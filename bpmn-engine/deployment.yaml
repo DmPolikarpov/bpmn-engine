@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bpmn-engine-deployment
+  labels:
+    app: bpmn-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bpmn-engine
+  template:
+    metadata:
+      labels:
+        app: bpmn-engine
+    spec:
+      containers:
+      - name: bpmn-engine
+        image: bpmn-engine-service:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bpmn-engine-service
+spec:
+  type: ClusterIP
+  selector:
+    app: bpmn-engine
+  ports:
+    - port: 8080
+      targetPort: 8080

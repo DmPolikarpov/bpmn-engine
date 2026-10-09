@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bpmn-engine-deployment
+  labels:
+    app: bpmn-engine
+    tier: core
+spec:
+  replicas: 3 # Запускаем 3 идентичных инстанса для отказоустойчивости
+  selector:
+    matchLabels:
+      app: bpmn-engine
+  template:
+    metadata:
+      labels:
+        app: bpmn-engine
+    spec:
+      containers:
+      - name: bpmn-engine-container
+        image: bpmn-engine-inst:latest # Наш скомпилированный Rust-образ
+        imagePullPolicy: IfNotPresent
+        
+        # Переменные окружения для подключения к инфраструктуре
+        env:
+        - name: RUST_LOG
+          value: "info"
+        - name: NATS_URL
+          value: "nats://nats-service:4222" # Сервис брокера NATS
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: db-secrets
+              key: database-url
+              
+        # Ограничения по ресурсам (Rust потребляет очень мало)
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "250m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bpmn-engine-service
+spec:
+  type: ClusterIP # Внутренний сервис для обращения внутри кластера
+  selector:
+    app: bpmn-engine
+  ports:
+  - port: 8080
+    targetPort: 8080

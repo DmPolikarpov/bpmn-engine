@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="Definitions_1">
+  <bpmn:process id="Process_ERP_Test" isExecutable="true">
+    
+    <bpmn:startEvent id="StartEvent_1">
+      <bpmn:outgoing>Flow_1</bpmn:outgoing>
+    </bpmn:startEvent>
+    
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="StartEvent_1" targetRef="ServiceTask_ERP_Sync" />
+    
+    <bpmn:serviceTask id="ServiceTask_ERP_Sync" name="Sync with ERP">
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+      <bpmn:outgoing>Flow_Success</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:sequenceFlow id="Flow_Success" sourceRef="ServiceTask_ERP_Sync" targetRef="EndEvent_Success" />
+    <bpmn:endEvent id="EndEvent_Success" />
+
+    <!-- Boundary Error Event (Saga / Compensation) -->
+    <bpmn:boundaryEvent id="Event_Error_1" attachedToRef="ServiceTask_ERP_Sync">
+      <bpmn:outgoing>Flow_Error</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrorEventDefinition_1" />
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_Error" sourceRef="Event_Error_1" targetRef="Task_Compensation" />
+    <bpmn:task id="Task_Compensation" name="Rollback DB" />
+
+    <!-- Boundary Timer Event (SLA Timeout) -->
+    <bpmn:boundaryEvent id="Event_Timer_1" attachedToRef="ServiceTask_ERP_Sync">
+      <bpmn:outgoing>Flow_Timer</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="TimerEventDefinition_1" />
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="Flow_Timer" sourceRef="Event_Timer_1" targetRef="Task_Timeout_Escalation" />
+    <bpmn:task id="Task_Timeout_Escalation" name="Notify Manager" />
+
+  </bpmn:process>
+</bpmn:definitions>

@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nats-init-streams
+  namespace: default
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 120
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: nats-box
+        image: natsio/nats-box:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo "Waiting for NATS JetStream to be ready..."
+          
+          while ! nats --server=nats-service:4222 stream ls; do 
+            echo "JetStream is not ready yet. Retrying in 2 seconds..."
+            sleep 2
+          done
+          
+          set -e 
+          echo "JetStream is online! Creating streams..."
+
+          SERVER="--server=nats-service:4222"
+
+          recreate_stream() {
+            NAME=$1
+            shift
+            echo "Configuring stream $NAME..."
+            nats stream delete "$NAME" $SERVER --force < /dev/null > /dev/null 2>&1 || true
+            nats stream add "$NAME" "$@" $SERVER --defaults < /dev/null
+          }
+
+          # 1. Входящие события
+          recreate_stream INBOUND_EVENTS --subjects "mes.in.v1.event.>" --retention limits --max-age 168h --storage file --discard old
+
+          # 2. Внутренний аудит
+          recreate_stream BPMN_EVENTS --subjects "mes.bpmn.v1.event.>" --retention limits --max-age 336h --storage file --discard old
+
+          # 3. Исходящие директивы
+          recreate_stream OUTBOUND_DISPATCH --subjects "mes.out.v1.cmd.>" --retention workq --storage file
+
+          # 4. Вещание в реальном времени (Снижаем до 128M, чтобы уместиться в лимит 512M с запасом)
+          recreate_stream WS_NOTIFICATIONS --subjects "mes.ws.v1.event.>" --retention limits --max-age 1h --max-bytes 128M --storage memory --discard old
+
+          # 5. Ответы от ERP (Обязателен для вашего bpmn-engine!)
+          recreate_stream ERP_RESPONSES --subjects "mes.in.v1.erp.>" --retention limits --max-age 168h --storage file --discard old
+
+          echo "All NATS JetStream streams created successfully!"

@@ -1,0 +1,17 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: bpmn-db
+spec:
+  instances: 1
+
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+  storage:
+    size: 5Gi

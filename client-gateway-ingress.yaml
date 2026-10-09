@@ -1,0 +1,32 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: client-gateway-ingress
+  annotations:
+    # Ограничение частоты запросов для защиты от DDoS/перегрузок (Rate Limiting)
+    traefik.ingress.kubernetes.io/rate-limit: |
+      average: 100
+      burst: 200
+spec:
+  rules:
+  # Единая точка входа для ERP и клиентов
+  - host: api.orchestrator.local
+    http:
+      paths:
+      # 1. Маршрут для долгоживущих WebSocket-соединений
+      - path: /ws
+        pathType: Prefix
+        backend:
+          service:
+            name: websocket-cluster-service
+            port:
+              number: 8080
+
+      # 2. Маршрут для обычных HTTP-запросов (REST API)
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: http-cluster-service
+            port:
+              number: 8080

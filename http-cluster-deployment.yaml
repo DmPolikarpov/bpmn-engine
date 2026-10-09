@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: http-cluster-deployment
+  labels:
+    app: http-cluster
+    tier: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: http-cluster
+  template:
+    metadata:
+      labels:
+        app: http-cluster
+    spec:
+      containers:
+      - name: http-server
+        image: http-cluster-service:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: NATS_URL
+          value: "nats://nats-service:4222"
+        - name: REDIS_URL
+          value: "redis://redis-service:6379"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: http-cluster-service
+spec:
+  type: ClusterIP
+  selector:
+    app: http-cluster
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http

@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats-deployment
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats
+  template:
+    metadata:
+      labels:
+        app: nats
+    spec:
+      containers:
+      - name: nats
+        image: nats:2.11-alpine
+        args: ["-js", "-config", "/etc/nats/nats.conf"]
+        ports:
+        - containerPort: 4222
+          name: client
+        - containerPort: 8222
+          name: monitor
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/nats
+        - name: jetstream-data
+          mountPath: /data/jetstream
+      volumes:
+      - name: config-volume
+        configMap:
+          name: nats-config
+      - name: jetstream-data
+        # Изменение здесь: меняем emptyDir на PVC
+        persistentVolumeClaim:
+          claimName: nats-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats-service
+  namespace: default
+spec:
+  selector:
+    app: nats
+  ports:
+  - name: client
+    port: 4222
+    targetPort: 4222
+  - name: monitor
+    port: 8222
+    targetPort: 8222
+---
+# Добавляем новый блок с описанием PVC в конец файла
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nats-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi # Должно быть не меньше, чем max_file_store в конфиге

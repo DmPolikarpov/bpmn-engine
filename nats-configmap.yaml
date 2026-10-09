@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  namespace: default
+data:
+  nats.conf: |
+    port: 4222
+    monitor_port: 8222
+
+    jetstream {
+      store_dir: "/data/jetstream"
+      max_memory_store: 512M # Увеличено для запаса под метаданные
+      max_file_store: 1G     # Согласовано с новым размером PVC
+    }

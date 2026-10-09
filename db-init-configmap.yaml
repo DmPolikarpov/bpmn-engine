@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-init-script
+data:
+  init.sql: |
+    -- =========================================================
+    -- 1. СТРУКТУРА ТАБЛИЦ (SCHEMA)
+    -- =========================================================
+
+    -- Шаблоны BPMN-процессов
+    CREATE TABLE IF NOT EXISTS process_definitions (
+        id VARCHAR(64) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        version INT NOT NULL DEFAULT 1,
+        bpmn_xml TEXT NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT unique_def_version UNIQUE (name, version)
+    );
+
+    -- Экземпляры процессов
+    CREATE TABLE IF NOT EXISTS process_instances (
+        id VARCHAR(64) PRIMARY KEY,
+        definition_id VARCHAR(64) NOT NULL REFERENCES process_definitions(id),
+        status VARCHAR(32) NOT NULL DEFAULT 'ACTIVE',
+        business_key VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Токены (текущие шаги выполнения)
+    CREATE TABLE IF NOT EXISTS tokens (
+        id VARCHAR(64) PRIMARY KEY,
+        instance_id VARCHAR(64) NOT NULL REFERENCES process_instances(id) ON DELETE CASCADE,
+        element_id VARCHAR(255) NOT NULL,
+        state VARCHAR(32) NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- История и аудит
+    CREATE TABLE IF NOT EXISTS execution_history (
+        id BIGSERIAL PRIMARY KEY,
+        instance_id VARCHAR(64) NOT NULL REFERENCES process_instances(id) ON DELETE CASCADE,
+        event_type VARCHAR(64) NOT NULL,
+        element_id VARCHAR(255),
+        payload JSONB,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Индексы
+    CREATE INDEX IF NOT EXISTS idx_pi_business_key ON process_instances(business_key);
+    CREATE INDEX IF NOT EXISTS idx_tokens_instance ON tokens(instance_id);
+    CREATE INDEX IF NOT EXISTS idx_history_instance ON execution_history(instance_id);
+
+    -- =========================================================
+    -- 2. ЗАПОЛНЕНИЕ НАЧАЛЬНЫМИ ДАННЫМИ (SEED DATA)
+    -- =========================================================
+
+    -- Тестовый BPMN-процесс обработки заказа
+    INSERT INTO process_definitions (id, name, version, bpmn_xml)
+    VALUES (
+        'order_process_v1',
+        'Order Processing',
+        1,
+        '<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"><bpmn:process id="order_process" isExecutable="true"><bpmn:startEvent id="StartEvent_1"/><bpmn:sequenceFlow id="Flow_1" sourceRef="StartEvent_1" targetRef="Task_ValidateOrder"/><bpmn:userTask id="Task_ValidateOrder" name="Validate Order"/><bpmn:endEvent id="EndEvent_1"/></bpmn:process></bpmn:definitions>'
+    ) ON CONFLICT DO NOTHING;
+
+    -- Тестовый запущенный экземпляр процесса для ERP
+    INSERT INTO process_instances (id, definition_id, status, business_key)
+    VALUES (
+        'pi_test_1001',
+        'order_process_v1',
+        'ACTIVE',
+        'ERP-ORDER-7789'
+    ) ON CONFLICT DO NOTHING;
+
+    -- Тестовый активный токен на шаге проверки заказа
+    INSERT INTO tokens (id, instance_id, element_id, state)
+    VALUES (
+        'token_9901',
+        'pi_test_1001',
+        'Task_ValidateOrder',
+        'ACTIVE'
+    ) ON CONFLICT DO NOTHING;
