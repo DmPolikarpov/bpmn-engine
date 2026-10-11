@@ -4,7 +4,7 @@ set -e
 # Переходим в директорию скрипта (корень проекта)
 cd "$(dirname "$0")"
 
-CLUSTER_NAME="${CLUSTER_NAME:-mycluster}"
+CLUSTER_NAME="${CLUSTER_NAME:-erp}"
 ENGINE_IMAGE="bpmn-engine-service:latest"
 HTTP_IMAGE="http-cluster-service:latest"
 WS_IMAGE="websocket-cluster-service:latest"
@@ -12,7 +12,10 @@ WS_IMAGE="websocket-cluster-service:latest"
 echo "Checking Kubernetes cluster connection..."
 if ! kubectl cluster-info &> /dev/null; then
     echo "ERROR: Kubernetes cluster is not reachable."
-    echo "Please ensure your local cluster (k3d/Docker/Minikube) is running."
+    echo "Please ensure your local cluster (kind/k3d/Docker/Minikube) is running."
+    echo "  - kind:     kind create cluster --name ${CLUSTER_NAME}"
+    echo "  - k3d:      k3d cluster create ${CLUSTER_NAME}"
+    echo "  - minikube: minikube start"
     exit 1
 fi
 echo "Cluster is reachable. Proceeding..."
@@ -55,10 +58,15 @@ docker build -t "${WS_IMAGE}" ./bpmn-gateways/websocket-cluster
 
 # 4. Импорт образов в локальное хранилище кластера
 echo "[4/8] Importing Images into Cluster..."
-if command -v k3d &> /dev/null && k3d cluster list | grep -q "${CLUSTER_NAME}"; then
+if command -v kind &> /dev/null && kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
+    echo "  -> Loading images into kind cluster '${CLUSTER_NAME}'..."
+    kind load docker-image "${ENGINE_IMAGE}" "${HTTP_IMAGE}" "${WS_IMAGE}" --name "${CLUSTER_NAME}"
+elif command -v k3d &> /dev/null && k3d cluster list | grep -q "${CLUSTER_NAME}"; then
     k3d image import "${ENGINE_IMAGE}" "${HTTP_IMAGE}" "${WS_IMAGE}" -c "${CLUSTER_NAME}"
 elif command -v minikube &> /dev/null; then
     minikube image load "${ENGINE_IMAGE}" "${HTTP_IMAGE}" "${WS_IMAGE}"
+else
+    echo "WARN: no kind/k3d/minikube cluster detected - images were NOT loaded into the cluster."
 fi
 
 # 5. Применение остальных корневых YAML

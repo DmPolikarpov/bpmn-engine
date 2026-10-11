@@ -4,7 +4,7 @@ set -e
 # Переходим в директорию расположения скрипта
 cd "$(dirname "$0")"
 
-CLUSTER_NAME="${CLUSTER_NAME:-mycluster}"
+CLUSTER_NAME="${CLUSTER_NAME:-erp}"
 TESTER_IMAGE="mes-tester:latest"
 JOB_NAME="mes-integration-test"
 
@@ -21,8 +21,10 @@ trap 'echo "🧹 Финальная очистка окружения..."; kubec
 echo "=== 1. Сборка Docker-образа тестера ==="
 docker build -t "${TESTER_IMAGE}" "${TESTS_DIR}"
 
-echo "=== 2. Импорт образа в кластер k3d ==="
-if command -v k3d &> /dev/null && k3d cluster list | grep -q "${CLUSTER_NAME}"; then
+echo "=== 2. Импорт образа в кластер (kind/k3d) ==="
+if command -v kind &> /dev/null && kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
+    kind load docker-image "${TESTER_IMAGE}" --name "${CLUSTER_NAME}"
+elif command -v k3d &> /dev/null && k3d cluster list | grep -q "${CLUSTER_NAME}"; then
     k3d image import "${TESTER_IMAGE}" -c "${CLUSTER_NAME}"
 fi
 
