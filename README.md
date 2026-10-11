@@ -19,7 +19,10 @@
 > всем подписчикам; сервис либо отвечает в `mes.in.v1.erp.response`, либо шаг
 > двигает следующий UI-обработчик. Никаких дополнительных extension-атрибутов в
 > схеме для этого не нужно. А вот роль исполнителя шага живёт в схеме штатным
-> `bpmn:potentialOwner` — см. [«Роль исполнителя узла»](#роль-исполнителя-узла-bpmnpotentialowner).
+> `bpmn:potentialOwner`, а запуск второго процесса из узла — расширением
+> `trg:processTrigger`: см. [«Роль исполнителя
+> узла»](#роль-исполнителя-узла-bpmnpotentialowner) и [«Кросс-процессный запуск
+> из узла»](#кросс-процессный-запуск-из-узла-trgprocesstrigger).
 > Как добавить новую связку — см.
 > [чек-лист](#как-привязать-новый-блок-к-сервису).
 
@@ -30,6 +33,7 @@
 - [Контракты транспорта](#контракты-транспорта)
 - [Какие привязки уже настроены](#какие-привязки-уже-настроены)
 - [Роль исполнителя узла (`bpmn:potentialOwner`)](#роль-исполнителя-узла-bpmnpotentialowner)
+- [Кросс-процессный запуск из узла (`trg:processTrigger`)](#кросс-процессный-запуск-из-узла-trgprocesstrigger)
 - [Локальный кэш схемы (`localStorage`)](#локальный-кэш-схемы-localstorage)
 - [Как привязать новый блок к сервису](#как-привязать-новый-блок-к-сервису)
 - [Правила и ограничения идентификаторов](#правила-и-ограничения-идентификаторов)
@@ -378,6 +382,125 @@ setElementRole(xml, 'Task_QualityControl', '');         // снять роль
 (импорт/экспорт моддлом), [`App.test.js`](erp-simulator/src/App.test.js)
 (перераспределение роли в схеме переключает кабинет).
 
+## Кросс-процессный запуск из узла (`trg:processTrigger`)
+
+Активация узла может запускать экземпляр **другого** процесса: шаг заказчика
+«передать заказ поставщику» создаёт экземпляр процесса поставщика. В BPMN 2.0
+такого понятия нет, поэтому привязка живёт расширением в собственном namespace
+`trg` — внутри расширений узла:
+
+```xml
+<bpmn:serviceTask id="Task_WaitForSupplierShipment" name="Ожидание отгрузки">
+  <bpmn:extensionElements>
+    <trg:processTrigger targetProcessId="Process_SupplierSupply_v1"
+                        instancePrefix="inst-supp-"
+                        startElementId="Task_WaitForSupplierShipment"
+                        firstElementId="Task_SupplierCreateDocs"
+                        payloadKeys="orderNum,volume" />
+  </bpmn:extensionElements>
+</bpmn:serviceTask>
+```
+
+| Поле | Смысл |
+| --- | --- |
+| `targetProcessId` | `bpmn:process/@id` целевого процесса, экземпляр которого запускается. **Обязательное**: без него триггера нет |
+| `instancePrefix` | префикс идентификатора нового экземпляра (`inst-supp-`): по нему сторона отличает чужие экземпляры в списке и сопоставляет их со стороной обмена (`INSTANCE_PREFIX` в [`constants.js`](erp-simulator/src/bpmn-sdk/constants.js)) |
+| `startElementId` | узел **текущего** процесса, активация которого запускает целевой. Обычно совпадает с узлом-владельцем триггера: поле позволяет проверить, что триггер стоит на ожидаемом узле |
+| `firstElementId` | узел **целевого** процесса, который первым станет `ACTIVE` (точка входа в чужой маршрут). Пусто — штатный маршрут от `startEvent` целевого процесса |
+| `payloadKeys` | ключи payload текущего экземпляра, которые передаются новому (через запятую). Передаётся только перечисленное: контекст целиком между сторонами не «переливается» |
+
+Почему собственный namespace:
+
+- кросс-процессного запуска в BPMN 2.0 нет, а писать это в `camunda:*` — значит
+  зависеть от чужого вендорского namespace;
+- тип требует регистрации в моделлере
+  (`new Modeler({ container, moddleExtensions: TRIGGER_MODELE_EXTENSIONS })`),
+  поэтому описание лежит отдельно —
+  [`xml/triggerModdle.js`](erp-simulator/src/bpmn-sdk/xml/triggerModdle.js).
+  **Без регистрации правка холста молча теряет триггер:** `bpmn-js` читает
+  элемент по имени тега (`$type` — `trg:processTrigger`, а не
+  `trg:ProcessTrigger`), `$instanceOf('trg:ProcessTrigger')` даёт `false`, а
+  `moddle.create` падает с `unknown type` — та же ловушка, что и у `camunda:*`.
+  Поведение зафиксировано тестом
+  [`bpmnModdleTrigger.test.js`](erp-simulator/src/vendor/bpmnModdleTrigger.test.js):
+  без расширения парсер не выдаёт **ни одного** предупреждения, элемент
+  остаётся в XML, но прочитать и записать его через модель нельзя;
+- запись и снятие идут через `modeling.updateProperties`
+  ([`BpmnEditor.jsx`](erp-simulator/src/bpmn-sdk/components/BpmnEditor.jsx)),
+  поэтому попадают в `commandStack` (Ctrl+Z) и сохраняют чужие расширения узла
+  (`camunda:*`, другие `trg`-элементы).
+
+### Как назначить триггер
+
+1. **В редакторе схемы** — инспектор узлов
+   ([`EnginePanel.jsx`](erp-simulator/src/bpmn-sdk/panels/EnginePanel.jsx)):
+   выбрать узел → блок «Запуск другого процесса при активации узла» → поля
+   `targetProcessId`, `instancePrefix`, `firstElementId`, `startElementId`,
+   `payloadKeys`. Поле «Запускаемый процесс» ходит по подсказкам-`datalist` из
+   пропа `triggerTargets` — это список `bpmn:process/@id` **схемы второй
+   стороны** (у Заказчика — процессы Поставщика), который
+   [`App.jsx`](erp-simulator/src/App.jsx) считает через `getProcessIds`:
+   переименование процесса в схеме соседа сразу видно в подсказках.
+2. **В XML** — той же строкой `trg:processTrigger` (пример выше).
+3. **Из кода** (SDK, [`xml/bpmnXml.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.js)):
+
+```js
+import { getElementTrigger, getTriggerAssignments, listTriggers, setElementTrigger } from './vendor/bpmn-sdk';
+
+getTriggerAssignments(xml);   // {Task_WaitForSupplierShipment: {targetProcessId: 'Process_SupplierSupply_v1', ...}}
+getElementTrigger(xml, 'Task_WaitForSupplierShipment'); // триггер узла либо null
+listTriggers(xml);            // [{elementId, trigger}, ...] — в порядке схемы
+
+setElementTrigger(xml, 'Task_WaitForSupplierShipment', {
+  targetProcessId: 'Process_SupplierSupply_v1',
+  instancePrefix: 'inst-supp-',
+  startElementId: 'Task_WaitForSupplierShipment',
+  firstElementId: 'Task_SupplierCreateDocs',
+  payloadKeys: 'orderNum, volume',
+});
+setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять триггер
+```
+
+Инварианты, которые проверяются тестами:
+
+- **пустой `targetProcessId` = «триггера нет»**: `setElementTrigger(xml, id,
+  { targetProcessId: '' })` удаляет элемент, а не оставляет пустой атрибут;
+- **хостом может быть только узел потока или активность** (`isTriggerHostType`):
+  на `sequenceFlow` SDK бросает ошибку — движок активирует узлы токеном, а
+  последовательный поток активирован не бывает (панель в этом случае показывает
+  подсказку и блокирует поля);
+- **значения валидируются до записи**: `instancePrefix` — по
+  `INSTANCE_PREFIX_PATTERN`, `startElementId` и `firstElementId` — как обычный
+  `element_id`, `payloadKeys` — по `TRIGGER_PAYLOAD_KEY_PATTERN`
+  (`/^[A-Za-z_][A-Za-z0-9_.-]*$/`). Недопустимое значение в схему не уходит:
+  поле подсвечивается, а введённый текст остаётся в черновике;
+- **`payloadKeys` канонизируется**: `' volume , orderNum ,, volume '` →
+  `'volume,orderNum'` (пробелы и пустые элементы списка убираются, повторы
+  схлопываются), поэтому повторное применение того же триггера не переписывает
+  схему;
+- **правка идёт текстом**, как `renameElementId` и `setElementRole`: остальная
+  схема, включая `bpmndi:BPMNShape`, не переформатируется, а namespace `trg`
+  добавляется в `bpmn:definitions`, если его там не было;
+- **неизвестные поля отбрасываются**: `normalizeTrigger` собирает триггер ровно
+  из `TRIGGER_FIELDS`, а не-объект вместо триггера — ошибка.
+
+Проверки в коде:
+[`bpmnXml.test.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.test.js) (запись,
+дописывание в существующие `extensionElements` с сохранением `camunda:*`,
+снятие, идемпотентность канонизации, отказы),
+[`EnginePanel.test.jsx`](erp-simulator/src/bpmn-sdk/panels/EnginePanel.test.jsx)
+(поля формы, подсказки, откат при отказе владельца схемы),
+[`bpmnModdleTrigger.test.js`](erp-simulator/src/vendor/bpmnModdleTrigger.test.js)
+(чтение тем самым `bpmn-moddle`, который упакован в бандл),
+[`App.test.js`](erp-simulator/src/App.test.js) (подсказки берутся из схемы
+второй стороны).
+
+> **Триггер пока декларация.** Движок его не читает: запуск второго процесса
+> делает клиент отдельным `sendEvent` (так работает демо-сценарий «передать
+> заказ поставщику»), а `trg:processTrigger` фиксирует пару «источник → цель»,
+> точку входа и состав передаваемого payload. См.
+> [«Известные ограничения»](#известные-ограничения).
+
 ## Локальный кэш схемы (`localStorage`)
 
 Правки редактора живут в состоянии React, поэтому без сохранения F5 возвращал
@@ -721,6 +844,14 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
    несколькими одновременными ветками так не выразить: на экземпляре останется
    только последняя активация. Для ветвлений понадобится хранить набор активных
    токенов и снимать состояние с графа (`sequenceFlow`), а не с одной записи.
+12. **Движок не читает `trg:processTrigger`.** Триггер живёт в схеме и
+    настраивается в редакторе, но запуск второго процесса по-прежнему делает
+    клиент отдельным `sendEvent` (демо-сценарий «передать заказ поставщику»):
+    движок не разбирает `extensionElements`, а ветка продвижения в
+    [`main.rs`](bpmn-engine/src/main.rs) написана только для ответов ERP. Чтобы
+    запуск шёл от движка, ему понадобится разбор триггера задеплоенной схемы,
+    создание экземпляра целевого процесса, вход в `firstElementId` и перенос
+    перечисленных в `payloadKeys` полей контекста источника.
 
 ## Карта исходников
 
@@ -734,9 +865,11 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 | [`bpmn-gateways/websocket-cluster/index.js`](bpmn-gateways/websocket-cluster/index.js) | Вещание `mes.bpmn.v1.event.>` в `ws://<host>:8081/ws/status` |
 | [`erp-simulator/src/bpmn-sdk/client/httpClient.js`](erp-simulator/src/bpmn-sdk/client/httpClient.js) | `sendEvent(instanceId, eventName, elementId, outputData)`, `deploySchema(org, xml)` |
 | [`erp-simulator/src/bpmn-sdk/constants.js`](erp-simulator/src/bpmn-sdk/constants.js) | `ENGINE_EVENTS`, `ENGINE_ELEMENTS`, `INSTANCE_PREFIX`, `TOKEN_STATES`, `ELEMENT_ID_PATTERN` |
-| [`erp-simulator/src/bpmn-sdk/xml/bpmnXml.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.js) | Поиск/переименование узлов (`id`) и роли (`bpmn:potentialOwner`) в XML |
+| [`erp-simulator/src/bpmn-sdk/xml/bpmnXml.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.js) | Поиск/переименование узлов (`id`), роли (`bpmn:potentialOwner`) и триггера (`trg:processTrigger`) в XML |
+| [`erp-simulator/src/bpmn-sdk/xml/triggerModdle.js`](erp-simulator/src/bpmn-sdk/xml/triggerModdle.js) | Moddle-пакет `trg`: тип `trg:ProcessTrigger`, поля триггера и `TRIGGER_MODELE_EXTENSIONS` для редактора |
+| [`erp-simulator/src/bpmn-sdk/panels/EnginePanel.jsx`](erp-simulator/src/bpmn-sdk/panels/EnginePanel.jsx) | Инспектор узла: `id`, название, роль исполнителя, триггер запуска другого процесса |
 | [`erp-simulator/src/roles.js`](erp-simulator/src/roles.js) | Демо-пользователи и словарь ролей (`ROLE_CODES`) для инспектора узлов |
 | [`erp-simulator/src/schemaStore.js`](erp-simulator/src/schemaStore.js) | Кэш схем в браузере: `saveSchema`/`loadSchema`/`clearSchema`, ключ `bpmn-schema:<ORG>` |
-| [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) | Демо-привязки: роль → кнопка → `sendEvent`; сохранение/сброс схемы в браузере |
+| [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) | Демо-привязки: роль → кнопка → `sendEvent`; сохранение/сброс схемы; подсказки триггера — `getProcessIds` из схемы второй стороны |
 | [`tests/test_workflow.py`](tests/test_workflow.py) | E2E-проверка привязок через HTTP, БД, NATS и WS |
 | [`schema.sql`](schema.sql), [`db-init-configmap.yaml`](db-init-configmap.yaml) | Таблицы и ограничения по длинам идентификаторов |
