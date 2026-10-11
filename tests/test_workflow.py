@@ -199,6 +199,20 @@ def poll_db_instance_status(expected_status, timeout=15, instance_id=None):
         cursor.close()
         conn.close()
 
+def fetch_active_element_ids(instance_id):
+    """ACTIVE-токены экземпляра — для проверки инварианта «один активный узел»."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT element_id FROM tokens WHERE instance_id = %s AND state = 'ACTIVE' ORDER BY element_id;",
+            (instance_id,)
+        )
+        return [row[0] for row in cursor.fetchall()]
+    finally:
+        cursor.close()
+        conn.close()
+
 def force_expire_token(instance_id, element_id):
     """Искусственно сдвигает created_at токена в БД на 35 минут назад."""
     conn = get_db_connection()
@@ -292,6 +306,17 @@ def run_complex_workflow_test():
             print(f"   ✅ Успешно! Токен '{TASK_1_ID}'=COMPLETED, токен '{TASK_2_ID}'=ACTIVE")
         else:
             raise AssertionError("❌ Ошибка продвижения шагов!")
+
+        # Шаг 7.1: инвариант «на экземпляр ровно один ACTIVE-токен»: движок
+        # закрывает прежние активные узлы, иначе клиент подсветит несколько.
+        print(f"\n📌 [Шаг 7.1] Проверка инварианта «один активный узел на экземпляр»...")
+        active_elements = fetch_active_element_ids(INSTANCE_ID)
+        if active_elements == [TASK_2_ID]:
+            print(f"   ✅ На экземпляре ровно один ACTIVE-токен: {active_elements}")
+        else:
+            raise AssertionError(
+                f"❌ Ожидался единственный ACTIVE-токен '{TASK_2_ID}', получено: {active_elements}"
+            )
 
         # Шаг 8
         print(f"\n📌 [Шаг 8] Симуляция ответа от ERP для финального шага '{TASK_2_ID}'...")

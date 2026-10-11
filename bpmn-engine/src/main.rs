@@ -130,6 +130,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                     if let Err(e) = db::save_token_state(&pool_erp, inst_id, next_element, "ACTIVE").await {
                                                         eprintln!("❌ [ERP Consumer] Ошибка создания токена: {}", e);
                                                     } else {
+                                                        // Тот же инвариант, что и в основном цикле: на экземпляр
+                                                        // остаётся ровно один ACTIVE-токен.
+                                                        match db::complete_active_tokens(&pool_erp, inst_id, next_element).await {
+                                                            Ok(completed_elements) => {
+                                                                for stale_element in completed_elements {
+                                                                    let _ = nats_erp.publish_token_event(inst_id, &stale_element, "COMPLETED", None).await;
+                                                                }
+                                                            }
+                                                            Err(e) => eprintln!("❌ [ERP Consumer] Ошибка закрытия прежних ACTIVE-токенов: {}", e),
+                                                        }
+
                                                         let _ = nats_erp.publish_token_event(inst_id, next_element, "ACTIVE", Some(&response.payload)).await;
                                                     }
                                                 }
@@ -185,7 +196,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     eprintln!("❌ Ошибка обновления токена: {}", e);
                                 } else {
                                     println!("💾 [Main Loop] Токен {}:{} сохранен как ACTIVE", instance_id, element_id);
+                                    // Инвариант «один активный узел на экземпляр»: прежние
+                                    // ACTIVE-токены закрываем (COMPLETED), иначе клиент
+                                    // подсветит несколько активных узлов одновременно.
+                                    match db::complete_active_tokens(&pool, instance_id, element_id).await {
+                                        Ok(completed_elements) => {
+                                            for stale_element in completed_elements {
+                                                println!("🔁 [Main Loop] Прежний токен {}:{} закрыт как COMPLETED", instance_id, stale_element);
+                                                let _ = nats_adapter.publish_token_event(instance_id, &stale_element, "COMPLETED", None).await;
+                                            }
+                                        }
+                                        Err(e) => eprintln!("❌ Ошибка закрытия прежних ACTIVE-токенов: {}", e),
+                                    }
+
                                     // ПЕРЕДАЕМ event.payload В WebSocket NATS PUBLISH!
+                                    // Payload уходит только с ACTIVE: COMPLETED-события не должны
+                                    // перезаписывать данные заказа на клиенте.
                                     let _ = nats_adapter.publish_token_event(instance_id, element_id, "ACTIVE", Some(&event.payload)).await;
                                 }
                             }

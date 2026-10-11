@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 /// Сохранение определения BPMN-процесса в таблицу process_definitions
 pub async fn save_process_definition(
@@ -86,6 +86,35 @@ pub async fn save_token_state(
     }
 
     Ok(())
+}
+
+/// Закрытие всех прочих ACTIVE-токенов экземпляра при активации нового узла.
+///
+/// Инвариант «один активный узел на экземпляр»: пока движок только дописывал
+/// новые ACTIVE-токены, клиент накапливал их и подсвечивал несколько узлов
+/// одновременно. Здесь прежние ACTIVE-токены переводятся в COMPLETED, а их
+/// `element_id` возвращаются вызывающему коду — по ним публикуются события
+/// `token_updated COMPLETED`. Токены в других состояниях (COMPLETED,
+/// TIMED_OUT, FAILED) не затрагиваются, поэтому вызов идемпотентен.
+pub async fn complete_active_tokens(
+    pool: &PgPool,
+    instance_id: &str,
+    keep_element_id: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        UPDATE tokens
+        SET state = 'COMPLETED'
+        WHERE instance_id = $1 AND state = 'ACTIVE' AND element_id <> $2
+        RETURNING element_id;
+        "#,
+    )
+    .bind(instance_id)
+    .bind(keep_element_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|row| row.get("element_id")).collect())
 }
 
 pub async fn update_process_instance_status(
