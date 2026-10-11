@@ -442,7 +442,12 @@ setElementRole(xml, 'Task_QualityControl', '');         // снять роль
    [`App.jsx`](erp-simulator/src/App.jsx) считает через `getProcessIds`:
    переименование процесса в схеме соседа сразу видно в подсказках.
 2. **В XML** — той же строкой `trg:processTrigger` (пример выше).
-3. **Из кода** (SDK, [`xml/bpmnXml.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.js)):
+3. **На витрине `<script>`-подключения** — `npm run sdk:demo && npm start` →
+   [http://localhost:3000/sdk-demo.html](http://localhost:3000/sdk-demo.html):
+   инспектор на странице пишет роль и триггер прямо в схему демо
+   (`setElementRole`/`setElementTrigger`), а подсказки «Запускаемый процесс»
+   берёт из демо-схемы поставщика функцией `getProcessIds`.
+4. **Из кода** (SDK, [`xml/bpmnXml.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.js)):
 
 ```js
 import { getElementTrigger, getTriggerAssignments, listTriggers, setElementTrigger } from './vendor/bpmn-sdk';
