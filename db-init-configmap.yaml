@@ -82,3 +82,11 @@ data:
         'Task_ValidateOrder',
         'ACTIVE'
     ) ON CONFLICT DO NOTHING;
+
+    -- =========================================================
+    -- 3. ПРАВА ДОСТУПА ДЛЯ ПРИКЛАДНОГО ПОЛЬЗОВАТЕЛЯ
+    -- =========================================================
+    -- postInitApplicationSQLRefs выполняется от суперпользователя,
+    -- поэтому таблицы создаются от postgres. Выдаём права bpmn_user.
+    GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO bpmn_user;
+    GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO bpmn_user;
