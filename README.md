@@ -34,7 +34,9 @@
 - [Какие привязки уже настроены](#какие-привязки-уже-настроены)
 - [Роль исполнителя узла (`bpmn:potentialOwner`)](#роль-исполнителя-узла-bpmnpotentialowner)
 - [Кросс-процессный запуск из узла (`trg:processTrigger`)](#кросс-процессный-запуск-из-узла-trgprocesstrigger)
+- [Кнопки участников узла (`act:userAction`)](#кнопки-участников-узла-actuseraction)
 - [Локальный кэш схемы (`localStorage`)](#локальный-кэш-схемы-localstorage)
+- [Метрики выполненных процессов](#метрики-выполненных-процессов)
 - [Как привязать новый блок к сервису](#как-привязать-новый-блок-к-сервису)
 - [Правила и ограничения идентификаторов](#правила-и-ограничения-идентификаторов)
 - [Диагностика](#диагностика)
@@ -220,7 +222,9 @@ const { client } = useBpmnEngine();                       // HTTP-клиент �
 // 1) деплой схемы: inst-deploy-<org> + DeploySchema + Process_Deployment
 await client.deploySchema('CUSTOMER', bpmnXml);
 
-// 2) привязка «блок → действие сервиса»: какой узел активируем и чем
+// 2) привязка «блок → действие сервиса»: какой узел активируем и чем.
+//    В демо параметры вызова (событие и узел) берутся из кнопки схемы —
+//    `act:userAction`, см. «Кнопки участников узла».
 await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
   entryTime: '10:15:00', orderNum: '№101',
 });
@@ -234,33 +238,49 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 
 ### A. Демо-приложение клиента (роль → блок → сервис)
 
-Обработчики в [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) — это и есть
-«сервисы»: каждый из них по нажатию кнопки вызывает `client.sendEvent(...)`.
-Колонка `element_id` — узел, который после события станет `ACTIVE` (и подсветится
-на схеме).
+Кнопки кабинета объявлены в самих блоках схемы (`act:userAction`): надпись,
+иконка и роль участника — это данные, а не код, а `event_name` и `element_id`
+(`event`/`elementId`) схема выводит сама, если в кнопке их не записали
+(см. [«Кнопки участников узла»](#кнопки-участников-узла-actuseraction)). В
+[`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) остаются обработчики —
+«сервисы»: по нажатию кнопки они собирают **вычисляемый** payload (номера
+УПД/ТТН, метки времени, `instanceId` новой стороны) и вызывают
+`client.sendEvent(...)` параметрами из схемы: `resolveAction` доводит пару
+«событие + узел» до значений, которые понимает движок. Колонка `element_id` —
+узел, который после события станет `ACTIVE` (и подсветится на схеме).
 
 Колонка «Роль (вход)» — роль, под которой пользователь входит в демо; **какие шаги
-этой роли принадлежат, решает схема** (`bpmn:potentialOwner`), а не список в коде:
-кабинет строится по ролям узлов, поэтому шаг можно переназначить в редакторе схемы
-(см. [«Роль исполнителя узла»](#роль-исполнителя-узла-bpmnpotentialowner)).
-Исключение — запуск процесса: у событий нет `resourceRole`, поэтому инициатора
-старта (`StartEvent_Customer`) определяет роль пользователя в клиенте.
+этой роли принадлежат, решает схема**: у задачи — `bpmn:potentialOwner`, у кнопки
+на событии — её собственное поле `role` (у событий нет `resourceRole`, поэтому
+роль инициатора старта записана в кнопке `createOrder` на `StartEvent_Customer`).
+Кабинет строится по ролям, поэтому и надпись кнопки, и её получателя можно
+поменять в редакторе схемы
+(см. [«Роль исполнителя узла»](#роль-исполнителя-узла-bpmnpotentialowner) и
+[«Кнопки участников узла»](#кнопки-участников-узла-actuseraction)).
 
-| Роль (вход) | Действие в UI | `event_name` | `element_id` | Экземпляр |
+| Роль (вход) | Кнопка в UI (обработчик) | `event_name` | `element_id` | Экземпляр |
 | --- | --- | --- | --- | --- |
 | Руководитель (EXECUTIVE) | Деплой схемы (`deploySchema('CUSTOMER', xml)`) | `DeploySchema` | `Process_Deployment` | `inst-deploy-customer` |
 | Руководитель Поставщика | Деплой схемы (`deploySchema('SUPPLIER', xml)`) | `DeploySchema` | `Process_Deployment` | `inst-deploy-supplier` |
 | Мастер производства (`handleProductionCreateOrder`) | «Создать внутренний заказ на 100 л» | `StartProcess` | `StartEvent_Customer` | `inst-cust-*` |
-| Мастер производства (там же, шаг 2 — `startProcess`) | Первый шаг процесса | `StartPurchaseOrder` | `Task_CreatePurchaseOrder` | `inst-cust-*` |
-| Менеджер закупок (`handleCustomerSendOrderToSupplier`) | Передать заказ поставщику | `SendToSupplier` | `Task_WaitForSupplierShipment` | `inst-cust-*` |
+| Мастер производства (там же, шаг 2 — `startProcess`) | Первый шаг процесса | `CompleteBlock` | `Task_CreatePurchaseOrder` | `inst-cust-*` |
+| Менеджер закупок (`handleCustomerSendOrderToSupplier`) | Передать заказ поставщику | `CompleteBlock` | `Task_WaitForSupplierShipment` | `inst-cust-*` |
 | Менеджер закупок (там же, шаг 2 — `startProcess`) | Запуск процесса поставщика | `StartProcess` | `StartEvent_Supplier` | `inst-supp-*` |
-| Менеджер закупок (там же, шаг 3 — `startProcess`) | Первый шаг поставщика | `StartSupplierDocs` | `Task_SupplierCreateDocs` | `inst-supp-*` |
-| Менеджер поставщика (`handleSupplierCreateDocs`) | Сформировать УПД/ТТН | `CreateDocs` | `Task_SupplierShipment` | `inst-supp-*` |
-| Менеджер поставщика (`handleSupplierShipment`) | Отгрузить цистерну | `Shipment` | `EndEvent_Supplier` | `inst-supp-*` |
+| Менеджер закупок (там же, шаг 3 — `startProcess`) | Первый шаг поставщика | `CompleteBlock` | `Task_SupplierCreateDocs` | `inst-supp-*` |
+| Менеджер поставщика (`handleSupplierCreateDocs`) | Сформировать УПД/ТТН | `CompleteBlock` | `Task_SupplierShipment` | `inst-supp-*` |
+| Менеджер поставщика (`handleSupplierShipment`) | Отгрузить цистерну | `CompleteBlock` | `EndEvent_Supplier` | `inst-supp-*` |
 | Менеджер поставщика (там же, шаг 2) | Сигнал заказчику | `SupplierShippedSignal` | `Task_ReceiveDocsAndIssuePass` | `inst-cust-*` |
-| Менеджер закупок (`handleCustomerIssuePass`) | Выписать пропуск | `IssuePass` | `Task_SecurityCheck` | `inst-cust-*` |
-| Охрана КПП (`handleSecurityCheckAndPass`) | Пропустить транспорт | `SecurityPass` | `Task_QualityControl` | `inst-cust-*` |
-| Специалист ОТК (`handleQualityApprove`) | Принять качество | `QualityApprove` | `EndEvent_Customer` | `inst-cust-*` |
+| Менеджер закупок (`handleCustomerIssuePass`) | Выписать пропуск | `CompleteBlock` | `Task_SecurityCheck` | `inst-cust-*` |
+| Охрана КПП (`handleSecurityCheckAndPass`) | Пропустить транспорт | `CompleteBlock` | `Task_QualityControl` | `inst-cust-*` |
+| Специалист ОТК (`handleQualityApprove`) | Принять качество | `CompleteBlock` | `EndEvent_Customer` | `inst-cust-*` |
+
+`CompleteBlock` в колонке `event_name` — умолчание: `event_name` это метка
+операции (она уходит в subject NATS `mes.in.v1.event.erp.*` и в журнал), а токен
+двигает `element_id`, поэтому в кнопках демо-схем событие и узел не записаны, и
+их выводит схема (`DEFAULT_ACTION_EVENT` и цель единственной исходящей связи,
+см. [«Кнопки участников узла»](#кнопки-участников-узла-actuseraction)). Явные
+имена остались там, где их пишут данные: `DeploySchema`, `StartProcess` и
+`SupplierShippedSignal` (сигнал второй стороне — поле `counterpartEvent`).
 
 Строки с `startProcess` — про запуск процесса: **старт это два события.** Движок
 не делает переходов сам (событие называет узел, который станет `ACTIVE`), поэтому
@@ -272,10 +292,23 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 иначе) — именно так первый прямоугольник «не красился» и у заказчика, и у
 поставщика.
 
+У «старт — два события» есть следствие для списка заказов: раз событий два, токен
+`StartProcess` движок публикует **раньше**, чем обработчик кнопки дождётся обоих
+ответов HTTP (кадр WS успевает между двумя `sendEvent`). Заказ к этому моменту уже
+заводит ветка «заказ по токену» в подписке на токены, поэтому
+`handleProductionCreateOrder` не добавляет свой `pendingOrder` вслепую, а сливает
+его с найденным по `custInstId` (`{ ...pendingOrder, ...order }` — состояние из WS
+свежее, о состоянии движка ответ HTTP ничего не знает). Иначе в списке оказывались
+два заказа с одним `№`: React ругался на неуникальный `key={o.id}` в списке и
+таблицах заказов, а «текущий шаг» мог уехать на чужой заказ. Регрессия закрыта
+тестом «токен старта, обогнавший ответ HTTP, не удваивает заказ».
+
 Тот же приём используется и в интеграционном тесте:
 [`App.test.js`](erp-simulator/src/App.test.js) проверяет оба вызова кнопки
 производства — `sendEvent(inst-cust-*, 'StartProcess', 'StartEvent_Customer', {...})`
-и `sendEvent(inst-cust-*, 'StartPurchaseOrder', 'Task_CreatePurchaseOrder', {...})`.
+и `sendEvent(inst-cust-*, 'CompleteBlock', 'Task_CreatePurchaseOrder', {...})`.
+Второе имя события — умолчание схемы (в кнопке старта записана только роль
+инициатора), узел первого шага схема выводит по исходящей связи.
 
 ### B. Сервисные задачи в движке (ответ ERP)
 
@@ -506,6 +539,94 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
 > точку входа и состав передаваемого payload. См.
 > [«Известные ограничения»](#известные-ограничения).
 
+## Кнопки участников узла (`act:userAction`)
+
+Кнопка кабинета — тоже привязка, и она тоже живёт в схеме: в BPMN 2.0 такого
+понятия нет, поэтому кнопка объявляется расширением в namespace `act` (тип
+объявляет `ACTION_MODELE_EXTENSIONS` — `moddleExtensions` редактора):
+
+```xml
+<bpmn:userTask id="Task_CreatePurchaseOrder" name="Сформировать заказ у поставщика">
+  <bpmn:extensionElements>
+    <act:userAction id="sendToSupplier" label="Сформировать и отправить заказ Поставщику"
+                    icon="Send"
+                    startsProcess="Process_SupplierSupply_v1" />
+  </bpmn:extensionElements>
+  <bpmn:potentialOwner name="MANAGER" />
+</bpmn:userTask>
+```
+
+| Поле | Смысл |
+| --- | --- |
+| `id` | ключ кнопки: по нему клиент (`ACTION_ID` в `App.jsx`) сопоставляет её со своим обработчиком. Незнакомый ключ ошибкой не считается: такую кнопку кабинет показывает общим шагом (см. ниже) |
+| `label`, `icon` | надпись и имя иконки в кабинете |
+| `role` | роль участника; пусто — берётся у узла-хоста (`bpmn:potentialOwner`) |
+| `event`, `elementId` | `event_name` и `element_id` события нажатия. **Оба необязательны**: пустое `event` — «шаг выполнен» (`DEFAULT_ACTION_EVENT` = `CompleteBlock`), пустой `elementId` — следующий блок по единственной исходящей связи узла (`getNextElementId`). Записанное в схеме значение всегда важнее умолчания |
+| `counterpartEvent`, `counterpartElementId` | необязательный сигнал в экземпляр второй стороны по тому же заказу |
+| `startsProcess` | `bpmn:process/@id` процесса второй стороны, который запускает нажатие |
+
+Почему так: движок имя события не разбирает — оно уходит только в subject NATS
+(`mes.in.v1.event.erp.${event_name}`) и в журнал, а токен двигает `element_id`
+(см. «B. Сервисные задачи»). Поэтому кнопке достаточно знать, **куда** шаг
+переводит токен, и демо-схемы записаны коротко: «нажатие завершает блок и
+переводит токен на следующий узел». Обработчик кабинета разрешает пару по схеме
+(`resolveAction`), а явные `event`/`elementId` — это способ описать нестандартный
+переход (прыжок через блок, возврат, активация события).
+
+Что это меняет:
+
+- **надпись, роль и адрес кнопки правятся в схеме**, а не в коде: переименовали
+  `label` — кабинет показывает новую надпись, поменяли `role` — кнопку видит
+  другая роль (проверяется тестами
+  [`App.test.js`](erp-simulator/src/App.test.js));
+- **кросс-процессные эффекты тоже данные**: `startsProcess` заменил жёстко
+  прописанный запуск процесса поставщика, `counterpartEvent` — сигнал заказчику
+  (`SupplierShippedSignal` на `Task_ReceiveDocsAndIssuePass`);
+- **кнопка запуска процесса** — та, что объявлена на стартовом событии
+  (`getStartAction`): её `role` — роль инициатора, а `event`/`elementId` (если они
+  записаны) — первый шаг; у старта связь одна, поэтому пару обычно выводит схема
+  (движок переводит токен двумя событиями, см. «A.» выше);
+- **обработчики в `App.jsx` остались**: они собирают payload, которого в схеме нет
+  (номера УПД/ТТН, метки времени, идентификатор нового экземпляра), и пишут в
+  журнал события процесса. Поимённо кабинет разбирает только эти шаги — их ключи
+  перечислены в `ACTION_ID`;
+- **новый блок работает без правок кода**: кнопку с незнакомым ключом кабинет
+  показывает общим шагом (`schemaStepActions`) — роль берётся у кнопки либо у
+  узла, событие и узел — из схемы, а payload состоит из номера заказа и метки
+  времени. Поэтому добавленный в редакторе блок с кнопкой видит его роль сразу
+  после сохранения/деплоя схемы;
+- **шаг, которому некуда идти**, кабинет кнопкой не рисует: если кнопка не назвала
+  узел, а у блока нет единственной исходящей связи, показывается подсказка
+  «заполните „Узел после нажатия“» — движок токен двигает узлом события, и нажатие
+  «в никуда» ничего бы не сдвинуло.
+
+API SDK: `listActions`, `getElementActions`, `getElementAction`,
+`getActionAssignments`, `getStartAction`, `setElementActions`, `normalizeAction`,
+`isValidAction`, `isActionHostType`, `ACTION_FIELDS`, `EMPTY_ACTION`,
+`ACTION_TYPE`, `ACTION_NAMESPACE`, `ACTION_MODELE_EXTENSIONS`, а для вывода адреса
+кнопки из связей — `resolveAction`, `resolveActionEvent`, `resolveActionTarget`,
+`getNextElementId`, `getOutgoingTargetIds`, `DEFAULT_ACTION_EVENT` — подробности и
+правила записи в
+[README SDK](erp-simulator/src/bpmn-sdk/README.md#кнопки-участников-узла).
+
+Как назначить кнопку:
+
+1. **В редакторе схемы** — инспектор узлов, блок «Кнопки участников на узле»:
+   выбрать узел → заполнить поля (подсказки — роли пользователей, узлы схемы и
+   процессы второй стороны) → «Добавить кнопку». Обязательны ключ и надпись:
+   кнопка попадает в схему сразу, а в поле «Узел после нажатия» подсказывается
+   блок, который схема выведет по связи. Список пишется целиком, а
+   «Удалить кнопку» убирает её из схемы;
+2. **В XML** — той же строкой `act:userAction` (пример выше), объявив
+   `xmlns:act="http://erp.mes/schema/bpmn/action"` в `bpmn:definitions` (инспектор
+   делает это сам вместе с первой кнопкой);
+3. **Из кода** — `setElementActions(xml, elementId, actions)` (список заменяется
+   целиком, `[]` снимает все) и чтение `getElementActions`/`listActions`.
+
+> Схема без `act:userAction` — схема без кнопок: кабинет покажет только ожидание.
+> Демо-схемы SDK кнопки несут; кнопка «Демо-схема» в панели схемы возвращает их,
+> если в браузере осталась копия от прежней версии.
+
 ## Локальный кэш схемы (`localStorage`)
 
 Правки редактора живут в состоянии React, поэтому без сохранения F5 возвращал
@@ -548,6 +669,58 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
 [`App.test.js`](erp-simulator/src/App.test.js) (подхват при старте процесса,
 кнопки сохранения/сброса, «перезагрузка» повторным монтированием).
 
+## Метрики выполненных процессов
+
+Кабинет руководителя показывает инфографику по процессам
+([`MetricsPanel.jsx`](erp-simulator/src/MetricsPanel.jsx)): сколько запусков
+завершено, среднее/минимальное/максимальное время выполнения и столбики
+последних запусков. Пока измеряется одно — **время выполнения**: от старта
+экземпляра до токена на конечном узле.
+
+Отдельного события «процесс завершён» движок не публикует: токен просто встаёт
+на `bpmn:endEvent` и остаётся `ACTIVE`. Поэтому финиш определяет клиент по схеме
+(у конечного узла нет исходящих связей — `getOutgoingTargetIds`), а саму метрику
+хранит в браузере ([`erp-simulator/src/metricsStore.js`](erp-simulator/src/metricsStore.js),
+ключ `bpmn-process-metrics`):
+
+| Что | Функция | Когда вызывается |
+| --- | --- | --- |
+| Старт | `beginRun({id, org, processId, processName, orderNumber})` | `startProcess` в [`App.jsx`](erp-simulator/src/App.jsx) — экземпляр создан |
+| Финиш | `completeRun(instanceId, {finishedAt, lastElementId, orderNumber})` | токен `ACTIVE` встал на конечный узел схемы контура |
+| Чтение | `loadRuns()` | при монтировании кабинета и после каждой записи |
+| Забыть | `clearRuns()` | кнопка «Очистить» в панели инфографики |
+
+Детали:
+
+- **метрика локальная и на браузер**, как и кэш схемы: её видит тот клиент,
+  который запускал процессы (журнал `execution_history` в кластере она не
+  заменяет);
+- **финиш определяет схема контура**, а не движок: `org` берётся из префикса
+  экземпляра (`inst-cust-*` / `inst-supp-*`), конечный узел — из текущей схемы
+  этой стороны. Правка схемы (например, переименование `endEvent`) сразу меняет
+  условие финиша;
+- **экземпляр, который клиент не начинал** (страница открыта посреди процесса),
+  метрики не получает: время выполнения оказалось бы выдуманным — `completeRun`
+  для незнакомого экземпляра возвращает `null`;
+- **повторный финиш идемпотентен**: уже закрытая запись не переписывается
+  (движок может отдать кадр дважды);
+- **записей не больше `MAX_RUNS` (60)**: метрика — не журнал, ей достаточно
+  последних запусков, а квота `localStorage` общая со схемой;
+- **имя процесса и номер заказа берутся из схемы и payload**, а не из кода:
+  `processName` — это `bpmn:process/@name`;
+- **агрегаты считаются по записям** (`summarizeRuns`, `groupRunsByProcess`): по
+  карточке на процесс, контур пользователя первым — процессы второй стороны
+  остаются рядом, потому что обмен межорганизационный;
+- **недоступное хранилище** (приватный режим, квота) метрику не ломает: функции
+  возвращают `null`/`false`/`[]`, а заказ обрабатывается дальше.
+
+Проверки: [`metricsStore.test.js`](erp-simulator/src/metricsStore.test.js)
+(старт/финиш, идемпотентность, кривые часы, отказы хранилища, агрегаты),
+[`MetricsPanel.test.jsx`](erp-simulator/src/MetricsPanel.test.jsx) (карточки
+процессов, плитки времени, столбики) и
+[`App.test.js`](erp-simulator/src/App.test.js) (метрика переживает смену
+пользователя, промежуточный узел финишем не считается).
+
 ## Как привязать новый блок к сервису
 
 Ниже — полный чек-лист. Порядок важен: сначала узел в схеме, потом его `id`
@@ -580,6 +753,32 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
 локальное сохранение в кластер не уходит (подробнее — [«Локальный кэш
 схемы»](#локальный-кэш-схемы-localstorage)).
 
+#### Совместимость схемы с движком
+
+Схему компилирует движок, и он разбирает не весь BPMN: парсер обходит прямых
+детей `<bpmn:process>` и знает только `startEvent`, `endEvent`, `serviceTask`,
+`userTask`, `exclusiveGateway`, `parallelGateway` и `sequenceFlow`. Узел другого
+типа — например, базовый `<bpmn:task>`, который создаёт кнопка «Task» в палитре
+редактора, — движок **пропускает молча**; связи, которые вели в него или из него,
+становятся «висячими», и компиляция отвечает `SequenceFlowSourceNotFound` /
+`SequenceFlowTargetNotFound` (тот же отказ дают узел без входящей или исходящей
+связи, `endEvent`, до которого нельзя дойти, и форма шлюза — полный список
+проверок в компиляторе).
+
+Узнать об отказе неоткуда: шлюз публикует событие в NATS и отвечает
+`202 Accepted` независимо от результата, а движок при ошибке компиляции не
+сохраняет ни определение, ни экземпляр процесса — `tokens` потом не проходит по
+внешнему ключу к `process_instances`, поэтому WS-кадров о токенах тоже не будет.
+Снаружи это выглядит как «ничего не произошло»: схема задеплоена, событие
+принято, а процесса нет.
+
+Поэтому проверку повторяет клиент (`validateEngineSchema` из SDK) и делает отказ
+видимым: панель схемы показывает причину до деплоя, деплой несовместимой схемы не
+отправляется, а «Создать внутренний заказ» не заводит заказ — иначе в списке
+остался бы «заказ-призрак» без экземпляра процесса. Проверка зеркалит правила
+компилятора и лежит в SDK рядом с остальной логикой XML (см.
+[README SDK](erp-simulator/src/bpmn-sdk/README.md#совместимость-схемы-с-движком)).
+
 Альтернатива для одноразового запуска — передать схему в `output_data.bpmn_xml`
 вместе со стартом процесса (так делает тест):
 
@@ -606,24 +805,45 @@ if (!res.ok) throw new Error(res.error);
 ```
 
 В демо-приложении такие вызовы разложены по обработчикам ролей
-(`handleProductionCreateOrder`, `handleSupplierCreateDocs`, ...). Если блоков
-становится много, удобнее держать таблицу привязок рядом с UI:
+(`handleProductionCreateOrder`, `handleSupplierCreateDocs`, ...), но **сама
+привязка** — надпись, роль и, если нужен «нестандартный» переход,
+`event_name`/`element_id` — объявлена в схеме (`act:userAction`, см.
+[«Кнопки участников узла»](#кнопки-участников-узла-actuseraction)). Обычный шаг
+пары не требует: у блока одна исходящая связь, поэтому «завершить блок» и
+«следующий узел» схема выводит сама, а обработчик разрешает их `resolveAction`.
+Дальше показан вариант с явной парой — так пишут прыжок через блок или активацию
+события. Обработчик
+находит её по ключу кнопки и добавляет только вычисляемые данные:
 
 ```js
-// пример: единая таблица «блок -> сервис/операция»
-// (роль узла здесь не нужна: она хранится в схеме, см. «Роль исполнителя узла»)
-export const BLOCK_SERVICE_MAP = {
-  StartEvent_Customer: { event: 'StartProcess' },
-  Task_SecurityCheck:  { event: 'IssuePass' },
-  Task_QualityControl: { event: 'SecurityPass' },
-  EndEvent_Customer:   { event: 'QualityApprove' },
-};
+// App.jsx: кнопка из схемы + payload, который данными не выразить.
+// `actionOf` разрешает пару «событие + узел» по схеме (`resolveAction`), поэтому
+// незаполненные поля кнопки читаются как «шаг выполнен» и «следующий блок».
+const action = actionOf('CUSTOMER', ACTION_ID.SEND_TO_SUPPLIER); // { elementId, action }
+await client.sendEvent(
+  order.customerInstanceId,
+  action.action.event,       // 'CompleteBlock' (если в кнопке нет своего event)
+  action.action.elementId,   // 'Task_WaitForSupplierShipment' (цель связи)
+  { orderNum: order.id, supplierInstanceId: instId } // вычисляемые данные
+);
+```
 
-async function advance(client, instanceId, elementId, payload) {
-  const binding = BLOCK_SERVICE_MAP[elementId];
-  if (!binding) throw new Error(`Блок ${elementId} ни с чем не связан`);
-  return client.sendEvent(instanceId, binding.event, elementId, payload);
-}
+Если привязку задают из кода, её пишут в схему тем же API, что и инспектор:
+
+```js
+import { listActions, setElementActions } from './vendor/bpmn-sdk';
+
+listActions(xml);   // [{elementId, action}, ...] — все кнопки схемы
+
+setElementActions(xml, 'Task_SecurityCheck', [
+  {
+    id: 'securityPass',
+    label: 'Проверить пропуск и открыть ворота',
+    icon: 'ShieldCheck',
+    // `event`/`elementId` можно не писать: пустые поля означают «шаг выполнен»
+    // (`CompleteBlock`) и следующий блок по единственной исходящей связи узла
+  },
+]);
 ```
 
 ### Шаг 4. Привязать сторону сервиса
@@ -857,6 +1077,13 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
     запуск шёл от движка, ему понадобится разбор триггера задеплоенной схемы,
     создание экземпляра целевого процесса, вход в `firstElementId` и перенос
     перечисленных в `payloadKeys` полей контекста источника.
+13. **Метрики процессов считает клиент, а не движок.** Время выполнения хранится
+    в браузере (ключ `bpmn-process-metrics`) и видно только тому, кто запускал
+    процессы: другой клиент, очищенное хранилище или запуск не из UI оставят
+    инфографику пустой. Финишем считается токен на узле без исходящих связей по
+    текущей схеме контура, поэтому правка схемы меняет и метрику. Серверная
+    метрика (из `tokens.created_at`/`execution_history`) — следующий шаг: там же
+    появятся время по шагам, ожидание и SLA.
 
 ## Карта исходников
 
@@ -870,11 +1097,14 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 | [`bpmn-gateways/websocket-cluster/index.js`](bpmn-gateways/websocket-cluster/index.js) | Вещание `mes.bpmn.v1.event.>` в `ws://<host>:8081/ws/status` |
 | [`erp-simulator/src/bpmn-sdk/client/httpClient.js`](erp-simulator/src/bpmn-sdk/client/httpClient.js) | `sendEvent(instanceId, eventName, elementId, outputData)`, `deploySchema(org, xml)` |
 | [`erp-simulator/src/bpmn-sdk/constants.js`](erp-simulator/src/bpmn-sdk/constants.js) | `ENGINE_EVENTS`, `ENGINE_ELEMENTS`, `INSTANCE_PREFIX`, `TOKEN_STATES`, `ELEMENT_ID_PATTERN` |
-| [`erp-simulator/src/bpmn-sdk/xml/bpmnXml.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.js) | Поиск/переименование узлов (`id`), роли (`bpmn:potentialOwner`) и триггера (`trg:processTrigger`) в XML |
+| [`erp-simulator/src/bpmn-sdk/xml/bpmnXml.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.js) | Поиск/переименование узлов (`id`), роли (`bpmn:potentialOwner`), триггер (`trg:processTrigger`) и кнопки участников (`act:userAction`) в XML, вывод адреса кнопки из связей (`resolveAction`, `getNextElementId`), проверка совместимости схемы с движком (`validateEngineSchema`) |
 | [`erp-simulator/src/bpmn-sdk/xml/triggerModdle.js`](erp-simulator/src/bpmn-sdk/xml/triggerModdle.js) | Moddle-пакет `trg`: тип `trg:ProcessTrigger`, поля триггера и `TRIGGER_MODELE_EXTENSIONS` для редактора |
-| [`erp-simulator/src/bpmn-sdk/panels/EnginePanel.jsx`](erp-simulator/src/bpmn-sdk/panels/EnginePanel.jsx) | Инспектор узла: `id`, название, роль исполнителя, триггер запуска другого процесса |
+| [`erp-simulator/src/bpmn-sdk/xml/actionModdle.js`](erp-simulator/src/bpmn-sdk/xml/actionModdle.js) | Moddle-пакет `act`: тип `act:UserAction`, поля кнопки и `ACTION_MODELE_EXTENSIONS` для редактора |
+| [`erp-simulator/src/bpmn-sdk/panels/EnginePanel.jsx`](erp-simulator/src/bpmn-sdk/panels/EnginePanel.jsx) | Инспектор узла: `id`, название, роль исполнителя, кнопки участников, триггер запуска другого процесса |
 | [`erp-simulator/src/roles.js`](erp-simulator/src/roles.js) | Демо-пользователи и словарь ролей (`ROLE_CODES`) для инспектора узлов |
 | [`erp-simulator/src/schemaStore.js`](erp-simulator/src/schemaStore.js) | Кэш схем в браузере: `saveSchema`/`loadSchema`/`clearSchema`, ключ `bpmn-schema:<ORG>` |
-| [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) | Демо-привязки: роль → кнопка → `sendEvent`; сохранение/сброс схемы; подсказки триггера — `getProcessIds` из схемы второй стороны |
+| [`erp-simulator/src/metricsStore.js`](erp-simulator/src/metricsStore.js) | Метрики запусков в браузере: `beginRun`/`completeRun`/`loadRuns`/`clearRuns`, ключ `bpmn-process-metrics`, агрегаты инфографики (`summarizeRuns`, `groupRunsByProcess`) |
+| [`erp-simulator/src/MetricsPanel.jsx`](erp-simulator/src/MetricsPanel.jsx) | Инфографика руководителя: карточка на процесс, плитки времени, столбики последних запусков |
+| [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) | Демо-привязки: роль → кнопка из схемы (`ACTION_ID`) → `sendEvent`; кнопки вне `ACTION_ID` — общим шагом (`schemaStepActions`); сохранение/сброс схемы; подсказки триггера — `getProcessIds` из схемы второй стороны; метрики запусков — `beginRun` на старте и `completeRun` по токену на конечном узле |
 | [`tests/test_workflow.py`](tests/test_workflow.py) | E2E-проверка привязок через HTTP, БД, NATS и WS |
 | [`schema.sql`](schema.sql), [`db-init-configmap.yaml`](db-init-configmap.yaml) | Таблицы и ограничения по длинам идентификаторов |
