@@ -1,0 +1,4 @@
+# Все shell-скрипты запускаются из bash (WSL / Git Bash / Linux).
+# CRLF внутри скрипта ломает разбор: `set: -\r: invalid option`,
+# `syntax error near unexpected token do\r` и т.п.
+*.sh text eol=lf

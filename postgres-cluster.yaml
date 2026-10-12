@@ -5,6 +5,22 @@ metadata:
 spec:
   instances: 1
 
+  # Начальные учётные данные берём из db-secrets (ключи username/password),
+  # чтобы они совпадали с DATABASE_URL, который использует bpmn-engine
+  # (postgres://bpmn_user:...@bpmn-db-rw:5432/bpmn_db).
+  bootstrap:
+    initdb:
+      database: bpmn_db
+      owner: bpmn_user
+      secret:
+        name: db-secrets
+      # Схему БД (и seed-данные) берём из ConfigMap db-init-script.
+      # apply в deploy.sh идёт по алфавиту, поэтому configmap создаётся раньше кластера.
+      postInitApplicationSQLRefs:
+        configMapRefs:
+          - name: db-init-script
+            key: init.sql
+
   resources:
     requests:
       memory: "256Mi"

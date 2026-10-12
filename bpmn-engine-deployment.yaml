@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: bpmn-engine-container
-        image: bpmn-engine-inst:latest # Наш скомпилированный Rust-образ
+        image: bpmn-engine-service:latest # Наш скомпилированный Rust-образ
         imagePullPolicy: IfNotPresent
         
         # Переменные окружения для подключения к инфраструктуре
