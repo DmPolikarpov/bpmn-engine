@@ -374,8 +374,9 @@ WS-шлюз вещает токены всем клиентам. Подробн�
 
 Кабинет в [`App.jsx`](erp-simulator/src/App.jsx) показывает блок шага, если роль
 узла из схемы равна роли вошедшего пользователя (`canWork(org, [element_id, ...])`),
-а не по захардкоженному списку; словарь ролей для выпадающего списка инспектора —
-`ROLE_CODES` из [`erp-simulator/src/roles.js`](erp-simulator/src/roles.js).
+а не по захардкоженному списку; роли для входа и выпадающего списка инспектора
+собираются из проекта — каталог `role:catalog` и назначения
+`bpmn:potentialOwner` ([`erp-simulator/src/projectRoles.js`](erp-simulator/src/projectRoles.js)).
 
 ### Как назначить роль
 
@@ -405,8 +406,9 @@ setElementRole(xml, 'Task_QualityControl', '');         // снять роль
   узлом, и роль «уехала» бы вместе с шагом;
 - роль нельзя записать в событие, шлюз или `sequenceFlow` — вместо молчаливой
   потери элемента SDK бросает ошибку;
-- роль, для которой нет пользователя, не теряется: инспектор показывает её в
-  списке, даже если такой роли нет среди `ROLE_CODES`.
+- роль, для которой нет каталога, не теряется: её название — сам код
+  (`potentialOwner name="Кладовщик"` → титул «Кладовщик»), поэтому загруженный
+  BPMN играется без правок кода, а инспектор показывает такую роль в списке.
 
 Проверки в коде:
 [`bpmnXml.test.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.test.js) (текстовые
@@ -627,18 +629,24 @@ API SDK: `listActions`, `getElementActions`, `getElementAction`,
 > Демо-схемы SDK кнопки несут; кнопка «Демо-схема» в панели схемы возвращает их,
 > если в браузере осталась копия от прежней версии.
 
-## Локальный кэш схемы (`localStorage`)
+## Проект в браузере (`localStorage`)
 
 Правки редактора живут в состоянии React, поэтому без сохранения F5 возвращал
-демо-схему SDK. Кнопка «Сохранить схему» пишет копию в `localStorage` браузера
-([`erp-simulator/src/schemaStore.js`](erp-simulator/src/schemaStore.js)), а
-приложение при следующем открытии стартует не с демо-схемы, а с этой копией:
+демо-проект SDK. Кнопка «Сохранить схему» пишет проект целиком в `localStorage`
+браузера ([`erp-simulator/src/projectStore.js`](erp-simulator/src/projectStore.js)),
+а приложение при следующем открытии стартует не с демо-проекта, а с этой копией:
 
 | Что | Функция | Ключ в хранилище |
 | --- | --- | --- |
-| Сохранить | `saveSchema(org, xml)` — запись `{org, xml, savedAt}` | `bpmn-schema:<ORG>` |
-| Подхватить | `loadSchema(org)` → `xml` либо `null` | тот же |
-| Забыть | кнопка «Демо-схема» → `clearSchema(org)` | запись удаляется |
+| Создать | `createProject({name, xml})` | `bpmn-projects` (список) |
+| Изменить | `updateProject(id, {xml, name})` | тот же |
+| Удалить | `deleteProject(id)` | тот же |
+| Активный | `ensureDefaultProject()` → запись; `setActiveProjectId(id)` | `bpmn-projects:active` |
+
+Проект — одна схема с процессами обеих сторон (`bpmn:collaboration`), поэтому
+правка роли у Заказчика сразу видна и процессу Поставщика: двух независимых
+копий (`bpmn-schema:CUSTOMER`/`:SUPPLIER`) больше нет. Старый кэш мигрирует
+`migratedProjectXml` — одноразово, при первом открытии приложения.
 
 Детали:
 
@@ -646,26 +654,23 @@ API SDK: `listActions`, `getElementActions`, `getElementAction`,
   копия, и деплой он не заменяет — схема уходит в кластер только кнопкой
   «Задеплоить BPMN в Оркестратор» (либо в `output_data.bpmn_xml` при старте
   процесса);
-- **деплой сохраняет копию тоже**, иначе после F5 кабинет показывал бы схему,
+- **деплой сохраняет проект тоже**, иначе после F5 кабинет показывал бы схему,
   которой в кластере уже нет;
-- **копия может быть старше демо-схемы SDK**: если демо-схему дополнили (новый
-  узел, переименование), старт всё равно возьмёт копию из браузера — вернуть
-  актуальную схему SDK можно кнопкой «Демо-схема». Так, после появления в
-  демо-схеме заказчика узла `Task_WaitForSupplierShipment` подсветка этого шага
-  появится только после сброса старой копии;
-- **подпись в панели схемы** говорит, что происходит: «Сохранено в 12:34:56»,
-  «Есть несохранённые изменения» (XML разошёлся с копией) или «Схема по
-  умолчанию» (копии нет — работает демо-схема);
+- **«Демо-схема» меняет только процесс своего контура**: второй остаётся в
+  проекте, иначе сброс одной стороны ломал бы связи `startsProcess`/
+  `counterpartEvent` другой;
+- **подпись в панели схемы** говорит, что происходит: «✅ Сохранено в 12:34:56»
+  или «⚠ Есть несохранённые изменения» (XML разошёлся с сохранённой копией);
 - **хранилище может быть недоступно** (приватный режим, переполненная квота):
-  `saveSchema` вернёт `null`, приложение продолжит работать в памяти, а в ленте
-  появится «Схема не сохранена»;
-- **битая запись приложение не роняет**: нечитаемый JSON или чужой формат
-  считаются отсутствием копии — подхватится демо-схема;
-- **валидность XML проверяет редактор**, а не кэш: `schemaStore` принимает любую
+  `createProject`/`updateProject` вернут `null`, приложение продолжит работать на
+  проекте в памяти (`MEMORY_PROJECT_ID`), а в ленте появится «Схема не сохранена»;
+- **битая запись приложение не роняет**: нечитаемый JSON, запись без `xml` или
+  чужой формат считаются отсутствием проекта — подхватится демо-проект;
+- **валидность XML проверяет редактор**, а не кэш: хранилище принимает любую
   непустую строку и намеренно не дублирует проверку схемы.
 
-Проверки: [`schemaStore.test.js`](erp-simulator/src/schemaStore.test.js)
-(сохранение, битые записи, отказы хранилища) и
+Проверки: [`projectStore.test.js`](erp-simulator/src/projectStore.test.js)
+(CRUD, активный проект, миграция, отказы хранилища) и
 [`App.test.js`](erp-simulator/src/App.test.js) (подхват при старте процесса,
 кнопки сохранения/сброса, «перезагрузка» повторным монтированием).
 
@@ -1101,8 +1106,10 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 | [`erp-simulator/src/bpmn-sdk/xml/triggerModdle.js`](erp-simulator/src/bpmn-sdk/xml/triggerModdle.js) | Moddle-пакет `trg`: тип `trg:ProcessTrigger`, поля триггера и `TRIGGER_MODELE_EXTENSIONS` для редактора |
 | [`erp-simulator/src/bpmn-sdk/xml/actionModdle.js`](erp-simulator/src/bpmn-sdk/xml/actionModdle.js) | Moddle-пакет `act`: тип `act:UserAction`, поля кнопки и `ACTION_MODELE_EXTENSIONS` для редактора |
 | [`erp-simulator/src/bpmn-sdk/panels/EnginePanel.jsx`](erp-simulator/src/bpmn-sdk/panels/EnginePanel.jsx) | Инспектор узла: `id`, название, роль исполнителя, кнопки участников, триггер запуска другого процесса |
-| [`erp-simulator/src/roles.js`](erp-simulator/src/roles.js) | Демо-пользователи и словарь ролей (`ROLE_CODES`) для инспектора узлов |
-| [`erp-simulator/src/schemaStore.js`](erp-simulator/src/schemaStore.js) | Кэш схем в браузере: `saveSchema`/`loadSchema`/`clearSchema`, ключ `bpmn-schema:<ORG>` |
+| [`erp-simulator/src/bpmn-sdk/xml/rolesModdle.js`](erp-simulator/src/bpmn-sdk/xml/rolesModdle.js) | Moddle-пакет `role`: каталог ролей процесса (`role:catalog`, `role:businessRole`) и `ROLE_MODELE_EXTENSIONS` для редактора |
+| [`erp-simulator/src/projectRoles.js`](erp-simulator/src/projectRoles.js) | Роли проекта из схемы: `analyzeProject` (процессы, роли, `roleCodes`, `problems`), `findUser`, `loginOf`, `iconNameOf` |
+| [`erp-simulator/src/projectStore.js`](erp-simulator/src/projectStore.js) | Проекты в браузере: `createProject`/`updateProject`/`deleteProject`/`listProjects`, активный проект (`ensureDefaultProject`), миграция старого кэша схем |
+| [`erp-simulator/src/schemaStore.js`](erp-simulator/src/schemaStore.js) | Старый кэш схем по организациям: `saveSchema`/`loadSchema`/`clearSchema`, ключ `bpmn-schema:<ORG>`; читается только для миграции в проект |
 | [`erp-simulator/src/metricsStore.js`](erp-simulator/src/metricsStore.js) | Метрики запусков в браузере: `beginRun`/`completeRun`/`loadRuns`/`clearRuns`, ключ `bpmn-process-metrics`, агрегаты инфографики (`summarizeRuns`, `groupRunsByProcess`) |
 | [`erp-simulator/src/MetricsPanel.jsx`](erp-simulator/src/MetricsPanel.jsx) | Инфографика руководителя: карточка на процесс, плитки времени, столбики последних запусков |
 | [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) | Демо-привязки: роль → кнопка из схемы (`ACTION_ID`) → `sendEvent`; кнопки вне `ACTION_ID` — общим шагом (`schemaStepActions`); сохранение/сброс схемы; подсказки триггера — `getProcessIds` из схемы второй стороны; метрики запусков — `beginRun` на старте и `completeRun` по токену на конечном узле |
