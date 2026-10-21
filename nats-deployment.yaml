@@ -5,6 +5,12 @@ metadata:
   namespace: default
 spec:
   replicas: 1
+  # PVC с доступом ReadWriteOnce нельзя монтировать в два пода одновременно:
+  # при RollingUpdate новый под стартует до остановки старого, и оба пода
+  # открывают один и тот же store_dir JetStream (файловые блокировки NATS).
+  # Поэтому сначала гасим старый под, затем поднимаем новый.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: nats
@@ -22,6 +28,27 @@ spec:
           name: client
         - containerPort: 8222
           name: monitor
+        # Без проб `rollout status` считает под готовым сразу после старта
+        # контейнера, даже если NATS ещё не отвечает. Монитор отдаёт /healthz,
+        # когда сервер поднялся и готов принимать соединения.
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: monitor
+          periodSeconds: 2
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: monitor
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: monitor
+          periodSeconds: 10
+          failureThreshold: 6
         volumeMounts:
         - name: config-volume
           mountPath: /etc/nats

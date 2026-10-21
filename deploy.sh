@@ -32,7 +32,15 @@ kubectl apply -f nats-deployment.yaml
 kubectl rollout restart deployment/nats-deployment
 
 echo "Waiting for NATS deployment to be ready..."
-kubectl rollout status deployment/nats-deployment --timeout=90s
+# 180s: при первом запуске образу nats:2.11-alpine может понадобиться скачаться,
+# а Recreate-стратегия сначала останавливает старый под.
+if ! kubectl rollout status deployment/nats-deployment --timeout=180s; then
+    echo "ERROR: NATS deployment did not become ready. Current state:"
+    kubectl get pods -l app=nats -o wide || true
+    kubectl describe pods -l app=nats || true
+    kubectl get events --sort-by=.lastTimestamp | tail -n 20 || true
+    exit 1
+fi
 
 # 2. Инициализация JetStream стримов
 echo "[2/8] Running NATS Streams Initialization Job..."
