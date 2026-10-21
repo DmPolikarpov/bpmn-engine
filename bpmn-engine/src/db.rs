@@ -136,3 +136,15 @@ pub async fn update_process_instance_status(
 
     Ok(())
 }
+
+/// Есть ли экземпляр в legacy `process_instances`.
+///
+/// Нужен режиму `graph`: экземпляр, начатый до включения графа, не имеет строки
+/// в вендорных таблицах, и старт создал бы его заново с первого шага.
+pub async fn instance_exists(pool: &PgPool, instance_id: &str) -> Result<bool, sqlx::Error> {
+    let row: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM process_instances WHERE id = $1")
+        .bind(instance_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}

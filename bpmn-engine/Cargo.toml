@@ -5,6 +5,12 @@ edition = "2021"
 
 [dependencies]
 bpm-engine = { path = "vendor/bpm-engine" }
+bpm-engine-adapter-postgres = { path = "vendor/bpm-engine/crates/adapters/postgres" }
+deadpool-postgres = "0.12"
+anyhow = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.38", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate"] }
 serde = { version = "1.0", features = ["derive"] }

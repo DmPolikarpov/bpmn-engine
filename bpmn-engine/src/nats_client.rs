@@ -28,6 +28,28 @@ impl NatsAdapter {
         state: &str,
         payload_data: Option<&Value>,
     ) -> Result<(), async_nats::Error> {
+        self.publish_token_event_with_token_id(
+            instance_id,
+            element_id,
+            state,
+            payload_data,
+            None,
+        )
+        .await
+    }
+
+    /// То же, но с `token_id` движка.
+    ///
+    /// Режим `ENGINE_ROUTING=graph` публикует его для M1.1 (подсветка набора
+    /// активных узлов); legacy-путь оставляет поле пустым.
+    pub async fn publish_token_event_with_token_id(
+        &self,
+        instance_id: &str,
+        element_id: &str,
+        state: &str,
+        payload_data: Option<&Value>,
+        token_id: Option<&str>,
+    ) -> Result<(), async_nats::Error> {
         let subject = format!("mes.bpmn.v1.event.{}", instance_id);
         
         let mut payload_json = json!({
@@ -45,9 +67,38 @@ impl NatsAdapter {
             }
         }
 
+        if let Some(token_id) = token_id {
+            if let Some(obj) = payload_json.as_object_mut() {
+                obj.insert("token_id".to_string(), json!(token_id));
+            }
+        }
+
         let payload_bytes = serde_json::to_vec(&payload_json)?.into();
         self.js.publish(subject, payload_bytes).await?;
         println!("📡 [NATS Publish] Токен {}:{} -> {} (с payload) опубликован в NATS", instance_id, element_id, state);
+
+        Ok(())
+    }
+
+    /// Завершение процесса: `process_completed` или `process_terminated`.
+    ///
+    /// Клиент закрывает запуск по этому событию: у `token_updated` нет
+    /// `element_id`, поэтому старый разбор его отбрасывает (дизайн 5.3).
+    pub async fn publish_process_finished(
+        &self,
+        instance_id: &str,
+        event: &str,
+    ) -> Result<(), async_nats::Error> {
+        let subject = format!("mes.bpmn.v1.event.{}", instance_id);
+        let payload_json = json!({
+            "event": event,
+            "instance_id": instance_id,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        });
+
+        let payload_bytes = serde_json::to_vec(&payload_json)?.into();
+        self.js.publish(subject, payload_bytes).await?;
+        println!("📡 [NATS Publish] {} для {} опубликован в NATS", event, instance_id);
 
         Ok(())
     }

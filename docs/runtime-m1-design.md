@@ -5,7 +5,9 @@
 маршрут процесса должен считаться по графу схемы, а не приходить из события
 клиента.
 
-- Статус: **дизайн согласован, реализация не начата** (21.10.2026).
+- Статус: **шаг 0 реализован** (22.10.2026): вендоринг 0.2.0 с тремя патчами,
+  `bpmn-engine/src/runtime/` за флагом `ENGINE_ROUTING=legacy`, миграция
+  `consumed_event`; шаги 1–3 — по плану раздела 10.1.
 - Область: [`bpmn-engine/src`](../bpmn-engine/src) (Rust), схема демо-проекта
   [`dairyPlant.js`](../erp-simulator/src/bpmn-sdk/defaults/dairyPlant.js), SDK
   [`bpmnXml.js`](../erp-simulator/src/bpmn-sdk/xml/bpmnXml.js).
@@ -671,11 +673,15 @@ fn engine() -> BpmEngine {
 
 - обязательные: `PostgresProcessStore`, `PostgresTokenStore`,
   `CachedDefStore` (обёртка над `PostgresProcessDefStore`);
-- опциональные для M1: `PostgresHistoryRepo` (аудит) и
-  `PostgresParallelJoinRepo` (слияние веток). `external_task_store`,
+- опциональные для M1: `PostgresHistoryRepo` (аудит). `external_task_store`,
   `timer_store`, `outbox`, `compensation` не включаются — их время придёт в
   M2/M3/M5; обработчик `ExternalTaskCompleted` их и не требует
-  (`external_task_completed_handler.rs:32-42`);
+  (`external_task_completed_handler.rs:32-42`). **`PostgresParallelJoinRepo`
+  тоже не подключается**: его `ensure_group` вставляет колонку `id`, которой
+  нет в таблице `parallel_join` (`migrate`, `adapters/postgres/src/lib.rs`), а
+  `try_join` без строки возвращает `true` — ветка «слилась» бы сразу, не
+  дождавшись второй. Слияние держится на in-memory состоянии
+  `TokenArrivedHandler` (ограничение 13);
 - пул: адаптер принимает `deadpool_postgres::Pool` (`create_pool`,
   `adapters/postgres/src/lib.rs:62-80`), а приложение уже использует `sqlx`.
   В M1 живут **два пула к одной БД**: `deadpool` — для движка, `sqlx` — для
@@ -694,27 +700,25 @@ fn engine() -> BpmEngine {
 поэтому гонка приводит к потерянному обновлению: один под перезапишет токены
 и переменные другого.
 
-M1 сериализует обработку **по экземпляру** сессионной advisory-блокировкой
-PostgreSQL:
+M1 сериализует обработку **по экземпляру** advisory-блокировкой PostgreSQL.
+Реализация (`runtime::pump::lock_instance`) берёт её на транзакции sqlx-пула:
 
 ```rust
-// пул движка (deadpool), тот же, что у Postgres*-сторов
-let mut client = pg_pool.get().await?;                       // deadpool::PoolError
-let key: i64 = client
-    .query_one("SELECT hashtextextended($1, 0)", &[&instance_id]).await?
-    .get(0);
-client.execute("SELECT pg_advisory_lock($1)", &[&key]).await?;
+let mut tx = pool.begin().await?;                     // sqlx-пул
+tx.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", ...).await?;
 
 let result = pump_and_project(instance_id, event).await;
 
-client.execute("SELECT pg_advisory_unlock($1)", &[&key]).await?;
+tx.commit().await?;                                   // блокировка снимается
 ```
 
 - блокировка берётся **до** загрузки снимка «до» и держится до записи
   read-model;
-- соединение под блокировкой — из пула движка; наши записи идут через
-  `sqlx`-пул, но advisory-блокировка видна любой сессии той же БД, поэтому
-  второй пул её не обходит;
+- выбран `pg_advisory_xact_lock` на sqlx-соединении, а не `pg_advisory_lock` на
+  соединении движка: сессионная блокировка «зависает» на коннекте, если тот
+  вернётся в пул без `unlock`, а пумпа сама занимает коннекты `deadpool` под
+  сторы. Advisory-блокировка видна любой сессии той же БД, поэтому второй пул
+  её не обходит;
 - под, упавший с блокировкой, теряет сессию — PostgreSQL отпускает её сам;
 - основной цикл обрабатывает сообщения последовательно (без `tokio::spawn` на
   сообщение), поэтому внутри пода порядок сохраняется, а между подами его
@@ -900,8 +904,11 @@ legacy-путь снова пишет `tokens` по `element_id`; экземпл
 | Уровень | Что проверяем | Где |
 | --- | --- | --- |
 | Rust unit | `eval_condition`: кавычки/без, `and`/`or`, отсутствующая переменная, нечисловое сравнение, голая переменная; `parse_condition` снимает `${}` | `crates/runtime/src/el.rs` (уже есть) |
-| Rust unit | `output_data` → `variables`: скаляры → строки, `null`/вложенные объекты/`bpmn_xml`/`token_id`/`org_type` отбрасываются | `runtime/vars.rs` |
+| Rust unit | `output_data` → `variables`: скаляры → строки, `null`/вложенные объекты/`bpmn_xml`/`token_id`/`org_type` отбрасываются | `runtime/vars.rs` (реализовано) |
 | Rust unit | шлюз: `default` при `false` (в т.ч. default-связь **без** `conditionExpression` — после патча 3), первая связь без условия выигрывает, порядок связей | `runtime/pump.rs` тесты на memory-сторах, `bpmn-engine/tests/vendor_patches.rs` |
+| Rust unit | проекция: старт активирует ожидающие шаги, движение токена закрывает прежний шаг и активирует новый, `End` закрывает последний шаг, повторная доставка пуста | `runtime/project.rs` (реализовано) |
+| Rust unit | кэш определений: сто `load` → одна компиляция, изменение XML → перекомпиляция, предел 64 записи | `runtime/store.rs` (реализовано) |
+| Rust unit | `ENGINE_ROUTING`: `graph` (в любом регистре) включает граф, всё остальное — `legacy` | `runtime/mod.rs` (реализовано) |
 | Rust unit | `default` без условия (патч 3): `parse_and_compile` даёт `Some(Default)` на default-связи и `Some(Expression)` на остальных | `bpmn-engine/tests/vendor_patches.rs` |
 | Rust unit | `UserTaskCompleted` (патч): переменные попали в инстанс, удалён только один `Waiting`-токен, `parallel_group_id` сохранён | `bpmn-engine/tests/vendor_patches.rs` |
 | Rust integration | пять шлюзов демо-схемы, обе/три ветки; `stockSufficient=true/false` доходит до `Task_Ship`/`Task_CreatePO` | `bpmn-engine/tests/dairy_routing.rs` (Postgres из `DATABASE_URL`, скип без него) |
@@ -932,6 +939,7 @@ legacy-путь снова пишет `tokens` по `element_id`; экземпл
 | 10 | Клиент остаётся «одноактивным»; параллельные ветки в кабинете не подсвечиваются | в демо-схеме нет `parallelGateway` | M1.1 (подсветка набора узлов) |
 | 11 | Ошибки процесса не уходят клиенту, DLQ нет | логи пода | M6/M7 |
 | 12 | Деплой определения — upsert по `def.id`, без версий | переименование `@id` при изменении графа (10.1) | M4 |
+| 13 | `PostgresParallelJoinRepo` несовместим со своей схемой: `ensure_group` вставляет `id`, `try_join` без строки считает ветку слившейся | репозиторий не подключается, слияние — in-memory в `TokenArrivedHandler` (9.2); в демо нет `parallelGateway` | патч вендора (кандидат в апстрим) или своя реализация `ParallelJoinRepo` |
 
 Маршрут после M1: M1.1 — `token_id` в контракте и подсветка набора активных
 узлов; M2 — живые `serviceTask` (воркеры, ретраи, идемпотентность ответов);
