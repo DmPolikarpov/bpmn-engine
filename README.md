@@ -1115,3 +1115,4 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 | [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) | Демо-привязки: роль → кнопка из схемы (`ACTION_ID`) → `sendEvent`; кнопки вне `ACTION_ID` — общим шагом (`schemaStepActions`); сохранение/сброс схемы; подсказки триггера — `getProcessIds` из схемы второй стороны; метрики запусков — `beginRun` на старте и `completeRun` по токену на конечном узле |
 | [`tests/test_workflow.py`](tests/test_workflow.py) | E2E-проверка привязок через HTTP, БД, NATS и WS |
 | [`schema.sql`](schema.sql), [`db-init-configmap.yaml`](db-init-configmap.yaml) | Таблицы и ограничения по длинам идентификаторов |
+| [`erp-simulator/docs/dairy-plant-roadmap.md`](erp-simulator/docs/dairy-plant-roadmap.md) | Дорожная карта демо-проекта «Молочный завод»: что уже играется в кабинете, какие разрывы (граф, воркеры, межпроцессные сообщения, роли, метрики) и в каком порядке закрываются (M1–M8) |
