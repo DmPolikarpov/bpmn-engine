@@ -2,8 +2,6 @@ mod events;
 mod nats_client;
 mod db;
 
-use bpm_engine::bpm_engine_runtime::Engine;
-use bpm_engine::bpm_engine_adapter_memory::MemoryTokenStore;
 use bpm_engine::bpm_engine_bpmn::parse_and_compile;
 
 use chrono::Utc;
@@ -13,9 +11,7 @@ use nats_client::NatsAdapter;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use std::env;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 #[tokio::main]
@@ -32,8 +28,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     sqlx::migrate!("./migrations").run(&pool).await?;
     println!("✅ Миграции базы данных успешно применены!");
 
-    let store = Arc::new(MemoryTokenStore::new());
-    let engine = Arc::new(Mutex::new(Engine::new(store)));
+    // Движок графа подключается на шаге M1 (`src/runtime/`, дизайн —
+    // `docs/runtime-m1-design.md`). До переключения `ENGINE_ROUTING=graph`
+    // маршрут по-прежнему считает клиент (`element_id` в событии), а
+    // `bpm-engine` здесь нужен только для `parse_and_compile` при деплое.
 
     let nats_adapter = NatsAdapter::new().await?;
     let consumer = nats_adapter.create_inbound_consumer().await?;

@@ -6,8 +6,9 @@ RUN apk add --no-cache musl-dev build-base
 
 WORKDIR /usr/src/app
 
-# Шаг A: Копируем ТОЛЬКО файлы зависимостей
-COPY Cargo.toml Cargo.lock* ./
+# Шаг A: Копируем ТОЛЬКО файлы зависимостей и вендорный движок
+COPY Cargo.toml Cargo.lock* rust-toolchain.toml ./
+COPY vendor ./vendor
 
 # Шаг B: Создаем временный пустой проект и собираем зависимости
 RUN mkdir src && \

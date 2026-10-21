@@ -124,10 +124,13 @@ crates.io), правится один модуль.
 ```text
 bpmn-engine/
 ├── Cargo.toml                  # bpm-engine = { path = "vendor/bpm-engine" }
+├── rust-toolchain.toml         # 1.89 — та же версия, что в Dockerfile
 ├── Dockerfile                  # COPY vendor ./vendor  — до сборки зависимостей
+├── tests/vendor_patches.rs     # проверки трёх патчей (см. 4.3)
 └── vendor/bpm-engine/
     ├── Cargo.toml              # корневой крейт bpm-engine (facade)
-    ├── LICENSE                 # MIT, сохраняется как есть
+    ├── Cargo.lock              # lock вендора — для сверки версий при обновлении
+    ├── LICENSE.txt             # MIT, сохраняется как есть
     ├── VENDORED_FROM.md        # URL, commit, дата, применённые патчи
     └── crates/
         ├── core/               # ProcessDefinition, Node, Token, EngineEvent

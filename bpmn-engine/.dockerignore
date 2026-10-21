@@ -1,0 +1,6 @@
+# Артефакты сборки не должны уезжать в контекст docker build
+target/
+vendor/bpm-engine/target/
+
+# Локальные логи
+*.log
