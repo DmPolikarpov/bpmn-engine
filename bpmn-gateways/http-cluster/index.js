@@ -29,7 +29,7 @@ function applyCors(req, res) {
 
     res.setHeader('Access-Control-Allow-Origin', allowOrigin);
     res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     res.setHeader('Access-Control-Max-Age', '600');
 }
@@ -157,6 +157,32 @@ app.get('/health', (req, res) => {
         nats_connected: Boolean(nc),
         jetstream: Boolean(js),
         body_limit: JSON_BODY_LIMIT
+    });
+});
+
+/**
+ * Корень шлюза. `translate_ports.sh` печатает ссылку
+ * `http://localhost:8080`, и её открывают в браузере, а Express на
+ * неизвестный путь отвечает HTML-страницей «Cannot GET /». Здесь отдаём
+ * JSON-карту маршрутов: сразу видно, что проброс жив и что 8080 — это
+ * REST API, а не UI (клиент `erp-simulator` поднимается отдельно на 3000).
+ */
+app.get('/', (req, res) => {
+    res.json({
+        service: 'http-cluster-gateway',
+        description: 'REST API шлюза BPMN-оркестратора. UI (erp-simulator) запускается отдельно: npm start -> http://localhost:3000',
+        routes: [
+            {
+                method: 'POST',
+                path: '/api/v1/process/instances/:id/events',
+                description: 'Публикация события процесса в NATS (mes.in.v1.event.erp.<event_name>)'
+            },
+            {
+                method: 'GET',
+                path: '/health',
+                description: 'Проверка проброса и состояния подключения к NATS/JetStream'
+            }
+        ]
     });
 });
 
