@@ -566,6 +566,7 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
 | `event`, `elementId` | `event_name` и `element_id` события нажатия. **Оба необязательны**: пустое `event` — «шаг выполнен» (`DEFAULT_ACTION_EVENT` = `CompleteBlock`), пустой `elementId` — следующий блок по единственной исходящей связи узла (`getNextElementId`). Записанное в схеме значение всегда важнее умолчания |
 | `counterpartEvent`, `counterpartElementId` | необязательный сигнал в экземпляр второй стороны по тому же заказу |
 | `startsProcess` | `bpmn:process/@id` процесса второй стороны, который запускает нажатие |
+| `variables` | переменные процесса, которые выставляет нажатие: пары `ключ=значение` через `;` (`stockSufficient=true`). Клиент добавляет их в `output_data` события; по ним `conditionExpression` шлюза выбирает ветку (M1, см. [дизайн рантайма графа](docs/runtime-m1-design.md#81-расширение-actuseractionvariables)) |
 
 Почему так: движок имя события не разбирает — оно уходит только в subject NATS
 (`mes.in.v1.event.erp.${event_name}`) и в журнал, а токен двигает `element_id`
@@ -604,11 +605,11 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
 
 API SDK: `listActions`, `getElementActions`, `getElementAction`,
 `getActionAssignments`, `getStartAction`, `setElementActions`, `normalizeAction`,
-`isValidAction`, `isActionHostType`, `ACTION_FIELDS`, `EMPTY_ACTION`,
-`ACTION_TYPE`, `ACTION_NAMESPACE`, `ACTION_MODELE_EXTENSIONS`, а для вывода адреса
-кнопки из связей — `resolveAction`, `resolveActionEvent`, `resolveActionTarget`,
-`getNextElementId`, `getOutgoingTargetIds`, `DEFAULT_ACTION_EVENT` — подробности и
-правила записи в
+`isValidAction`, `isActionHostType`, `parseActionVariables`, `ACTION_FIELDS`,
+`EMPTY_ACTION`, `ACTION_TYPE`, `ACTION_NAMESPACE`, `ACTION_MODELE_EXTENSIONS`, а
+для вывода адреса кнопки из связей — `resolveAction`, `resolveActionEvent`,
+`resolveActionTarget`, `getNextElementId`, `getOutgoingTargetIds`,
+`DEFAULT_ACTION_EVENT` — подробности и правила записи в
 [README SDK](erp-simulator/src/bpmn-sdk/README.md#кнопки-участников-узла).
 
 Как назначить кнопку:
