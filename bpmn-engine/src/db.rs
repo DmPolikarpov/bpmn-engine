@@ -14,9 +14,9 @@ pub async fn save_process_definition(
         DO UPDATE SET bpmn_xml = EXCLUDED.bpmn_xml
         "#,
     )
-    .bind(process_id)      // Совпадает с id из init.sql
-    .bind(process_id)      // Имя процесса
-    .bind(bpmn_xml)        // Совпадает с bpmn_xml из init.sql
+    .bind(process_id) // Совпадает с id из init.sql
+    .bind(process_id) // Имя процесса
+    .bind(bpmn_xml) // Совпадает с bpmn_xml из init.sql
     .execute(pool)
     .await?;
 
@@ -37,8 +37,8 @@ pub async fn save_process_instance(
         DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
         "#,
     )
-    .bind(instance_id)     // Совпадает с id из init.sql
-    .bind(process_id)      // Совпадает с definition_id из init.sql
+    .bind(instance_id) // Совпадает с id из init.sql
+    .bind(process_id) // Совпадает с definition_id из init.sql
     .execute(pool)
     .await?;
 

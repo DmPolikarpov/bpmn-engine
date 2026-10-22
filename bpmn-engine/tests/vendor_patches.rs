@@ -179,10 +179,7 @@ async fn user_task_variables_reach_gateway() {
             EngineEvent::ProcessStarted(payloads::ProcessStarted {
                 process_id: GATEWAY_PROCESS_ID.to_string(),
                 instance_id: "inst-approval".to_string(),
-                initial_variables: Some(HashMap::from([(
-                    "decision".to_string(),
-                    String::new(),
-                )])),
+                initial_variables: Some(HashMap::from([("decision".to_string(), String::new())])),
             }),
             &mut ctx,
         )
