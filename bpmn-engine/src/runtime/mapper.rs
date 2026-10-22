@@ -71,11 +71,7 @@ pub fn user_task_completed(instance_id: &str, step: &Step, output_data: &Value) 
 }
 
 /// Завершение внешней задачи (`serviceTask`) по ответу ERP.
-pub fn external_task_completed(
-    instance_id: &str,
-    step: &Step,
-    payload: &Value,
-) -> EngineEvent {
+pub fn external_task_completed(instance_id: &str, step: &Step, payload: &Value) -> EngineEvent {
     EngineEvent::ExternalTaskCompleted(payloads::ExternalTaskCompleted {
         instance_id: instance_id.to_string(),
         token_id: step.token_id.clone(),
@@ -115,7 +111,10 @@ mod tests {
 
     #[test]
     fn token_hint_is_optional() {
-        assert_eq!(token_id_hint(&json!({"token_id": "token-1"})), Some("token-1"));
+        assert_eq!(
+            token_id_hint(&json!({"token_id": "token-1"})),
+            Some("token-1")
+        );
         assert_eq!(token_id_hint(&json!({"token_id": ""})), None);
         assert_eq!(token_id_hint(&json!({})), None);
     }
@@ -153,7 +152,10 @@ mod tests {
         };
         assert_eq!(payload.task_id, "token-1");
         assert_eq!(payload.node_id, "Task_CheckStock");
-        assert_eq!(payload.variables.get("stockSufficient"), Some(&"true".to_string()));
+        assert_eq!(
+            payload.variables.get("stockSufficient"),
+            Some(&"true".to_string())
+        );
         assert!(!payload.variables.contains_key("token_id"));
     }
 
@@ -164,7 +166,9 @@ mod tests {
             element_id: "ServiceTask_ValidateOrder".to_string(),
             status: status.to_string(),
             error_message: None,
+            retryable: false,
             payload: json!({}),
+            idempotency_key: None,
         };
 
         assert!(erp_succeeded(&response("SUCCESS")));
@@ -180,7 +184,10 @@ mod tests {
             element_id: "Process_Deployment".to_string(),
             payload: json!({"bpmn_xml": "<definitions/>", "org_type": "DAIRY"}),
         };
-        assert!(is_deploy_only(&deploy), "служебный деплой не создаёт инстанс");
+        assert!(
+            is_deploy_only(&deploy),
+            "служебный деплой не создаёт инстанс"
+        );
 
         let start = InboundEvent {
             event_id: "evt-start".to_string(),

@@ -348,7 +348,11 @@ mod tests {
         let source = Arc::new(StaticXmlSource::new(&[]));
         let cache = store(source);
 
-        assert!(cache.load("missing").await.expect("load без ошибок").is_none());
+        assert!(cache
+            .load("missing")
+            .await
+            .expect("load без ошибок")
+            .is_none());
         assert_eq!(cache.compilations(), 0);
     }
 

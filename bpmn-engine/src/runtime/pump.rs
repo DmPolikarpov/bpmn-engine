@@ -114,6 +114,56 @@ pub fn step_kind(definition: &ProcessDefinition, node_id: &str) -> Option<StepKi
     }
 }
 
+/// Параметры `serviceTask` из схемы (дизайн `docs/runtime-m1-design.md`, 10.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalTaskSpec {
+    /// Тема воркера: `camunda:topic` (по умолчанию `default`).
+    pub task_type: String,
+    /// Сколько раз задача может быть переотправлена (ретраи — следующий шаг M2).
+    pub retries: i32,
+    /// Таймаут выполнения в секундах: из него считается `deadline` команды.
+    pub timeout_secs: u64,
+}
+
+/// Достаёт параметры `serviceTask`; для остальных узлов — `None`.
+pub fn external_task_spec(
+    definition: &ProcessDefinition,
+    node_id: &str,
+) -> Option<ExternalTaskSpec> {
+    match &definition.nodes.get(node_id)?.node_type {
+        NodeType::ExternalTask {
+            task_type,
+            retries,
+            timeout_secs,
+        } => Some(ExternalTaskSpec {
+            task_type: task_type.clone(),
+            retries: *retries,
+            timeout_secs: *timeout_secs,
+        }),
+        _ => None,
+    }
+}
+
+/// Хост-узел ответа ERP.
+///
+/// Явный `element_id` — адрес задачи: если такого ожидающего `serviceTask`
+/// нет, ответ не применяется. Иначе устаревший или повторный ответ закрыл бы
+/// соседний узел, который ждёт своей команды (дизайн 10.4). Без `element_id`
+/// работает прежний выбор по `token_id` или единственному ожидающему шагу.
+pub fn erp_host_step(
+    snapshot: &Snapshot,
+    element_id: Option<&str>,
+    token_id: Option<&str>,
+) -> Option<Step> {
+    match element_id {
+        Some(node_id) => snapshot.waiting_steps().into_iter().find(|step| {
+            step.element_id == node_id
+                && step_kind(&snapshot.definition, &step.element_id) == Some(StepKind::ExternalTask)
+        }),
+        None => snapshot.host_step(StepKind::ExternalTask, token_id, None),
+    }
+}
+
 /// Список хендлеров M1 (дизайн 9.2).
 ///
 /// `HistoryHandler` без `history_repo` в контексте сразу возвращает пусто,
@@ -215,6 +265,145 @@ pub async fn mark_consumed(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Состояние ретрая внешней задачи (таблица `erp_retry`, миграция 0002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryState {
+    /// Сколько ретраев уже запланировано (не считая первого ответа воркера).
+    pub attempts: i32,
+    /// Ретрай запланирован, но ещё не отправлен: ответ на такую команду —
+    /// повтор предыдущего сообщения, а не новая ошибка.
+    pub pending: bool,
+}
+
+/// Задача, которую пора переотправить воркеру после backoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryJob {
+    /// Ключ команды: он же ключ строки `erp_retry`.
+    pub idempotency_key: String,
+    /// Экземпляр процесса.
+    pub instance_id: String,
+    /// Узел `serviceTask`.
+    pub element_id: String,
+    /// Токен, который ждёт ответа: команда должна вернуть тот же ключ.
+    pub token_id: String,
+    /// Сколько ретраев уже сделано (для логов и `ActionRequiredEvent`).
+    pub attempts: i32,
+}
+
+/// Состояние ретрая по ключу команды; `None` — ретраев ещё не было.
+pub async fn load_retry(pool: &PgPool, key: &str) -> Result<Option<RetryState>, sqlx::Error> {
+    let row: Option<(i32, bool)> = sqlx::query_as(
+        "SELECT attempts, (dispatched_at IS NULL) AS pending FROM erp_retry WHERE idempotency_key = $1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(attempts, pending)| RetryState { attempts, pending }))
+}
+
+/// Планирует переотправку команды через `delay_secs` секунд.
+///
+/// `attempts` — общее число ретраев после этой записи: движок присылает
+/// `attempts + 1`, чтобы счётчик в БД сходился с `camunda:retries`.
+#[allow(clippy::too_many_arguments)]
+pub async fn schedule_retry(
+    pool: &PgPool,
+    key: &str,
+    instance_id: &str,
+    element_id: &str,
+    token_id: &str,
+    attempts: i32,
+    last_status: &str,
+    last_error: Option<&str>,
+    delay_secs: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO erp_retry (
+            idempotency_key, instance_id, element_id, token_id,
+            attempts, last_status, last_error, next_attempt_at, dispatched_at
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7,
+            NOW() + ($8::bigint * INTERVAL '1 second'), NULL
+        )
+        ON CONFLICT (idempotency_key) DO UPDATE SET
+            attempts = EXCLUDED.attempts,
+            last_status = EXCLUDED.last_status,
+            last_error = EXCLUDED.last_error,
+            next_attempt_at = EXCLUDED.next_attempt_at,
+            dispatched_at = NULL,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(key)
+    .bind(instance_id)
+    .bind(element_id)
+    .bind(token_id)
+    .bind(attempts)
+    .bind(last_status)
+    .bind(last_error)
+    .bind(delay_secs)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Забывает ретраи команды: шаг завершён, отменён или ретраи исчерпаны.
+pub async fn clear_retry(pool: &PgPool, key: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM erp_retry WHERE idempotency_key = $1")
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Забирает до `limit` созревших ретраев и отодвигает их на `lease_secs`.
+///
+/// `FOR UPDATE SKIP LOCKED` разводит поды: один и тот же ретрай не уйдёт
+/// воркеру дважды. Даже если публикация сорвётся, команда выйдет после
+/// аренды — а лишняя доставка безопасна: ключ идемпотентности тот же.
+pub async fn claim_due_retries(
+    pool: &PgPool,
+    limit: i64,
+    lease_secs: i64,
+) -> Result<Vec<RetryJob>, sqlx::Error> {
+    let rows: Vec<(String, String, String, String, i32)> = sqlx::query_as(
+        r#"
+        UPDATE erp_retry
+        SET dispatched_at = NOW(),
+            next_attempt_at = NOW() + ($2::bigint * INTERVAL '1 second'),
+            updated_at = NOW()
+        WHERE idempotency_key IN (
+            SELECT idempotency_key
+            FROM erp_retry
+            WHERE next_attempt_at <= NOW()
+            ORDER BY next_attempt_at
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING idempotency_key, instance_id, element_id, token_id, attempts
+        "#,
+    )
+    .bind(limit)
+    .bind(lease_secs)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(idempotency_key, instance_id, element_id, token_id, attempts)| RetryJob {
+                idempotency_key,
+                instance_id,
+                element_id,
+                token_id,
+                attempts,
+            },
+        )
+        .collect())
 }
 
 #[cfg(test)]
@@ -322,7 +511,11 @@ mod tests {
             definition,
         };
 
-        assert_eq!(snapshot.waiting_steps().len(), 2, "проходной startEvent не шаг");
+        assert_eq!(
+            snapshot.waiting_steps().len(),
+            2,
+            "проходной startEvent не шаг"
+        );
         assert_eq!(
             snapshot.host_step(StepKind::UserTask, None, None),
             None,
@@ -370,6 +563,72 @@ mod tests {
             snapshot.host_step(StepKind::UserTask, None, None),
             None,
             "serviceTask не завершается событием userTask"
+        );
+    }
+
+    #[test]
+    fn erp_response_targets_only_its_node() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="http://bpmn-engine.local">
+  <process id="runtime_pump_test" name="Pump" isExecutable="true">
+    <startEvent id="Start"/>
+    <serviceTask id="ServiceTask_A" name="A"/>
+    <serviceTask id="ServiceTask_B" name="B"/>
+    <endEvent id="End"/>
+    <sequenceFlow id="F1" sourceRef="Start" targetRef="ServiceTask_A"/>
+    <sequenceFlow id="F2" sourceRef="ServiceTask_A" targetRef="ServiceTask_B"/>
+    <sequenceFlow id="F3" sourceRef="ServiceTask_B" targetRef="End"/>
+  </process>
+</definitions>"#;
+        let definition = parse_and_compile(xml).expect("схема компилируется");
+        let snapshot = Snapshot {
+            instance: instance(vec![
+                waiting_token("token-a", "ServiceTask_A"),
+                waiting_token("token-b", "ServiceTask_B"),
+            ]),
+            definition,
+        };
+
+        assert_eq!(
+            erp_host_step(&snapshot, Some("ServiceTask_A"), None).map(|step| step.token_id),
+            Some("token-a".to_string())
+        );
+        assert_eq!(
+            erp_host_step(&snapshot, Some("ServiceTask_Old"), None),
+            None,
+            "ответ на чужой/устаревший узел не должен закрывать соседний"
+        );
+        assert_eq!(
+            erp_host_step(&snapshot, None, None),
+            None,
+            "без element_id и двух ожидающих задач выбор неоднозначен"
+        );
+    }
+
+    #[test]
+    fn external_task_spec_reads_topic_and_retries() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+             targetNamespace="http://bpmn-engine.local">
+  <process id="runtime_pump_spec" name="Spec" isExecutable="true">
+    <startEvent id="Start"/>
+    <serviceTask id="ServiceTask_ERP" name="ERP" camunda:topic="erp" camunda:retries="2"/>
+    <endEvent id="End"/>
+    <sequenceFlow id="Flow_Start" sourceRef="Start" targetRef="ServiceTask_ERP"/>
+    <sequenceFlow id="Flow_End" sourceRef="ServiceTask_ERP" targetRef="End"/>
+  </process>
+</definitions>"#;
+        let definition = parse_and_compile(xml).expect("схема компилируется");
+
+        let spec = external_task_spec(&definition, "ServiceTask_ERP").expect("serviceTask");
+        assert_eq!(spec.task_type, "erp", "тема воркера — camunda:topic");
+        assert_eq!(spec.retries, 2);
+        assert_eq!(spec.timeout_secs, 60);
+        assert_eq!(
+            external_task_spec(&definition, "Start"),
+            None,
+            "проходной узел не является внешней задачей"
         );
     }
 

@@ -26,6 +26,8 @@ FROM alpine:3.19
 
 WORKDIR /app
 COPY --from=builder /usr/src/app/target/release/bpmn-engine /app/bpmn-engine
+# Мок-воркер ERP (M2) — второй бинарь того же образа: демо без 1С.
+COPY --from=builder /usr/src/app/target/release/erp_mock_worker /app/erp-mock-worker
 
 EXPOSE 8080
 CMD ["./bpmn-engine"]

@@ -1,4 +1,4 @@
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 
 /// Сохранение определения BPMN-процесса в таблицу process_definitions
 pub async fn save_process_definition(
@@ -14,9 +14,9 @@ pub async fn save_process_definition(
         DO UPDATE SET bpmn_xml = EXCLUDED.bpmn_xml
         "#,
     )
-    .bind(process_id)      // Совпадает с id из init.sql
-    .bind(process_id)      // Имя процесса
-    .bind(bpmn_xml)        // Совпадает с bpmn_xml из init.sql
+    .bind(process_id) // Совпадает с id из init.sql
+    .bind(process_id) // Имя процесса
+    .bind(bpmn_xml) // Совпадает с bpmn_xml из init.sql
     .execute(pool)
     .await?;
 
@@ -37,8 +37,8 @@ pub async fn save_process_instance(
         DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
         "#,
     )
-    .bind(instance_id)     // Совпадает с id из init.sql
-    .bind(process_id)      // Совпадает с definition_id из init.sql
+    .bind(instance_id) // Совпадает с id из init.sql
+    .bind(process_id) // Совпадает с definition_id из init.sql
     .execute(pool)
     .await?;
 
@@ -88,35 +88,7 @@ pub async fn save_token_state(
     Ok(())
 }
 
-/// Закрытие всех прочих ACTIVE-токенов экземпляра при активации нового узла.
-///
-/// Инвариант «один активный узел на экземпляр»: пока движок только дописывал
-/// новые ACTIVE-токены, клиент накапливал их и подсвечивал несколько узлов
-/// одновременно. Здесь прежние ACTIVE-токены переводятся в COMPLETED, а их
-/// `element_id` возвращаются вызывающему коду — по ним публикуются события
-/// `token_updated COMPLETED`. Токены в других состояниях (COMPLETED,
-/// TIMED_OUT, FAILED) не затрагиваются, поэтому вызов идемпотентен.
-pub async fn complete_active_tokens(
-    pool: &PgPool,
-    instance_id: &str,
-    keep_element_id: &str,
-) -> Result<Vec<String>, sqlx::Error> {
-    let rows = sqlx::query(
-        r#"
-        UPDATE tokens
-        SET state = 'COMPLETED'
-        WHERE instance_id = $1 AND state = 'ACTIVE' AND element_id <> $2
-        RETURNING element_id;
-        "#,
-    )
-    .bind(instance_id)
-    .bind(keep_element_id)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows.into_iter().map(|row| row.get("element_id")).collect())
-}
-
+/// Статус legacy-инстанса (`process_instances.status`) по проекции движка.
 pub async fn update_process_instance_status(
     pool: &PgPool,
     instance_id: &str,
@@ -139,8 +111,8 @@ pub async fn update_process_instance_status(
 
 /// Есть ли экземпляр в legacy `process_instances`.
 ///
-/// Нужен режиму `graph`: экземпляр, начатый до включения графа, не имеет строки
-/// в вендорных таблицах, и старт создал бы его заново с первого шага.
+/// Нужен рантайму графа: экземпляр, начатый прежним legacy-путём, не имеет
+/// строки в вендорных таблицах, и старт создал бы его заново с первого шага.
 pub async fn instance_exists(pool: &PgPool, instance_id: &str) -> Result<bool, sqlx::Error> {
     let row: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM process_instances WHERE id = $1")
         .bind(instance_id)
