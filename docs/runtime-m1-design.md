@@ -999,9 +999,65 @@ runtime::handle_erp: ключ уже в consumed_event → ack;
   логируется, событие клиента остаётся подтверждённым. Потеря команды лечится
   повтором события или рестартом; outbox — M5.
 
-Осталось за рамками шага: ретраи (`retries`, `retryable`, backoff),
-компенсация через `ActionRequiredEvent`, перевод демо-`Task_ERP_*` на
-`bpmn:serviceTask` и мок-воркер — следующие пункты M2.
+### 10.5 Ретраи, backoff и компенсация ответа (M2)
+
+Неуспешный ответ не двигает токен и не выбрасывается: `runtime::handle_erp_failure`
+решает по `camunda:retries` узла, счётчику попыток и флагу `retryable`.
+
+```text
+status != SUCCESS
+        │
+        ▼
+load_retry(key) — ключ команды <instance>:<element>:<token>
+        │  pending (dispatched_at IS NULL) → повтор сообщения, выходим
+        ▼
+failure_plan(retries, attempts, retryable)
+   !retryable            → Compensate(NOT_RETRYABLE)
+   attempts >= retries   → Compensate(RETRIES_EXHAUSTED)
+   иначе                 → Retry(attempts+1, base·2^attempts)
+        │
+        ▼
+erp_retry: next_attempt_at = now + backoff, dispatched_at = NULL
+        │
+        ▼
+main::retry loop (ERP_RETRY_POLL_SECS, 2 с)
+   claim_due_retries (FOR UPDATE SKIP LOCKED, аренда 30 с)
+   шаг всё ещё ждёт? → worker_command с тем же ключом
+        │
+        ├─ воркер повторяет работу и отвечает снова
+        └─ Compensate → ActionRequiredEvent в mes.out.v1.cmd.<system>
+```
+
+Правила:
+
+- `retries` — `camunda:retries` узла (вендор: 3 по умолчанию), `0` — компенсация
+  сразу. Счётчик `attempts` в `erp_retry` считает уже отправленные ретраи;
+- backoff экспоненциальный: `ERP_RETRY_BASE_SECS` (5 с), потолок
+  `ERP_RETRY_MAX_SECS` (300 с), шаг — `base·2^attempts`;
+- повтор неуспешного ответа не сжигает попытку: пока `dispatched_at IS NULL`
+  (ретрай запланирован, но не отправлен), ответ считается дублем
+  (`erp_retry_pending`). Ответ на уже отправленный ретрай — новая ошибка;
+- успех и компенсация терминальны: ключ пишется в `consumed_event`, строка
+  `erp_retry` удаляется. Ретрай терминальным не считается — ответ на него
+  придёт с тем же ключом;
+- компенсация — `ActionRequiredEvent` (`status: FAILED`, `reason`, `attempts`,
+  `last_status`, `error`) в `mes.out.v1.cmd.<system>`; токен остаётся на шаге,
+  решение за человеком. Мгновенного `FAILED`-перехода у токена нет: вендорный
+  `ExternalTaskFailed` в рантайм M2 не подключён;
+- ретрай не меняет состояние графа: `Outcome` пуст, WS-событий нет (шаг и так
+  `ACTIVE`), клиент видит только подсветку;
+- подов несколько: ретрай выбирается `FOR UPDATE SKIP LOCKED` и уходит после
+  аренды. Лишняя публикация безопасна — `idempotency_key` тот же, воркер
+  обязан гасить повторы (так делает мок-воркер).
+
+Демо переведено на контракт: `Task_ERP_HandleDeviation` и
+`Task_ERP_CriticalAlert` — `bpmn:serviceTask` с `camunda:topic="erp"` и
+`camunda:retries="2"`, кнопки `applyDeviation` / `escalateCritical` удалены.
+Сценарий без 1С закрывает мок-воркер
+(`src/bin/erp_mock_worker.rs`, манифест `erp-mock-worker.yaml`): он читает
+`mes.out.v1.cmd.erp`, отвечает в `mes.in.v1.erp.response` тем же ключом и умеет
+провалить первые `ERP_MOCK_FAIL_FIRST` попыток — это и показывает backoff.
+
 
 ## 11. Тесты
 
@@ -1019,6 +1075,9 @@ runtime::handle_erp: ключ уже в consumed_event → ack;
 | Rust integration | повторный `event_id` не двигает токен; повторный `UserTaskCompleted` без `Waiting`-токена — no-op | `bpmn-engine/tests/idempotency.rs` |
 | Rust unit | `serviceTask`: тема воркера из `camunda:topic`, `retries`, `timeout_secs` | `runtime/pump.rs` (реализовано) |
 | Rust unit | активация `serviceTask` даёт команду (`payload` = переменные, ключ `<instance>:<element>:<token>`, `deadline` RFC 3339); `userTask` команду не даёт | `runtime/mod.rs` (реализовано) |
+| Rust unit | неуспешный ответ: `failure_plan` (retryable → ретрай, исчерпание/`retries = 0` → компенсация), backoff `base·2^n` с потолком, ключ ретрая из команды | `runtime/mod.rs` (реализовано) |
+| Rust unit | мок-воркер: номер документа стабилен по `idempotency_key` (повторный ответ идемпотентен) | `src/bin/erp_mock_worker.rs` (реализовано) |
+| JS unit | демо: `Task_ERP_*` — `serviceTask` с `camunda:topic="erp"` и `camunda:retries`, кнопок у них нет | `dairyPlant.test.js` |
 | JS unit | `variables` кнопки: разбор, запись/чтение XML, `normalizeAction`, ошибки формата | `bpmnXml.test.js` |
 | JS unit | валидатор: шесть новых кодов (7.4), демо-проект без проблем | `bpmnXml.test.js`, `dairyPlant.test.js` |
 | JS unit | маршрут кнопок: для каждого шлюза переменные кнопок дают её же `elementId` | `dairyPlant.test.js` |

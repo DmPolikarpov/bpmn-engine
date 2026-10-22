@@ -267,6 +267,145 @@ pub async fn mark_consumed(
     Ok(())
 }
 
+/// Состояние ретрая внешней задачи (таблица `erp_retry`, миграция 0002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryState {
+    /// Сколько ретраев уже запланировано (не считая первого ответа воркера).
+    pub attempts: i32,
+    /// Ретрай запланирован, но ещё не отправлен: ответ на такую команду —
+    /// повтор предыдущего сообщения, а не новая ошибка.
+    pub pending: bool,
+}
+
+/// Задача, которую пора переотправить воркеру после backoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryJob {
+    /// Ключ команды: он же ключ строки `erp_retry`.
+    pub idempotency_key: String,
+    /// Экземпляр процесса.
+    pub instance_id: String,
+    /// Узел `serviceTask`.
+    pub element_id: String,
+    /// Токен, который ждёт ответа: команда должна вернуть тот же ключ.
+    pub token_id: String,
+    /// Сколько ретраев уже сделано (для логов и `ActionRequiredEvent`).
+    pub attempts: i32,
+}
+
+/// Состояние ретрая по ключу команды; `None` — ретраев ещё не было.
+pub async fn load_retry(pool: &PgPool, key: &str) -> Result<Option<RetryState>, sqlx::Error> {
+    let row: Option<(i32, bool)> = sqlx::query_as(
+        "SELECT attempts, (dispatched_at IS NULL) AS pending FROM erp_retry WHERE idempotency_key = $1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(attempts, pending)| RetryState { attempts, pending }))
+}
+
+/// Планирует переотправку команды через `delay_secs` секунд.
+///
+/// `attempts` — общее число ретраев после этой записи: движок присылает
+/// `attempts + 1`, чтобы счётчик в БД сходился с `camunda:retries`.
+#[allow(clippy::too_many_arguments)]
+pub async fn schedule_retry(
+    pool: &PgPool,
+    key: &str,
+    instance_id: &str,
+    element_id: &str,
+    token_id: &str,
+    attempts: i32,
+    last_status: &str,
+    last_error: Option<&str>,
+    delay_secs: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO erp_retry (
+            idempotency_key, instance_id, element_id, token_id,
+            attempts, last_status, last_error, next_attempt_at, dispatched_at
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7,
+            NOW() + ($8::bigint * INTERVAL '1 second'), NULL
+        )
+        ON CONFLICT (idempotency_key) DO UPDATE SET
+            attempts = EXCLUDED.attempts,
+            last_status = EXCLUDED.last_status,
+            last_error = EXCLUDED.last_error,
+            next_attempt_at = EXCLUDED.next_attempt_at,
+            dispatched_at = NULL,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(key)
+    .bind(instance_id)
+    .bind(element_id)
+    .bind(token_id)
+    .bind(attempts)
+    .bind(last_status)
+    .bind(last_error)
+    .bind(delay_secs)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Забывает ретраи команды: шаг завершён, отменён или ретраи исчерпаны.
+pub async fn clear_retry(pool: &PgPool, key: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM erp_retry WHERE idempotency_key = $1")
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Забирает до `limit` созревших ретраев и отодвигает их на `lease_secs`.
+///
+/// `FOR UPDATE SKIP LOCKED` разводит поды: один и тот же ретрай не уйдёт
+/// воркеру дважды. Даже если публикация сорвётся, команда выйдет после
+/// аренды — а лишняя доставка безопасна: ключ идемпотентности тот же.
+pub async fn claim_due_retries(
+    pool: &PgPool,
+    limit: i64,
+    lease_secs: i64,
+) -> Result<Vec<RetryJob>, sqlx::Error> {
+    let rows: Vec<(String, String, String, String, i32)> = sqlx::query_as(
+        r#"
+        UPDATE erp_retry
+        SET dispatched_at = NOW(),
+            next_attempt_at = NOW() + ($2::bigint * INTERVAL '1 second'),
+            updated_at = NOW()
+        WHERE idempotency_key IN (
+            SELECT idempotency_key
+            FROM erp_retry
+            WHERE next_attempt_at <= NOW()
+            ORDER BY next_attempt_at
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING idempotency_key, instance_id, element_id, token_id, attempts
+        "#,
+    )
+    .bind(limit)
+    .bind(lease_secs)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(idempotency_key, instance_id, element_id, token_id, attempts)| RetryJob {
+                idempotency_key,
+                instance_id,
+                element_id,
+                token_id,
+                attempts,
+            },
+        )
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -372,7 +511,11 @@ mod tests {
             definition,
         };
 
-        assert_eq!(snapshot.waiting_steps().len(), 2, "проходной startEvent не шаг");
+        assert_eq!(
+            snapshot.waiting_steps().len(),
+            2,
+            "проходной startEvent не шаг"
+        );
         assert_eq!(
             snapshot.host_step(StepKind::UserTask, None, None),
             None,

@@ -48,6 +48,11 @@ pub struct ErpResponseEvent {
     pub element_id: String,
     pub status: String,
     pub error_message: Option<String>,
+    /// Можно ли переотправить команду: `true` — движок сделает ретрай с
+    /// backoff (пока не кончились `camunda:retries` узла), `false` — сразу
+    /// компенсация (`ActionRequiredEvent`). Необязателен в JSON.
+    #[serde(default)]
+    pub retryable: bool,
     pub payload: serde_json::Value,
     /// Ключ идемпотентности из [`ServiceCommand`]; повтор с тем же ключом
     /// не двигает токен дважды. Необязателен: ручной `nats pub` и E2E-тесты

@@ -231,10 +231,24 @@ curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/eve
 | --- | --- | --- |
 | `process_instance_id` | да | Экземпляр процесса |
 | `element_id` | нет | Адрес шага: если указан, он обязан совпасть с ожидающим `serviceTask`, иначе ответ игнорируется (`erp_target_mismatch`) — так устаревший ответ не закроет соседний узел. Пусто → узел ищется по `token_id` из `payload`, иначе берётся единственный ожидающий `serviceTask` |
-| `status` | да | `SUCCESS` (регистр не важен) — шаг завершается, граф идёт дальше; любой другой — только лог, шаг остаётся активным (ретраи/компенсация — M2) |
-| `error_message` | нет | Текст ошибки для логов/аудита |
+| `status` | да | `SUCCESS` (регистр не важен) — шаг завершается, граф идёт дальше; любой другой — ошибка: с `retryable` уходит в ретрай, иначе (или когда `camunda:retries` исчерпаны) — компенсация |
+| `error_message` | нет | Текст ошибки: попадает в лог, `erp_retry.last_error` и `ActionRequiredEvent.payload.error` |
+| `retryable` | нет | `true` — ошибка временная, движок переотправит команду с backoff (пока не кончились `camunda:retries`). По умолчанию `false` — сразу компенсация |
 | `payload` | да | Данные сервиса; уезжают клиентам вместе с токеном. Поле у `ErpResponseEvent` объявлено без `#[serde(default)]`, поэтому без него ответ не десериализуется и теряется (в логах движка — `❌ [ERP Consumer] Ошибка десериализации`) |
-| `idempotency_key` | нет | Ключ из `ServiceCommand`: повтор с тем же ключом не двигает токен. Без него ответ гасится отсутствием ожидающего токена, как в M1 |
+| `idempotency_key` | нет | Ключ из `ServiceCommand`: успех или компенсация с тем же ключом не двигают токен повторно. Без него ответ гасится отсутствием ожидающего токена, как в M1 |
+
+Неуспешный ответ не двигает граф. Порядок решения:
+
+1. `retryable = true` и `attempts < camunda:retries` → команда с тем же
+   `idempotency_key` уходит воркеру повторно через `base·2^attempts` секунд
+   (`ERP_RETRY_BASE_SECS` = 5 с, потолок `ERP_RETRY_MAX_SECS` = 300 с);
+2. иначе — компенсация: движок публикует `ActionRequiredEvent` в
+   `mes.out.v1.cmd.<system>`, токен остаётся на шаге, решение за человеком.
+
+Повтор неуспешного ответа, пока ретрай ещё не отправлен, считается дублем и не
+сжигает вторую попытку. Состояние попыток — таблица `erp_retry` (миграция
+`0002_erp_retry.sql`).
+
 
 ```bash
 nats pub mes.in.v1.erp.response \
@@ -345,7 +359,8 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 | `element_id` узла `serviceTask`, `status: SUCCESS` | внешняя задача завершается, токен идёт по исходящим связям; условия шлюзов вычисляются по переменным из `payload` |
 | `element_id` пуст | узел ищется по `token_id` из `payload`, иначе берётся единственный ожидающий `serviceTask`; если ждут несколько — событие отбрасывается (`no_waiting_token` в логе) |
 | узел уже не ждёт ответа (другой шаг/инстанс) | событие логируется и игнорируется, очередь не блокируется |
-| `status != SUCCESS` | только лог `erp_not_success`: шаг остаётся активным, ретраи/компенсация — M2 |
+| `status != SUCCESS`, `retryable: true` | `erp_retry_scheduled`: команда с тем же ключом уходит повторно после backoff (`camunda:retries`), шаг остаётся `ACTIVE` |
+| `status != SUCCESS` без `retryable` (или ретраи исчерпаны) | `erp_compensate`: `ActionRequiredEvent` в `mes.out.v1.cmd.<system>`, токен ждёт человека |
 | после закрытия узла нет исходящих связей | токен уходит в `EndEvent` → экземпляр `COMPLETED` |
 
 Полный E2E-сценарий (схема с `ServiceTask_ValidateOrder` →
@@ -904,9 +919,34 @@ nats pub mes.in.v1.erp.response \
 
 Ответ закрывает `serviceTask` в движке: тот завершает внешнюю задачу и сам ведёт
 токен по графу задеплоенной схемы — правок в коде не нужно, маршрут берётся из
-`sequenceFlow`. Ошибка (`status != SUCCESS`) сейчас
-только логируется: ретраи, `retryable` и компенсация — задача M2
-([дорожная карта](erp-simulator/docs/dairy-plant-roadmap.md)).
+`sequenceFlow`. Ошибка (`status != SUCCESS`) не роняет шаг: с `retryable = true`
+команда переотправляется с backoff, иначе (или когда `camunda:retries` узла
+исчерпаны) движок публикует `ActionRequiredEvent` и ждёт человека — подробности
+в разделе про контракт (§3) и в
+[дизайне](docs/runtime-m1-design.md#105-ретраи-backoff-и-компенсация-ответа-m2).
+
+**Вариант D — демо без 1С: мок-воркер.** В репозитории есть NATS-воркер, который
+играет роль ERP: читает `mes.out.v1.cmd.erp`, отвечает в
+`mes.in.v1.erp.response` тем же `idempotency_key` и помнит уже обработанные
+ключи. Он собирается вместе с движком (второй бинарь того же образа) и
+запускается отдельным подом:
+
+```bash
+docker build -t bpmn-engine-service:latest bpmn-engine/bpmn-engine
+kind load docker-image bpmn-engine-service:latest --name erp
+kubectl apply -f bpmn-engine/bpmn-engine/erp-mock-worker.yaml
+
+# демо ретраев: первая попытка на каждый ключ падает с retryable = true
+kubectl set env deploy/erp-mock-worker ERP_MOCK_FAIL_FIRST=1
+```
+
+| Переменная | По умолчанию | Смысл |
+| --- | --- | --- |
+| `ERP_MOCK_TOPIC` | `erp` | тема воркера (`camunda:topic` демо-схемы) |
+| `ERP_MOCK_DELAY_MS` | `500` | имитация работы ERP |
+| `ERP_MOCK_FAIL_FIRST` | `0` | сколько первых попыток на ключ провалить (`retryable = true`) |
+| `ERP_MOCK_FAIL_ELEMENT` | — | узел, который всегда отвечает `FAILED` (проверка компенсации) |
+
 
 **Вариант C — адресация конкретной системе.** Работа уходит системе сразу по
 активации узла: `ServiceCommand` в `mes.out.v1.cmd.<system>`

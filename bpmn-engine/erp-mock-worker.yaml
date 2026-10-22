@@ -1,0 +1,48 @@
+# Мок-воркер ERP (M2, демо без 1С).
+#
+# Тот же образ, что у движка: второй бинарь `erp-mock-worker` уже лежит в
+# `/app` (см. Dockerfile). Воркер читает `mes.out.v1.cmd.erp` и отвечает в
+# `mes.in.v1.erp.response` — контракт `ServiceCommand` / `ErpResponseEvent`.
+#
+# `ERP_MOCK_FAIL_FIRST=1` показывает ретраи: первая попытка на ключ падает с
+# `retryable = true`, движок переотправляет команду с backoff, вторая проходит.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erp-mock-worker
+  labels:
+    app: erp-mock-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: erp-mock-worker
+  template:
+    metadata:
+      labels:
+        app: erp-mock-worker
+    spec:
+      # Мок-воркер не держит состояние: при рестарте его память ключей
+      # очищается, а повторная доставка безопасна (ключ тот же).
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: erp-mock-worker
+        image: bpmn-engine-service:latest
+        imagePullPolicy: IfNotPresent
+        command: ["/app/erp-mock-worker"]
+        env:
+        - name: NATS_URL
+          value: "nats://nats-service:4222"
+        - name: ERP_MOCK_TOPIC
+          value: "erp"
+        - name: ERP_MOCK_DELAY_MS
+          value: "500"
+        - name: ERP_MOCK_FAIL_FIRST
+          value: "0"
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"

@@ -1,6 +1,6 @@
+mod db;
 mod events;
 mod nats_client;
-mod db;
 mod runtime;
 
 use async_nats::jetstream::AckKind;
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
         "postgres://bpmn_user:bpmn_super_secret_password@bpmn-db-rw:5432/bpmn_db".to_string()
     });
-    
+
     let pool = PgPool::connect(&db_url).await?;
 
     println!("⚙️ Проверка и авто-применение миграций базы данных...");
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .unwrap_or(30);
 
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-        
+
         loop {
             interval.tick().await;
 
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 "SELECT instance_id, element_id FROM tokens WHERE state = 'ACTIVE' AND created_at < NOW() - INTERVAL '{} minutes'",
                 timeout_minutes
             );
-            
+
             match sqlx::query(&query).fetch_all(&pool_sla).await {
                 Ok(rows) => {
                     for row in rows {
@@ -87,17 +87,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         };
 
                         if let Err(e) = nats_sla.publish_outbound_command(&outbound_event).await {
-                            eprintln!("❌ [SLA Worker] Ошибка отправки компенсационной команды: {}", e);
+                            eprintln!(
+                                "❌ [SLA Worker] Ошибка отправки компенсационной команды: {}",
+                                e
+                            );
                         } else {
-                            if let Err(e) = db::save_token_state(&pool_sla, &inst_id, &elem_id, "TIMED_OUT").await {
-                                eprintln!("❌ [SLA Worker] Ошибка БД при обновлении статуса токена: {}", e);
+                            if let Err(e) =
+                                db::save_token_state(&pool_sla, &inst_id, &elem_id, "TIMED_OUT")
+                                    .await
+                            {
+                                eprintln!(
+                                    "❌ [SLA Worker] Ошибка БД при обновлении статуса токена: {}",
+                                    e
+                                );
                             } else {
-                                let _ = nats_sla.publish_token_event(&inst_id, &elem_id, "TIMED_OUT", None).await;
+                                let _ = nats_sla
+                                    .publish_token_event(&inst_id, &elem_id, "TIMED_OUT", None)
+                                    .await;
                             }
                         }
                     }
                 }
-                Err(e) => eprintln!("❌ [SLA Worker] Ошибка выполнения query в SLA Worker: {}", e),
+                Err(e) => eprintln!(
+                    "❌ [SLA Worker] Ошибка выполнения query в SLA Worker: {}",
+                    e
+                ),
             }
         }
     });
@@ -111,19 +125,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         match msg_result {
                             Ok(msg) => {
                                 match serde_json::from_slice::<ErpResponseEvent>(&msg.payload) {
-                                    Ok(response) => {
-                                        match graph_erp.handle_erp(&response).await {
-                                            Ok(outcome) => {
-                                                publish_outcome(&nats_erp, &response.process_instance_id, &outcome).await;
-                                                let _ = msg.ack().await;
-                                            }
-                                            Err(e) => {
-                                                eprintln!("❌ [Graph][ERP] Транзиентная ошибка: {:#}", e);
-                                                let _ = msg.ack_with(AckKind::Nak(None)).await;
-                                            }
+                                    Ok(response) => match graph_erp.handle_erp(&response).await {
+                                        Ok(outcome) => {
+                                            publish_outcome(
+                                                &nats_erp,
+                                                &response.process_instance_id,
+                                                &outcome,
+                                            )
+                                            .await;
+                                            let _ = msg.ack().await;
                                         }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "❌ [Graph][ERP] Транзиентная ошибка: {:#}",
+                                                e
+                                            );
+                                            let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        eprintln!("❌ [ERP Consumer] Ошибка десериализации: {}", e)
                                     }
-                                    Err(e) => eprintln!("❌ [ERP Consumer] Ошибка десериализации: {}", e),
                                 }
                                 let _ = msg.ack().await;
                             }
@@ -138,25 +160,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    // 3. Основной цикл обработки входящих событий
+    // 3. Публикатор ретраев: команды, у которых истёк backoff.
+    let nats_retry = nats_adapter.clone();
+    let graph_retry = graph.clone();
+    tokio::spawn(async move {
+        let interval_secs = env::var("ERP_RETRY_POLL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(2);
+
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+
+        loop {
+            interval.tick().await;
+
+            match graph_retry.due_retries().await {
+                Ok(commands) => {
+                    for command in commands {
+                        if let Err(e) = nats_retry.publish_service_command(&command).await {
+                            eprintln!(
+                                "❌ [Retry] Ошибка публикации {}:{}: {}",
+                                command.instance_id, command.element_id, e
+                            );
+                        }
+                    }
+                }
+                Err(e) => eprintln!("❌ [Retry] Ошибка выборки ретраев: {:#}", e),
+            }
+        }
+    });
+
+    // 4. Основной цикл обработки входящих событий
     loop {
         match consumer.messages().await {
             Ok(mut messages) => {
                 while let Some(Ok(msg)) = messages.next().await {
                     match serde_json::from_slice::<InboundEvent>(&msg.payload) {
-                        Ok(event) => {
-                            match graph.handle_inbound(&event).await {
-                                Ok(outcome) => {
-                                    publish_outcome(&nats_adapter, &event.instance_id, &outcome).await;
-                                    let _ = msg.ack().await;
-                                }
-                                Err(e) => {
-                                    eprintln!("❌ [Graph] Транзиентная ошибка: {:#}", e);
-                                    let _ = msg.ack_with(AckKind::Nak(None)).await;
-                                }
+                        Ok(event) => match graph.handle_inbound(&event).await {
+                            Ok(outcome) => {
+                                publish_outcome(&nats_adapter, &event.instance_id, &outcome).await;
+                                let _ = msg.ack().await;
                             }
+                            Err(e) => {
+                                eprintln!("❌ [Graph] Транзиентная ошибка: {:#}", e);
+                                let _ = msg.ack_with(AckKind::Nak(None)).await;
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("❌ [Main Loop] Ошибка десериализации InboundEvent: {}", e)
                         }
-                        Err(e) => eprintln!("❌ [Main Loop] Ошибка десериализации InboundEvent: {}", e),
                     }
                     let _ = msg.ack().await;
                 }
@@ -176,6 +229,18 @@ async fn publish_outcome(nats: &NatsAdapter, instance_id: &str, outcome: &runtim
             eprintln!(
                 "❌ [Graph] Ошибка публикации команды {}:{}: {}",
                 command.instance_id, command.element_id, e
+            );
+        }
+    }
+
+    // Компенсации идут тем же subject, что и команды воркерам: получатель
+    // (ERP/MES) сам решает, показать `ActionRequiredEvent` человеку или
+    // закрыть шаг вручную.
+    for action in &outcome.actions {
+        if let Err(e) = nats.publish_outbound_command(action).await {
+            eprintln!(
+                "❌ [Graph] Ошибка публикации компенсации {}:{}: {}",
+                action.process_instance_id, action.current_step, e
             );
         }
     }
