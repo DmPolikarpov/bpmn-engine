@@ -574,11 +574,81 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
 [`App.test.js`](erp-simulator/src/App.test.js) (подсказки берутся из схемы
 второй стороны).
 
-> **Триггер пока декларация.** Движок его не читает: запуск второго процесса
-> делает клиент отдельным `sendEvent` (так работает демо-сценарий «передать
-> заказ поставщику»), а `trg:processTrigger` фиксирует пару «источник → цель»,
-> точку входа и состав передаваемого payload. См.
-> [«Известные ограничения»](#известные-ограничения).
+> **Триггер читает движок (M3).** Активация узла, на котором объявлен
+> `trg:processTrigger`, создаёт экземпляр целевого процесса: id —
+> `<instancePrefix><orderNum>`, переменные — только из `payloadKeys`. Демо-проект
+> «Молочный завод» больше не запускает поставщика из кабинета: сообщение
+> `PurchaseOrder` уходит throw-событием и несёт триггер. Механика сообщений и
+> корреляция по бизнес-ключу — в разделе
+> [«Межпроцессные сообщения»](#межпроцессные-сообщения-m3).
+
+## Межпроцессные сообщения (M3)
+
+Два процесса общаются сообщениями BPMN 2.0, а не вызовами кабинета:
+
+```xml
+<bpmn:definitions ... xmlns:trg="http://erp.mes/schema/bpmn/trigger">
+  <bpmn:message id="Message_PurchaseOrder" name="PurchaseOrder" />
+
+  <bpmn:intermediateThrowEvent id="Event_SendPO">
+    <bpmn:extensionElements>
+      <trg:processTrigger targetProcessId="Process_Supplier"
+                          instancePrefix="inst-supp-"
+                          firstElementId="Task_ConfirmPO"
+                          payloadKeys="orderNum" />
+    </bpmn:extensionElements>
+    <bpmn:messageEventDefinition messageRef="Message_PurchaseOrder" />
+  </bpmn:intermediateThrowEvent>
+
+  <bpmn:intermediateCatchEvent id="Task_WaitPOConfirmed">
+    <bpmn:messageEventDefinition messageRef="Message_PurchaseOrderConfirmed" />
+  </bpmn:intermediateCatchEvent>
+</bpmn:definitions>
+```
+
+Что делает движок:
+
+| Событие схемы | Поведение |
+| --- | --- |
+| токен вошёл в `intermediateThrowEvent` | отправляется `MessageSent`; перехватчик в [`pump.rs`](bpmn-engine/src/runtime/pump.rs) запоминает узел и имя |
+| у узла есть `trg:processTrigger` | создаётся экземпляр `targetProcessId`: id `<instancePrefix><orderNum>`, переменные — только `payloadKeys`; повтор по тому же заказу второй экземпляр не создаёт |
+| сообщение ждёт `intermediateCatchEvent` другого экземпляра | доставка **только** экземпляру с тем же `orderNum`; токен сдвигается, переменные отправителя мержатся |
+| сообщение никто не ждёт | в лог уходит `message_no_waiter`, состояние не меняется |
+
+Корреляция — по бизнес-ключу `orderNum`
+([`runtime/messages.rs`](bpmn-engine/src/runtime/messages.rs),
+`CORRELATION_KEY`), а не по `instance_id`: завод и поставщик — разные
+экземпляры, но номер заказа у них один. Поэтому триггер обязан передать
+`orderNum` в `payloadKeys`; без него сообщение не доставляется и в лог уходит
+`message_without_correlation`.
+
+Клиент:
+
+- «Отправить заказ поставщику» закрывает `Task_SendPO` и **не** вызывает
+  `startProcess`: схема Поставщика деплоится заранее (upsert), а экземпляр
+  создаёт движок по триггеру `Event_SendPO`;
+- подтверждение заказа и отгрузка — throw-события поставщика
+  (`PurchaseOrderConfirmed`, `MilkShipped`), завод ждёт их на catch-событиях;
+- `startsProcess` и `counterpartEvent` в кнопках остались для **старых схем**:
+  если они объявлены, кабинет работает по-прежнему.
+
+Проверки: [`runtime/messages.rs`](bpmn-engine/src/runtime/messages.rs) (разбор
+триггера и связей, payload, корреляция),
+`vendor_patches.rs::message_delivery_respects_correlation` (чужой заказ не
+получает сообщение), [`dairyPlant.test.js`](erp-simulator/src/bpmn-sdk/defaults/dairyPlant.test.js)
+(схема), [`projectXml.test.js`](erp-simulator/src/bpmn-sdk/xml/projectXml.test.js)
+(`bpmn:message` переживает нарезку процесса).
+
+Ограничения M3:
+
+- **один шаг**: сообщение, отправленное стартовавшим экземпляром, движок не
+  разбирает каскадом (вложенные триггеры — M3.2);
+- **`firstElementId`** должен совпадать со штатным первым шагом целевого
+  процесса; расхождение логируется `message_entry_mismatch`;
+- **catch-событие — не шаг кабинета**: пока процесс ждёт сообщение, подсветка
+  стоит на последнем человеческом шаге;
+- **payload — только скаляры** (`HashMap<String, String>` вендора): вложенные
+  объекты (`documents`) между процессами не передаются.
 
 ## Кнопки участников узла (`act:userAction`)
 
@@ -1081,20 +1151,24 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 
 ## Известные ограничения
 
-1. **Воркера `serviceTask` нет (M2).** Ответ ERP уже двигает экземпляр по графу
-   (M1, шаг 3), но сама задача не активируется движком и команду воркеру никто не
-   шлёт: `Task_ERP_*` в демо — `userTask` с кнопкой. Контракт воркера —
-   [дорожная карта](erp-simulator/docs/dairy-plant-roadmap.md), M2.
+1. **`serviceTask` исполняет мок-воркер (M2).** Движок сам активирует
+   `Task_ERP_*`, публикует команду в `mes.out.v1.cmd.erp` и двигает токен по
+   ответу; в демо роль 1С играет
+   [`erp-mock-worker`](bpmn-engine/src/bin/erp_mock_worker.rs). Настоящего
+   коннектора ERP/MES в репозитории нет: контракт описан в §3 и M2
+   [дорожной карты](erp-simulator/docs/dairy-plant-roadmap.md).
 2. **Проходные токены (`startEvent`, шлюзы) остаются в вендорной таблице
    `token`.** В `Waiting` они копятся и не проецируются в шаги кабинета;
    уборка/GC — M5.
 3. **`event_name` не участвует в маршрутизации** (движок его не читает), а
    литерал `erp` в subject HTTP-шлюза (`mes.in.v1.event.erp.<event_name>`)
    зашит в код шлюза.
-4. **Компенсация/ретраи не реализованы**: ответ ERP со `status != SUCCESS`
-   только логируется — шаг остаётся активным; на таймауте SLA-воркер публикует
-   `ActionRequiredEvent` с `action: CANCEL_OR_RETRY` и помечает legacy-токен
-   `TIMED_OUT` (граф при этом не двигается — M6).
+4. **Ретраи и компенсация — на уровне шага, не процесса (M2).** Ответ воркера
+   с `retryable = true` уходит в `erp_retry` с экспоненциальным backoff, а
+   исчерпание `camunda:retries` или `retryable = false` даёт
+   `ActionRequiredEvent`; токен при этом остаётся на шаге. Компенсации
+   пройденных шагов (saga) и таймеры/эскалации — M6: SLA-воркер по-прежнему
+   смотрит legacy `tokens`, помечает `TIMED_OUT` и граф не двигает.
 5. **`migrations/` — пустой каталог:** в git пустые каталоги не хранятся, его
    создаёт `deploy.sh`. Каталог нужен макросу `sqlx::migrate!("./migrations")` на
    этапе сборки, а структура таблиц описана в [`schema.sql`](schema.sql) и
@@ -1130,14 +1204,14 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
     `ACTIVE` в `tokens` — норма для параллельных ветвей. Но клиент берёт последнее
     `ACTIVE`-сообщение и не рисует набор одновременно активных узлов: подсветка
     набора запланирована в M1.1 (`token_id` уже приходит в `token_updated`).
-12. **Движок не читает `trg:processTrigger`.** Триггер живёт в схеме и
-    настраивается в редакторе, но запуск второго процесса по-прежнему делает
-    клиент отдельным `sendEvent` (демо-сценарий «передать заказ поставщику»):
-    движок не разбирает `extensionElements`, а ветка продвижения в
-    [`main.rs`](bpmn-engine/src/main.rs) написана только для ответов ERP. Чтобы
-    запуск шёл от движка, ему понадобится разбор триггера задеплоенной схемы,
-    создание экземпляра целевого процесса, вход в `firstElementId` и перенос
-    перечисленных в `payloadKeys` полей контекста источника.
+12. **Межпроцессные сообщения работают одним шагом (M3).** Движок читает
+    `trg:processTrigger` и `bpmn:message`, создаёт экземпляр второй стороны и
+    доставляет catch-событию по `orderNum` (раздел
+    [«Межпроцессные сообщения»](#межпроцессные-сообщения-m3)). Ограничения:
+    нет каскада (сообщение стартовавшего экземпляра не разбирается в том же
+    проходе), `firstElementId` должен совпадать со штатным первым шагом,
+    payload — только скалярные переменные, `bpmn:messageFlow` используется как
+    диагностика (пара «источник → цель» берётся из триггера узла).
 13. **Метрики процессов считает клиент, а не движок.** Время выполнения хранится
     в браузере (ключ `bpmn-process-metrics`) и видно только тому, кто запускал
     процессы: другой клиент, очищенное хранилище или запуск не из UI оставят
@@ -1150,8 +1224,10 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 
 | Файл | Отвечает за |
 | --- | --- |
-| [`bpmn-engine/src/main.rs`](bpmn-engine/src/main.rs) | Приём событий, SLA-воркер; сообщения уходят в `runtime` |
-| [`bpmn-engine/src/runtime/mod.rs`](bpmn-engine/src/runtime/mod.rs) | `GraphRuntime`: деплой схемы, старт, завершение шага, ответ ERP, публикация `Outcome` |
+| [`bpmn-engine/src/main.rs`](bpmn-engine/src/main.rs) | Приём событий, SLA-воркер, ретраи; публикация `Outcome` и экземпляров второй стороны (`peers`, M3) |
+| [`bpmn-engine/src/runtime/mod.rs`](bpmn-engine/src/runtime/mod.rs) | `GraphRuntime`: деплой схемы, старт, завершение шага, ответ ERP, запуск второй стороны по триггеру и доставка сообщений |
+| [`bpmn-engine/src/runtime/messages.rs`](bpmn-engine/src/runtime/messages.rs) | Разбор `trg:processTrigger` / `bpmn:messageFlow`, `payloadKeys`, корреляция по `orderNum` |
+| [`bpmn-engine/src/runtime/pump.rs`](bpmn-engine/src/runtime/pump.rs) | Снимки движка, перехват `MessageSent`, движок доставки сообщений |
 | [`bpmn-engine/src/db.rs`](bpmn-engine/src/db.rs) | `process_definitions`, `process_instances`, `tokens` (id = `instance:element`) |
 | [`bpmn-engine/src/nats_client.rs`](bpmn-engine/src/nats_client.rs) | Subject'ы: `mes.bpmn.v1.event.<instance>`, `mes.out.v1.cmd.<system>` |
 | [`bpmn-engine/src/events.rs`](bpmn-engine/src/events.rs) | Контракты `InboundEvent`, `ErpResponseEvent`, `ActionRequiredEvent` |

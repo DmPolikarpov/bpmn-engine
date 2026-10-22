@@ -1,5 +1,12 @@
 //! MessageHandler: resumes tokens waiting at message intermediate catch events
 //! when a matching MessageSent event is fired.
+//!
+//! Local patch (M3): a message may carry a correlation map
+//! ([`payloads::MessageSent::correlation`]); only instances whose variables
+//! contain every key/value pair are resumed. Without the map the upstream
+//! broadcast behaviour is kept (all matching catch events fire). Message
+//! payload ([`payloads::MessageSent::payload`]) is merged into the receiver's
+//! variables before the catch token moves.
 
 use async_trait::async_trait;
 use bpm_engine_core::{payloads, EngineEvent, NodeType, TokenStatus};
@@ -35,6 +42,14 @@ impl EventHandler for MessageCatchHandler {
             if instance.state != bpm_engine_core::InstanceState::Running {
                 continue;
             }
+            if !matches_correlation(&instance, e) {
+                debug!(
+                    instance_id = %iid,
+                    message = %e.message_name,
+                    "message catch: correlation mismatch"
+                );
+                continue;
+            }
             let Ok(Some(def)) = process_def_store.load(&instance.process_def_id).await else {
                 continue;
             };
@@ -58,6 +73,14 @@ impl EventHandler for MessageCatchHandler {
 
             if matches.is_empty() {
                 continue;
+            }
+
+            // Перед сдвигом токена сообщение переносит свои переменные: получатель
+            // видит данные отправителя (M3, `payloadKeys` триггера).
+            if let Some(payload) = &e.payload {
+                for (key, value) in payload {
+                    instance.variables.insert(key.clone(), value.clone());
+                }
             }
 
             for (idx, node_id) in matches {
@@ -86,5 +109,23 @@ impl EventHandler for MessageCatchHandler {
         }
 
         out
+    }
+}
+
+/// Совпадает ли сообщение с экземпляром по карте корреляции.
+///
+/// `None` — сообщение без корреляции: сохраняется апстрим-поведение
+/// (подходит любой экземпляр с ожидающим catch-событием). Иначе все пары
+/// `ключ=значение` должны быть среди переменных экземпляра — так ответ
+/// поставщика находит экземпляр завода по `orderNum`, а не по `instance_id`.
+fn matches_correlation(
+    instance: &bpm_engine_core::ProcessInstance,
+    event: &payloads::MessageSent,
+) -> bool {
+    match &event.correlation {
+        None => true,
+        Some(correlation) => correlation
+            .iter()
+            .all(|(key, value)| instance.variables.get(key).is_some_and(|actual| actual == value)),
     }
 }

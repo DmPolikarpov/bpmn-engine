@@ -34,9 +34,9 @@ codeload-тарболла нет `.git`, поэтому при обновлен�
 `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `SECURITY.md`, `README_zh.md` —
 сборке не нужны, наших тестов не касаются.
 
-## Локальные патчи (5)
+## Локальные патчи (6)
 
-Патчи 1–3 и 5 зафиксированы тестами
+Патчи 1–3, 5 и 6 зафиксированы тестами
 [`tests/vendor_patches.rs`](../../tests/vendor_patches.rs); патч 4 без живой
 БД не проверяется (вендорский тест адаптера требует Postgres).
 
@@ -77,6 +77,19 @@ codeload-тарболла нет `.git`, поэтому при обновлен�
    а паника в основном цикле (future на главном потоке `#[tokio::main]`)
    роняет под — все реплики уходят в `CrashLoopBackOff`. Как и патч 4,
    вендорский юнит-прогон этого не видит: нужен живой Postgres.
+6. **Корреляция сообщений** (M3) — `crates/core/src/event.rs` (`MessageSent`),
+   `crates/runtime/src/token_arrived_handler.rs` и
+   `crates/runtime/src/message_handler.rs`:
+   - `MessageSent` несёт `node_id` (узел throw-события) и необязательные
+     `correlation` (пары «ключ=значение» переменных получателя) и `payload`
+     (переменные, которые сообщение переносит);
+   - `MessageCatchHandler` поднимает catch-токен только у экземпляров, где все
+     пары `correlation` совпадают с переменными; без карты поведение прежнее
+     (upstream будил **все** экземпляры с тем же именем сообщения);
+   - `payload` мержится в переменные получателя перед сдвигом токена.
+   Так ответ поставщика находит экземпляр завода по `orderNum`, а не по
+   `instance_id`. Проверка —
+   `tests/vendor_patches.rs::message_delivery_respects_correlation`.
 
 Хелпер `move_token_preserving_group` — upstream-код
 (`crates/runtime/src/transition.rs`), это не патч.

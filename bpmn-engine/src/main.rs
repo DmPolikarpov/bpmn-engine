@@ -4,7 +4,7 @@ mod nats_client;
 mod runtime;
 
 use async_nats::jetstream::AckKind;
-use events::{ActionRequiredEvent, ErpResponseEvent, InboundEvent};
+use events::{ActionRequiredEvent, ErpResponseEvent, InboundEvent, ServiceCommand};
 use futures::StreamExt;
 use nats_client::NatsAdapter;
 use runtime::GraphRuntime;
@@ -223,8 +223,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ///
 /// Ошибки публикации не отменяют уже записанное состояние: это телеметрия для
 /// кабинета, а сообщение уже подтверждено.
+///
+/// Экземпляры второй стороны (`outcome.peers`, M3) публикуются каждый в свой
+/// subject: кабинет сопоставляет их с заказом по `orderNum` из payload.
 async fn publish_outcome(nats: &NatsAdapter, instance_id: &str, outcome: &runtime::Outcome) {
-    for command in &outcome.commands {
+    publish_parts(
+        nats,
+        instance_id,
+        &outcome.steps,
+        outcome.process_finished,
+        &outcome.commands,
+        &outcome.actions,
+    )
+    .await;
+
+    for peer in &outcome.peers {
+        publish_parts(
+            nats,
+            &peer.instance_id,
+            &peer.steps,
+            peer.process_finished,
+            &peer.commands,
+            &peer.actions,
+        )
+        .await;
+    }
+}
+
+/// Публикация изменений одного экземпляра.
+async fn publish_parts(
+    nats: &NatsAdapter,
+    instance_id: &str,
+    steps: &[runtime::StepEvent],
+    process_finished: Option<&'static str>,
+    commands: &[ServiceCommand],
+    actions: &[ActionRequiredEvent],
+) {
+    for command in commands {
         if let Err(e) = nats.publish_service_command(command).await {
             eprintln!(
                 "❌ [Graph] Ошибка публикации команды {}:{}: {}",
@@ -236,7 +271,7 @@ async fn publish_outcome(nats: &NatsAdapter, instance_id: &str, outcome: &runtim
     // Компенсации идут тем же subject, что и команды воркерам: получатель
     // (ERP/MES) сам решает, показать `ActionRequiredEvent` человеку или
     // закрыть шаг вручную.
-    for action in &outcome.actions {
+    for action in actions {
         if let Err(e) = nats.publish_outbound_command(action).await {
             eprintln!(
                 "❌ [Graph] Ошибка публикации компенсации {}:{}: {}",
@@ -245,7 +280,7 @@ async fn publish_outcome(nats: &NatsAdapter, instance_id: &str, outcome: &runtim
         }
     }
 
-    for step in &outcome.steps {
+    for step in steps {
         if let Err(e) = nats
             .publish_token_event_with_token_id(
                 instance_id,
@@ -263,7 +298,7 @@ async fn publish_outcome(nats: &NatsAdapter, instance_id: &str, outcome: &runtim
         }
     }
 
-    if let Some(event) = outcome.process_finished {
+    if let Some(event) = process_finished {
         if let Err(e) = nats.publish_process_finished(instance_id, event).await {
             eprintln!(
                 "❌ [Graph] Ошибка публикации {} для {}: {}",

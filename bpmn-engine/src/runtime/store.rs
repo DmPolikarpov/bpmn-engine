@@ -236,6 +236,22 @@ impl GraphStores {
         }
     }
 
+    /// Загружает `bpmn_xml` определения без компиляции (M3: сообщения).
+    ///
+    /// Компиляция нужна только движку; рантайму для разбора
+    /// `trg:processTrigger` и `bpmn:messageFlow` достаточно исходного XML,
+    /// который уже лежит в вендорной таблице после деплоя.
+    pub async fn load_xml(&self, id: &str) -> anyhow::Result<Option<String>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT bpmn_xml FROM process_definition WHERE id = $1",
+                &[&id],
+            )
+            .await?;
+        Ok(row.map(|row| row.get(0)))
+    }
+
     /// Деплой определения (upsert по `def.id`, дизайн 9.4).
     pub async fn deploy(&self, process_id: &str, bpmn_xml: &str) -> anyhow::Result<()> {
         self.def_store.deploy(process_id, bpmn_xml).await

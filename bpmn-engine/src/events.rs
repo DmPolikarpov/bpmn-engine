@@ -12,7 +12,7 @@ pub struct InboundEvent {
     pub payload: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionRequiredEvent {
     pub process_instance_id: String,
     pub current_step: String,

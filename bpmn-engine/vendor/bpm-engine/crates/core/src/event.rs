@@ -156,6 +156,19 @@ pub mod payloads {
         pub instance_id: String,
         /// The message name.
         pub message_name: String,
+        /// The throw node that produced the message. Empty for events
+        /// reconstructed from the outbox by producers that predate M3.
+        #[serde(default)]
+        pub node_id: String,
+        /// Message correlation: every key/value must be present in the
+        /// receiver's variables for the message to be delivered. `None` keeps
+        /// the upstream broadcast semantics (all matching catch events fire).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub correlation: Option<HashMap<String, String>>,
+        /// Variables carried by the message; merged into the receiver before
+        /// the catch token moves. `None` — the message carries no data.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub payload: Option<HashMap<String, String>>,
     }
 
     /// Payload for [`super::EngineEvent::SignalSent`].
