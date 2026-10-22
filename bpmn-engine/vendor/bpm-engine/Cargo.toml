@@ -1,0 +1,73 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/storage",
+    "crates/runtime",
+    "crates/adapters/memory",
+    "crates/adapters/postgres",
+    "crates/bpmn",
+    "crates/server/rest",
+    "crates/worker-sdk",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+
+[package]
+name = "bpm-engine"
+version = "0.2.0"
+edition = "2021"
+description = "Lightweight embeddable BPM runtime for long-running, stateful workflows with tokens, timers, Saga compensation, and crash recovery"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/fanjia1024/bpm-engine"
+homepage = "https://github.com/fanjia1024/bpm-engine"
+documentation = "https://docs.rs/bpm-engine"
+keywords = ["bpm", "workflow", "engine", "process", "orchestration"]
+categories = ["algorithms", "concurrency", "data-structures"]
+
+[dependencies]
+bpm-engine-core = { path = "crates/core", version = "0.2.0" }
+bpm-engine-storage = { path = "crates/storage", version = "0.2.0" }
+bpm-engine-runtime = { path = "crates/runtime", version = "0.2.0" }
+bpm-engine-adapter-memory = { path = "crates/adapters/memory", version = "0.2.0" }
+bpm-engine-bpmn = { path = "crates/bpmn", version = "0.2.0" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = { version = "0.23", optional = true }
+metrics-exporter-prometheus = { version = "0.15", optional = true }
+axum = { version = "0.7", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+tower-http = { version = "0.5", features = ["cors"], optional = true }
+
+[features]
+default = []
+api = ["axum", "tokio", "tower-http"]
+observability = ["metrics", "metrics-exporter-prometheus", "bpm-engine-runtime/observability"]
+
+[dev-dependencies]
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[package.metadata.tarpaulin]
+# Coverage configuration for cargo-tarpaulin
+# Run: cargo tarpaulin --workspace
+# Output: HTML report in tarpaulin-report/
+exclude-files = [
+    "crates/server/rest/src/main.rs",
+    "examples/*",
+]
+timeout = 120
+fail-under = 0

@@ -31,6 +31,12 @@ spec:
             secretKeyRef:
               name: db-secrets
               key: database-url
+        # Режим маршрутизации M1 (`docs/runtime-m1-design.md`, 10.1):
+        # `graph` — маршрут считает движок по графу схемы (основной режим);
+        # `legacy` — аварийный откат: токен ставится по `element_id` клиента.
+        # Пустое/неизвестное значение читается как `graph`.
+        - name: ENGINE_ROUTING
+          value: "graph"
               
         # Ограничения по ресурсам (Rust потребляет очень мало)
         resources:

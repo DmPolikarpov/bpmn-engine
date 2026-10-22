@@ -1,0 +1,3 @@
+# Python (E2E-тесты в tests/)
+__pycache__/
+*.pyc

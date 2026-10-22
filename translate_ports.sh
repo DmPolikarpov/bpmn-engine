@@ -37,5 +37,9 @@ WS_FORWARD_PID=$!
 
 trap 'kill "${HTTP_FORWARD_PID}" "${WS_FORWARD_PID}" 2>/dev/null || true' EXIT INT TERM
 
-echo "Пробросы активны: http://localhost:${HTTP_PORT} и ws://localhost:${WS_PORT}/ws/status (Ctrl+C для остановки)"
+echo "Пробросы активны (Ctrl+C для остановки):"
+echo "  HTTP-шлюз (REST API, не UI): http://localhost:${HTTP_PORT}"
+echo "    проверка: curl -s http://localhost:${HTTP_PORT}/health"
+echo "  WS-шлюз:  ws://localhost:${WS_PORT}/ws/status"
+echo "  UI:       cd erp-simulator && npm start -> http://localhost:3000"
 wait

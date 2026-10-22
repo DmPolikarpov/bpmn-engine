@@ -13,7 +13,7 @@ docker run --rm \
   -v "$(pwd)":/usr/src/app \
   -w /usr/src/app/bpmn-engine \
   -e LIBRARY_PATH=/usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0:/usr/lib \
-  rust:1.88-alpine \
+  rust:1.89-alpine \
   sh -c "apk add --no-cache build-base musl-dev linux-headers && cargo test"
 echo "✅ Unit-тесты пройдены!"
 

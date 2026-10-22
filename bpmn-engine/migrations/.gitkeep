@@ -1,0 +1,3 @@
+# Keeps this directory in git: `sqlx::migrate!("./migrations")` (src/main.rs)
+# embeds migrations at compile time and `Dockerfile` copies the directory.
+# No own migrations yet.

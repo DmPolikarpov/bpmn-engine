@@ -1,21 +1,20 @@
 mod events;
 mod nats_client;
 mod db;
+mod runtime;
 
-use bpm_engine::bpm_engine_runtime::Engine;
-use bpm_engine::bpm_engine_adapter_memory::MemoryTokenStore;
 use bpm_engine::bpm_engine_bpmn::parse_and_compile;
 
-use chrono::Utc;
+use async_nats::jetstream::AckKind;
 use events::{ActionRequiredEvent, ErpResponseEvent, InboundEvent};
 use futures::StreamExt;
 use nats_client::NatsAdapter;
-use serde_json::{json, Value};
+use runtime::{GraphRuntime, Routing};
+use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 #[tokio::main]
@@ -32,8 +31,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     sqlx::migrate!("./migrations").run(&pool).await?;
     println!("✅ Миграции базы данных успешно применены!");
 
-    let store = Arc::new(MemoryTokenStore::new());
-    let engine = Arc::new(Mutex::new(Engine::new(store)));
+    // Маршрутизация: `graph` (по умолчанию) — движок ведёт экземпляр по графу
+    // схемы (`src/runtime/`, дизайн `docs/runtime-m1-design.md`, 10.1);
+    // `legacy` — аварийный откат, где маршрут считает клиент.
+    let routing = Routing::from_env();
+    println!("🔀 Маршрутизация событий: {}", routing.as_str());
+
+    let graph: Option<Arc<GraphRuntime>> = match routing {
+        Routing::Legacy => None,
+        Routing::Graph => {
+            runtime::init_tracing();
+            let graph = GraphRuntime::new(&db_url, pool.clone()).await?;
+            println!("✅ [Graph] рантайм bpm-engine подключён");
+            Some(Arc::new(graph))
+        }
+    };
 
     let nats_adapter = NatsAdapter::new().await?;
     let consumer = nats_adapter.create_inbound_consumer().await?;
@@ -44,6 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let pool_sla = pool.clone();
     let pool_erp = pool.clone();
+
+    let graph_erp = graph.clone();
 
     // 1. Фоновый воркер SLA / таймаутов
     tokio::spawn(async move {
@@ -110,6 +124,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             Ok(msg) => {
                                 match serde_json::from_slice::<ErpResponseEvent>(&msg.payload) {
                                     Ok(response) => {
+                                        if let Some(graph) = graph_erp.as_ref() {
+                                            match graph.handle_erp(&response).await {
+                                                Ok(outcome) => {
+                                                    publish_outcome(&nats_erp, &response.process_instance_id, &outcome).await;
+                                                    let _ = msg.ack().await;
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("❌ [Graph][ERP] Транзиентная ошибка: {:#}", e);
+                                                    let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                                }
+                                            }
+                                            continue;
+                                        }
+
                                         let inst_id = &response.process_instance_id;
                                         let element_id = if !response.element_id.is_empty() {
                                             response.element_id.as_str()
@@ -163,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
                     }
                 }
-                Err(e) => {
+                Err(_) => {
                     sleep(Duration::from_secs(2)).await;
                 }
             }
@@ -177,6 +205,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 while let Some(Ok(msg)) = messages.next().await {
                     match serde_json::from_slice::<InboundEvent>(&msg.payload) {
                         Ok(event) => {
+                            if let Some(graph) = graph.as_ref() {
+                                match graph.handle_inbound(&event).await {
+                                    Ok(outcome) => {
+                                        publish_outcome(&nats_adapter, &event.instance_id, &outcome).await;
+                                        let _ = msg.ack().await;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("❌ [Graph] Транзиентная ошибка: {:#}", e);
+                                        let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                    }
+                                }
+                                continue;
+                            }
+
                             let instance_id = &event.instance_id;
                             let element_id = &event.element_id;
 
@@ -222,6 +264,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
             Err(_) => sleep(Duration::from_secs(2)).await,
+        }
+    }
+}
+
+/// Публикует результат обработки события в NATS (`mes.bpmn.v1.event.<instance>`).
+///
+/// Ошибки публикации не отменяют уже записанное состояние: это телеметрия для
+/// кабинета, а сообщение уже подтверждено.
+async fn publish_outcome(nats: &NatsAdapter, instance_id: &str, outcome: &runtime::Outcome) {
+    for step in &outcome.steps {
+        if let Err(e) = nats
+            .publish_token_event_with_token_id(
+                instance_id,
+                &step.element_id,
+                step.state,
+                step.payload.as_ref(),
+                Some(&step.token_id),
+            )
+            .await
+        {
+            eprintln!(
+                "❌ [Graph] Ошибка публикации {} для {}:{}: {}",
+                step.state, instance_id, step.element_id, e
+            );
+        }
+    }
+
+    if let Some(event) = outcome.process_finished {
+        if let Err(e) = nats.publish_process_finished(instance_id, event).await {
+            eprintln!(
+                "❌ [Graph] Ошибка публикации {} для {}: {}",
+                event, instance_id, e
+            );
         }
     }
 }
