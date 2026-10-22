@@ -835,7 +835,7 @@ load(id):
 | 2 | `ENGINE_ROUTING=graph` на одном поде/стенде, затем на всех — **выполнено**: `graph` стал значением по умолчанию | включение графа на схеме без условий увело бы `Gateway_Stock` в `Task_CreatePO` (7.1, п. 1) |
 | 3 | удаление legacy-ветки `main.rs`, `db::complete_active_tokens`, `_main_tmp.rs` | после того как граф отработал E2E и демо-сценарий; задача M2 |
 
-Флаг выставляется в манифесте [`bpmn-engine-deployment.yaml`](../bpmn-engine-deployment.yaml)
+Флаг выставляется в манифесте [`bpmn-engine-deployment.yaml`](../../bpmn-engine-deployment.yaml)
 (`env: ENGINE_ROUTING`, значение `graph`): откат — правка одного значения на
 `legacy` и `kubectl apply -f bpmn-engine-deployment.yaml` (затем
 `kubectl rollout status deploy/bpmn-engine-deployment`). Значение читает
