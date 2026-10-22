@@ -5,12 +5,13 @@
 маршрут процесса должен считаться по графу схемы, а не приходить из события
 клиента.
 
-- Статус: **шаги 0–2 реализованы** (22.10.2026): вендоринг 0.2.0 с пятью
+- Статус: **шаги 0–3 выполнены** (22.10.2026): вендоринг 0.2.0 с пятью
   патчами и `bpmn-engine/src/runtime/` (шаг 0); условия на связях и `variables`
   у кнопок демо-схемы, шесть новых кодов валидатора SDK, тест маршрута кнопок и
   старт клиента **одним** событием (10.2, п. 1–2) — шаг 1; `graph` включён по
   умолчанию и подтверждён интеграционным прогоном `tests/test-job.yaml`
-  (10 шагов, WS-события, SLA) — шаг 2. Шаг 3 (удаление legacy-ветки) — M2.
+  (10 шагов, WS-события, SLA) — шаг 2; legacy-ветка удалена (шаг 3, задача M2) —
+  маршрут считает только движок.
 - Область: [`bpmn-engine/src`](../bpmn-engine/src) (Rust), схема демо-проекта
   [`dairyPlant.js`](../erp-simulator/src/bpmn-sdk/defaults/dairyPlant.js), SDK
   [`bpmnXml.js`](../erp-simulator/src/bpmn-sdk/xml/bpmnXml.js).
@@ -51,14 +52,14 @@
 
 | Факт | Где | Следствие |
 | --- | --- | --- |
-| `Engine::new(store)` создан и не используется | [`main.rs:35-36`](../bpmn-engine/src/main.rs) | предупреждение `unused variable: engine`; `tick()` в 0.2.0 — заглушка, так что «просто вызвать» нельзя |
-| `parse_and_compile` вызывается только ради `process_def.id` | [`main.rs:183-192`](../bpmn-engine/src/main.rs) | `sequenceFlow` и `conditionExpression` компилируются и **выбрасываются** |
-| Токен ставится по `element_id` из события | [`main.rs:194-217`](../bpmn-engine/src/main.rs) | маршрут задаёт нажатая кнопка |
-| Прежние `ACTIVE` закрываются принудительно | [`db::complete_active_tokens`](../bpmn-engine/src/db.rs) | инвариант «один активный узел», параллельные ветки невыразимы |
-| Ответ ERP двигает только захардкоженную пару | [`main.rs:127-158`](../bpmn-engine/src/main.rs) | `ServiceTask_ValidateOrder → ServiceTask_ReserveStock`, дальше `COMPLETED` |
+| `Engine::new(store)` создан и не используется *(исправлено на шаге 2)* | `main.rs` | предупреждение `unused variable: engine`; теперь рантайм подключён |
+| `parse_and_compile` вызывается только ради `process_def.id` *(исправлено на шаге 2)* | `main.rs` | `sequenceFlow` и `conditionExpression` компилируются и **выбрасываются** |
+| Токен ставится по `element_id` из события *(исправлено на шаге 3)* | `main.rs` | маршрут задаёт нажатая кнопка |
+| Прежние `ACTIVE` закрываются принудительно *(удалено на шаге 3)* | [`db::complete_active_tokens`](../bpmn-engine/src/db.rs) | инвариант «один активный узел», параллельные ветки невыразимы |
+| Ответ ERP двигает только захардкоженную пару *(удалено на шаге 3)* | [`main.rs:127-158`](../bpmn-engine/src/main.rs) | `ServiceTask_ValidateOrder → ServiceTask_ReserveStock`, дальше `COMPLETED` |
 | `Cargo.lock` не содержит `bpm-engine`, зато содержит `roxmltree` | `bpmn-engine/Cargo.lock` | артефакт прежней локальной реализации движка; перегенерируется при импорте зависимостей |
-| `_main_tmp.rs` — побайтовая копия `main.rs`, не в git | `bpmn-engine/src/_main_tmp.rs` | мусор, удаляется отдельным коммитом |
-| `publish_audit_event` и `BpmnEvent` не вызываются | [`nats_client.rs:55`](../bpmn-engine/src/nats_client.rs), [`events.rs:24`](../bpmn-engine/src/events.rs) | мёртвый код: либо включить в аудит (M6/M7), либо удалить |
+| `_main_tmp.rs` — побайтовая копия `main.rs`, не в git *(удалён)* | `bpmn-engine/src/_main_tmp.rs` | мусор, удалён отдельным коммитом |
+| `publish_audit_event` и `BpmnEvent` не вызываются *(удалены на шаге 3)* | `nats_client.rs`, `events.rs` | мёртвый код убран; аудит вернётся в M6 через `Outcome` |
 | `event_id` пишется шлюзом и не читается | [`http-cluster/index.js:125`](../bpmn-gateways/http-cluster/index.js), [`events.rs:7`](../bpmn-engine/src/events.rs) | идемпотентности нет: повторная доставка двигает шаг дважды |
 | `ErpResponseEvent.error_message` не читается | [`events.rs:36`](../bpmn-engine/src/events.rs) | причина отказа ERP не попадает ни в токен, ни в историю |
 
@@ -329,10 +330,9 @@ bpmn-engine/
   снова выбирает ветку в обход шлюза (и «Нет» на пастеризации снова можно
   обойти кнопкой аварии);
 - два источника истины (граф и `element_id`) дают расходящееся состояние:
-  движок уже передвинул токен, а legacy-запись пишет другой узел;
-- совместимость обеспечивается не смешиванием, а переключателем
-  `ENGINE_ROUTING=legacy|graph`: в `legacy` работает сегодняшний код
-  (`main.rs`), в `graph` — рантайм. Смешанного режима нет (10.1).
+  движок уже передвинул токен, а запись по `element_id` пишет другой узел;
+- смешанного режима нет: до шага 3 совместимость обеспечивал переключатель
+  `ENGINE_ROUTING` (10.1), после — маршрут считает только рантайм.
 
 Совместимость при этом проверяема: после добавления условий (приложение A)
 целевой узел каждой кнопки совпадает с тем, что выбирает граф. Это
@@ -372,7 +372,7 @@ bpmn-engine/
 | Семейство | Таблицы | Кто пишет | Зачем |
 | --- | --- | --- | --- |
 | движок (источник истины) | `process_definition`, `process_instance`, `token`, `external_task`, `timer`, `history_event`, `parallel_join`, `compensation_record`, `event_outbox`, `dead_letter` | вендорные сторы через `EngineContext` | граф, токены, переменные, конкурентный доступ |
-| legacy read-model | `process_definitions`, `process_instances`, `tokens`, `execution_history` | `runtime::project` (+ существующий `db.rs` в `legacy`-режиме) | кабинет, E2E-тесты, SLA-воркер, обратная совместимость |
+| legacy read-model | `process_definitions`, `process_instances`, `tokens`, `execution_history` | `runtime::project` (SLA-воркер пишет `TIMED_OUT` через `db::save_token_state`) | кабинет, E2E-тесты, SLA-воркер, обратная совместимость |
 | служебная | `consumed_event` | `runtime::pump` | идемпотентность доставки |
 
 Правила:
@@ -652,9 +652,9 @@ runtime::project (снимок «после»)
 
 ```text
 bpmn-engine/src/
-├── main.rs                 // NATS-циклы, выбор режима legacy|graph
-├── db.rs                   // legacy-запись (как есть: save_token_state,
-│                           //   complete_active_tokens, update_process_instance_status)
+├── main.rs                 // NATS-циклы: сообщения уходят в runtime, SLA-воркер
+├── db.rs                   // legacy read-model: save_token_state,
+│                           //   update_process_instance_status, instance_exists
 └── runtime/
     ├── mod.rs              // публичные entry points: deploy, start, complete, erp
     ├── mapper.rs           // InboundEvent/ErpResponseEvent → EngineEvent
@@ -664,7 +664,7 @@ bpmn-engine/src/
     └── vars.rs             // flatten(output_data), parse action variables (Rust-тест)
 ```
 
-Границы: `main.rs` знает только `runtime::{deploy, start, complete, erp_response}`;
+Границы: `main.rs` знает только `runtime::{GraphRuntime, Outcome, StepEvent}`;
 типы `bpm_engine_*` не выходят за `runtime/`.
 
 ### 9.2 Пумпа и контекст
@@ -818,30 +818,19 @@ load(id):
 
 ### 10.1 Порядок шагов
 
-Переключатель — переменная окружения `ENGINE_ROUTING`:
-
-- `graph` (**по умолчанию**) — включается `runtime::*`, `main.rs` только
-  маршрутизирует сообщения в `runtime`: токен ведёт движок по графу схемы;
-- `legacy` — аварийный откат на время выкатки: работает прежний `main.rs`,
-  токен ставится по `element_id`, шлюзы не участвуют.
-
-Пустое или неизвестное значение читается как `graph` (`Routing::parse`): флаг
-не может незаметно выключить оркестратор из-за опечатки в манифесте.
+Режим один: `main.rs` маршрутизирует сообщения в `runtime::GraphRuntime`, токен
+ведёт движок по графу схемы. Переключателя `ENGINE_ROUTING` больше нет — он
+удалён вместе с legacy-веткой на шаге 3, поэтому опечатка в манифесте не может
+незаметно выключить оркестратор. При старте под печатает
+`✅ [Graph] рантайм bpm-engine подключён — маршрут по графу схемы` — по этой
+строке проверяют, что рантайм поднялся.
 
 | Шаг | Что выкатывается | Почему в этом порядке |
 | --- | --- | --- |
 | 0 | vendor (с патчами 4.3) + `runtime` (за флагом `legacy`), миграция `consumed_event` | код не меняет поведение; проверяются компиляция, кэш, пумпа на тестах |
 | 1 | SDK: `variables` у кнопки, новые проверки валидатора; демо-схема: условия + ветка «Нет» пастеризации; клиент: переменные в `output_data`, один стартовый event (10.2, п. 1–2) | `legacy` игнорирует условия и `variables`, поэтому шаг безопасен; но к моменту включения графа схема и клиент уже готовы |
-| 2 | `ENGINE_ROUTING=graph` на одном поде/стенде, затем на всех — **выполнено**: `graph` стал значением по умолчанию | включение графа на схеме без условий увело бы `Gateway_Stock` в `Task_CreatePO` (7.1, п. 1) |
-| 3 | удаление legacy-ветки `main.rs`, `db::complete_active_tokens`, `_main_tmp.rs` | после того как граф отработал E2E и демо-сценарий; задача M2 |
-
-Флаг выставляется в манифесте [`bpmn-engine-deployment.yaml`](../../bpmn-engine-deployment.yaml)
-(`env: ENGINE_ROUTING`, значение `graph`): откат — правка одного значения на
-`legacy` и `kubectl apply -f bpmn-engine-deployment.yaml` (затем
-`kubectl rollout status deploy/bpmn-engine-deployment`). Значение читает
-`Routing::from_env()` в `main.rs` и печатает режим в лог при старте
-(`🔀 Маршрутизация событий: ...`) — по этой строке проверяют, что под уже в
-`graph`.
+| 2 | `graph` на одном поде/стенде, затем на всех — **выполнено**: `graph` стал значением по умолчанию | включение графа на схеме без условий увело бы `Gateway_Stock` в `Task_CreatePO` (7.1, п. 1) |
+| 3 | удаление legacy-ветки `main.rs` (`Routing`, `match element_id` по ответу ERP), `db::complete_active_tokens`, `ENGINE_ROUTING` и `_main_tmp.rs` — **выполнено** (M2) | после того как граф отработал E2E (`tests/test-job.yaml`) и демо-сценарий |
 
 При включении `graph` (22.10.2026) всплыли два дефекта вендорного
 Postgres-адаптера, которых не видит юнит-прогон вендора (в нём нет живой БД):
@@ -870,25 +859,24 @@ DDL дополнительно сериализуется advisory-блокир�
   делят одно определение, а старый клиент может его перезаписать. Полное
   версионирование — M4; в M1 достаточно переименования при изменении графа.
 
-Откат: `ENGINE_ROUTING=legacy` + рестарт подов. Вендорные таблицы остаются,
-legacy-путь снова пишет `tokens` по `element_id`; экземпляры, начатые в
-`graph`, продолжаются кнопками (маршрут снова клиентский). Данные не
-удаляются, поэтому откат обратим.
+Откат шага 3 — прежний образ движка (`kubectl set image`) или `git revert`
+коммита: legacy-ветки в текущем коде нет, поэтому откат — это откат версии, а не
+флага. Вендорные и legacy-таблицы остаются, данные не удаляются. Экземпляры,
+начатые до шага 3, продолжаются так же: их ведёт движок (с шага 2 `graph` —
+значение по умолчанию).
 
-Во время rolling update поды работают в разных режимах: сообщение обработает
-тот под, который его получил. Для демо это допустимо (секунды), но
-переключать флаг на всех подах лучше одновременно — `kubectl rollout restart`
-после смены env.
+Во время rolling update поды могут работать на образах до и после шага 3, но
+обе версии ведут экземпляр по графу — расхождения в маршруте нет.
 
 ### 10.2 Что меняется в клиенте
 
 1. **Старт — одно событие.** *(реализовано, шаг 1)* Прежде `startProcess` слал
    `StartProcess` (узел — стартовое событие) и сразу второй `CompleteBlock`
-   (узел — первый шаг), потому что legacy-движок не двигает токен сам. В M1
+   (узел — первый шаг), потому что движок не двигал токен сам. В M1
    второй event завершил бы первый человеческий шаг, который движок только что
    активировал. Теперь `startProcess` в [`App.jsx`](../erp-simulator/src/App.jsx)
-   отправляет **один** `StartProcess` с `element_id` = **первый шаг**: legacy
-   поставит туда токен, граф сам дойдёт от `startEvent` до того же узла. Узел
+   отправляет **один** `StartProcess` с `element_id` = **первый шаг**: движок сам
+   дойдёт от `startEvent` до того же узла (5.2, 10.1). Узел
    выводит схема (`act:userAction/@elementId`, иначе — цель единственной
    исходящей связи стартового события); если узел не выводится, событие не
    отправляется, а причина уходит в ошибку шага и журнал.
@@ -959,7 +947,6 @@ legacy-путь снова пишет `tokens` по `element_id`; экземпл
 | Rust unit | шлюз: `default` при `false` (в т.ч. default-связь **без** `conditionExpression` — после патча 3), первая связь без условия выигрывает, порядок связей | `runtime/pump.rs` тесты на memory-сторах, `bpmn-engine/tests/vendor_patches.rs` |
 | Rust unit | проекция: старт активирует ожидающие шаги, движение токена закрывает прежний шаг и активирует новый, `End` закрывает последний шаг, повторная доставка пуста | `runtime/project.rs` (реализовано) |
 | Rust unit | кэш определений: сто `load` → одна компиляция, изменение XML → перекомпиляция, предел 64 записи | `runtime/store.rs` (реализовано) |
-| Rust unit | `ENGINE_ROUTING`: явный `legacy` включает legacy-путь; `graph`, пустое и неизвестное значение — граф (режим по умолчанию) | `runtime/mod.rs` (реализовано) |
 | Rust unit | `default` без условия (патч 3): `parse_and_compile` даёт `Some(Default)` на default-связи и `Some(Expression)` на остальных | `bpmn-engine/tests/vendor_patches.rs` |
 | Rust unit | `UserTaskCompleted` (патч): переменные попали в инстанс, удалён только один `Waiting`-токен, `parallel_group_id` сохранён | `bpmn-engine/tests/vendor_patches.rs` |
 | Rust integration | пять шлюзов демо-схемы, обе/три ветки; `stockSufficient=true/false` доходит до `Task_Ship`/`Task_CreatePO` | `bpmn-engine/tests/dairy_routing.rs` (Postgres из `DATABASE_URL`, скип без него) |
@@ -1086,6 +1073,6 @@ M3 — сообщения между процессами вместо `startsPr
    `Token` (`id`, `node_id`, `status`, `parallel_group_id`), `Node` или
    `Node.outgoing_edges` (`target`/`condition`, `EdgeCondition::Default`); тогда
    4.3 переписывается, а не подгоняется.
-7. **Только после 1–6** `main.rs` получает `ENGINE_ROUTING` (10.1): `graph` —
-   режим по умолчанию, `legacy` остаётся аварийным откатом.
+7. **Только после 1–6** `main.rs` направляет сообщения в `runtime` (10.1): маршрут
+   считает движок, отдельного режима (`ENGINE_ROUTING`) и legacy-ветки нет.
 

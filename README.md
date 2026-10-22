@@ -82,24 +82,23 @@
 | HTTP-шлюз | `element_id` → тело сообщения в NATS | [`http-cluster/index.js`](bpmn-gateways/http-cluster/index.js) |
 | Движок | запись токена `ACTIVE`, продвижение и завершение | [`bpmn-engine/src/main.rs`](bpmn-engine/src/main.rs) |
 
-Что делает движок при входящем событии с `element_id` (`Main Loop`):
+Что делает движок при входящем событии (`main.rs` → `runtime::GraphRuntime`):
 
-1. сохраняет токен `tokens(id = "<instance_id>:<element_id>", state = 'ACTIVE')`;
-2. закрывает прежние `ACTIVE`-токены этого экземпляра (`COMPLETED`) и публикует по
-   ним `token_updated COMPLETED` — иначе клиент подсветит несколько узлов сразу;
-3. публикует `token_updated ACTIVE` вместе с `payload` в `mes.bpmn.v1.event.<instance_id>`;
-4. всё остальное (какой сервис что делает) — дело внешнего кода.
+1. если в `output_data` есть `bpmn_xml` — деплоит определение схемы
+   (`process_definitions.id` = `id` из `<bpmn:process ...>`) и стартует экземпляр
+   в вендорных сторах;
+2. проводит токен по графу: завершённый узел закрывается, следующие узлы
+   активируются по `sequenceFlow`, условия и `default` шлюзов считает движок;
+3. на каждое изменение публикует `token_updated` (`ACTIVE`/`COMPLETED`) вместе с
+   `payload` в `mes.bpmn.v1.event.<instance_id>`;
+4. повторяет шаги в legacy read-model (`tokens`, `process_instances`), чтобы
+   кабинет и внешние системы читали привычные таблицы.
 
-Инвариант: **на экземпляр ровно один `ACTIVE`-токен**
-([`complete_active_tokens`](bpmn-engine/src/db.rs)). Порядок публикации важен —
-сначала `COMPLETED` прежних узлов, затем `ACTIVE` нового, поэтому «текущий шаг»
-процесса на клиенте — **последнее `ACTIVE`-сообщение**, а пройденные узлы видны
-как `COMPLETED` (зелёная заливка без пульсации).
-
-Дополнительно: если в `output_data` есть `bpmn_xml`, движок компилирует схему,
-сохраняет определение процесса (`process_definitions.id` = `id` из
-`<bpmn:process ...>`) и создаёт экземпляр `process_instances` со статусом
-`ACTIVE`.
+`element_id` события — **адрес кнопки**, а не маршрут: движок берёт `Waiting`-токен
+этого узла, а следующий узел определяет схема (M1, дизайн 5.2). Набор активных
+токенов хранит движок, поэтому несколько `ACTIVE` в `tokens` — норма для
+параллельных ветвей; «текущий шаг» на клиенте — **последнее `ACTIVE`-сообщение**,
+а пройденные узлы видны как `COMPLETED` (зелёная заливка без пульсации).
 
 Имя события (`event_name`) **не участвует** в привязке: движок его не читает
 (оно попадает только в subject `mes.in.v1.event.erp.<event_name>` и в логи),
@@ -137,9 +136,8 @@ curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/eve
       }'
 ```
 
-`element_id` у старта — **первый шаг** процесса, а не стартовое событие: так одно
-и то же событие работает и в `ENGINE_ROUTING=legacy` (токен сразу на узле), и в
-`ENGINE_ROUTING=graph` (движок сам проводит токен от `startEvent` до этого узла).
+`element_id` у старта — **первый шаг** процесса, а не стартовое событие: движок
+сам проводит токен от `startEvent` до этого узла (маршрут по графу схемы, M1).
 
 ### 2. NATS-предметы (subjects) и потоки JetStream
 
@@ -148,7 +146,7 @@ curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/eve
 | `INBOUND_EVENTS` | `mes.in.v1.event.>` | HTTP-шлюз (`...event.erp.<event_name>`) | движок, consumer `engine-inbound-consumer` |
 | `ERP_RESPONSES` | `mes.in.v1.erp.>` | внешние системы (ответы сервисов) | движок, consumer `engine-erp-response-consumer` |
 | `OUTBOUND_DISPATCH` | `mes.out.v1.cmd.<target_system>` | движок (SLA-команды), `target_system` в нижнем регистре | внешние системы |
-| `BPMN_EVENTS` | `mes.bpmn.v1.event.>` | движок (токены и аудит) | WS-шлюз |
+| `BPMN_EVENTS` | `mes.bpmn.v1.event.>` | движок (токены, завершение процесса) | WS-шлюз |
 | `WS_NOTIFICATIONS` | `mes.ws.v1.event.>` | (резерв) | — |
 
 Стримы создаёт Job [`nats-init-streams-job.yaml`](nats-init-streams-job.yaml);
@@ -189,10 +187,10 @@ curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/eve
 
 Старт процесса — одно событие на действие: `StartProcess` (в его `payload` уходит
 `bpmn_xml`), а `element_id` — **первый шаг** схемы (`startProcess` в `App.jsx`,
-таблица действий ниже). Так первый блок сразу получает токен (`ACTIVE`) и после
-выполнения уходит в `COMPLETED`. Второго события нет: в режиме графа
-(`ENGINE_ROUTING=graph`) движок сам проводит токен от `startEvent` до первого
-узла, и лишний `CompleteBlock` закрыл бы шаг, который только что активировали.
+таблица действий ниже). Движок сам проводит токен от `startEvent` до этого узла,
+поэтому первый блок сразу получает токен (`ACTIVE`) и после выполнения уходит в
+`COMPLETED`. Второго события нет: лишний `CompleteBlock` закрыл бы шаг, который
+движок только что активировал.
 
 **Команда внешней системе (SLA-воркер), `ActionRequiredEvent`** → `mes.out.v1.cmd.<target_system>`:
 
@@ -207,8 +205,8 @@ curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/eve
 | Поле | Обяз. | Назначение |
 | --- | --- | --- |
 | `process_instance_id` | да | Экземпляр процесса |
-| `element_id` | нет | Какой шаг закрываем; пусто → `ServiceTask_ERP_Sync` |
-| `status` | да | `SUCCESS` — шаг `COMPLETED`; любое другое — `FAILED` |
+| `element_id` | нет | Подсказка, какой шаг закрываем; пусто → узел ищется по `token_id` из `payload`, иначе берётся единственный ожидающий `serviceTask` |
+| `status` | да | `SUCCESS` (регистр не важен) — шаг завершается, граф идёт дальше; любой другой — только лог, шаг остаётся активным (ретраи/компенсация — M2) |
 | `error_message` | нет | Текст ошибки для логов/аудита |
 | `payload` | да | Данные сервиса; уезжают клиентам вместе с токеном. Поле у `ErpResponseEvent` объявлено без `#[serde(default)]`, поэтому без него ответ не десериализуется и теряется (в логах движка — `❌ [ERP Consumer] Ошибка десериализации`) |
 
@@ -286,11 +284,10 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 `SupplierShippedSignal` (сигнал второй стороне — поле `counterpartEvent`).
 
 Строки с `startProcess` — про запуск процесса: **старт это одно событие.** Клиент
-называет им не стартовое событие, а **первый шаг** процесса. В режиме графа
-(`ENGINE_ROUTING=graph`, M1) движок сам проводит токен от `startEvent` до первого
-узла, а в legacy-режиме событие просто активирует названный узел. Второй
-`CompleteBlock` (так было до M1) в графе закрыл бы шаг, который движок только что
-активировал, — подсветка уехала бы на следующий узел. Узел первого шага схема
+называет им не стартовое событие, а **первый шаг** процесса: движок сам проводит
+токен от `startEvent` до этого узла (M1). Второй `CompleteBlock` (так было до M1)
+закрыл бы шаг, который движок только что активировал, — подсветка уехала бы на
+следующий узел. Узел первого шага схема
 выводит из кнопки старта: `act:userAction/@elementId`, а если поле пусто — по
 единственной исходящей связи стартового события (`resolveAction`).
 
@@ -313,17 +310,17 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 
 ### B. Сервисные задачи в движке (ответ ERP)
 
-Здесь привязка живёт целиком в `match` внутри
-[`main.rs`](bpmn-engine/src/main.rs) — это «серверная» часть связи
-блок↔сервис (продвижение процесса после ответа внешней системы):
+Привязки «блок → следующий блок» в коде больше нет: успешный ответ завершает
+внешнюю задачу узла, чей токен ждёт ответа, и дальше маршрут ведёт
+`GraphRuntime` по `sequenceFlow` задеплоенной схемы (M1, шаг 3):
 
-| `element_id` из ответа | Что делает движок при `status: SUCCESS` |
+| Что пришло | Что делает движок |
 | --- | --- |
-| `ServiceTask_ValidateOrder` | токен → `COMPLETED`, затем активирует `ServiceTask_ReserveStock` |
-| `ServiceTask_ReserveStock` | токен → `COMPLETED`, экземпляр → `COMPLETED` |
-| `ServiceTask_ERP_Sync` (и пустой `element_id`) | токен → `COMPLETED`, экземпляр → `COMPLETED` |
-| любой другой | только `COMPLETED`; продвижения/завершения нет — нужно добавить ветку |
-| `status != SUCCESS` | токен → `FAILED`, экземпляр → `FAILED`, событие `FAILED` в WS |
+| `element_id` узла `serviceTask`, `status: SUCCESS` | внешняя задача завершается, токен идёт по исходящим связям; условия шлюзов вычисляются по переменным из `payload` |
+| `element_id` пуст | узел ищется по `token_id` из `payload`, иначе берётся единственный ожидающий `serviceTask`; если ждут несколько — событие отбрасывается (`no_waiting_token` в логе) |
+| узел уже не ждёт ответа (другой шаг/инстанс) | событие логируется и игнорируется, очередь не блокируется |
+| `status != SUCCESS` | только лог `erp_not_success`: шаг остаётся активным, ретраи/компенсация — M2 |
+| после закрытия узла нет исходящих связей | токен уходит в `EndEvent` → экземпляр `COMPLETED` |
 
 Полный E2E-сценарий (схема с `ServiceTask_ValidateOrder` →
 `ServiceTask_ReserveStock`, публикация ответов ERP и проверка токенов в БД) —
@@ -790,8 +787,8 @@ API SDK: `listActions`, `getElementActions`, `getElementAction`,
 вместе со стартом процесса (так делает тест):
 
 ```js
-// `element_id` — первый шаг процесса: legacy поставит туда токен, граф сам
-// дойдёт от стартового события до того же узла (M1, дизайн 10.2 п. 1).
+// `element_id` — первый шаг процесса: движок сам дойдёт от стартового события
+// до того же узла (M1, дизайн 10.2 п. 1).
 await client.sendEvent('inst-cust-abc123', 'StartProcess', 'Task_CreatePurchaseOrder', {
   bpmn_xml: bpmnXml,
   orderNum: '№101',
@@ -863,11 +860,9 @@ setElementActions(xml, 'Task_SecurityCheck', [
 
 Исключение — **первый шаг процесса**: у него нет предшественника, поэтому его
 называет сам старт. `StartProcess` несёт `bpmn_xml` и `element_id` **первого
-блока**: legacy-движок ставит токен прямо на него, а движок графа
-(`ENGINE_ROUTING=graph`, M1) сам доходит от `startEvent` до того же узла. Второго
-события не нужно: в режиме графа оно закрыло бы шаг, который движок только что
-активировал (в демо старт делает `startProcess` в
-[`App.jsx`](erp-simulator/src/App.jsx)).
+блока**: движок сам доходит от `startEvent` до того же узла (M1). Второго события
+не нужно: оно закрыло бы шаг, который движок только что активировал (в демо старт
+делает `startProcess` в [`App.jsx`](erp-simulator/src/App.jsx)).
 
 **Вариант B — внешняя система (ERP/MES).** Система подписывается на
 `mes.bpmn.v1.event.>` (или читает таблицу `tokens`), находит свой узел по
@@ -879,30 +874,17 @@ nats pub mes.in.v1.erp.response \
     "status":"SUCCESS","payload":{"batch":"B-42"}}' --server=nats-service:4222
 ```
 
-Движок пометит блок `COMPLETED` и разошлёт событие. Чтобы процесс после этого
-**пошёл дальше** (активировать следующий блок или завершить экземпляр),
-добавьте ветку в `match element_id` в `main.rs`:
+Ответ закрывает `serviceTask` в движке: тот завершает внешнюю задачу и сам ведёт
+токен по графу задеплоенной схемы — правок в коде не нужно, маршрут берётся из
+`sequenceFlow`. Ошибка (`status != SUCCESS`) сейчас
+только логируется: ретраи, `retryable` и компенсация — задача M2
+([дорожная карта](erp-simulator/docs/dairy-plant-roadmap.md)).
 
-```rust
-match element_id {
-    "Task_FlashPasteurization" => {
-        let next_element = "Task_Packing";
-        db::save_token_state(&pool_erp, inst_id, next_element, "ACTIVE").await?;
-        nats_erp.publish_token_event(inst_id, next_element, "ACTIVE", Some(&response.payload)).await?;
-    }
-    "ServiceTask_ReserveStock" | "ServiceTask_ERP_Sync" => {
-        db::update_process_instance_status(&pool_erp, inst_id, "COMPLETED").await?;
-    }
-    _ => {}
-}
-```
-
-**Вариант C — адресация конкретной системе.** SLA-воркер уже умеет публиковать
-команду в `mes.out.v1.cmd.<target_system>`. Если нужно, чтобы по активации блока
-движок сразу отправлял работу конкретному сервису, добавьте публикацию
-`ActionRequiredEvent` в обработчик входящего события (сейчас там только запись
-токена и публикация в WS) — и система будет слушать свой subject, а не общий
-поток токенов.
+**Вариант C — адресация конкретной системе.** SLA-воркер публикует команду в
+`mes.out.v1.cmd.<target_system>`. Чтобы работа уходила системе сразу по активации
+узла, команду должен порождать сам `serviceTask`: контракт
+`mes.out.v1.cmd.<system>` (`instance_id`, `element_id`, `payload`,
+`idempotency_key`, `deadline`) и ответ `mes.in.v1.erp.response` — задача M2.
 
 ### Шаг 5. Проверить привязку
 
@@ -988,7 +970,7 @@ kubectl logs deploy/websocket-cluster-deployment -f
 | Токен `ACTIVE`, но шаг не подсвечен | `element_id` отсутствует в задеплоенной схеме | сверить `id` узла и `element_id`, передеплоить схему |
 | Первый блок схемы не подсвечен / не уходит в зелёный | токен стоит не на нём: `StartProcess` назвал другое `element_id` (у кнопки старта `act:userAction/@elementId`, иначе — цель единственной исходящей связи) | `SELECT element_id, state FROM tokens`; передеплоить схему с кнопкой старта и запустить процесс заново |
 | Токен висит `ACTIVE` | шаг никто не завершил | внешний сервис должен ответить в `mes.in.v1.erp.response`; иначе через `SLA_TIMEOUT_MINUTES` (по умолчанию 30) прилетит `TIMED_OUT` |
-| Процесс не доходит до `COMPLETED` | нет ветки `match element_id` в `main.rs` (для ответа ERP) | добавить ветку с активацией следующего узла/завершением |
+| Процесс не доходит до `COMPLETED` | у узла нет исходящего `sequenceFlow` (или сработал не тот `default`), либо ответ ERP не пришёл | проверить связи/условия схемы и ответ в `mes.in.v1.erp.response`; см. `runtime`-логи пода |
 | WS-подсветки нет вообще | не подключён WS-шлюз (`ws://localhost:8081/ws/status`) или движок не публикует `mes.bpmn.v1.event.>` | проверить логи `websocket-cluster` и `bpmn-engine` |
 | В UI «Заказ» появился, но действий нет | WS-событие не сопоставилось с заказом (`instanceId`/`orderNum`) | проверить формат `payload.orderNum` в событии |
 
@@ -1022,7 +1004,6 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 | `NATS_URL` | движок, шлюзы | `nats://nats-service:4222` | брокер |
 | `SLA_CHECK_INTERVAL_SECS` | движок | `3` | период сканирования «зависших» токенов |
 | `SLA_TIMEOUT_MINUTES` | движок | `30` | после какого простоя токен уходит в `TIMED_OUT` + команда в `mes.out.v1.cmd.erp` |
-| `ENGINE_ROUTING` | движок | `graph` | `graph` — исполнение по графу схемы, `legacy` — аварийный откат, где следующий узел называет клиент (M1, шаг 2; см. [`docs/runtime-m1-design.md`](docs/runtime-m1-design.md), 10.1). Пустое/неизвестное значение читается как `graph` |
 | `PORT` | шлюзы | `8080` | порт шлюза внутри пода |
 | `JSON_BODY_LIMIT` | http-cluster | `10mb` | лимит тела (BPMN-схема приезжает в `output_data.bpmn_xml`) |
 | `CORS_ORIGIN` | http-cluster | `*` | источник(и) для браузера |
@@ -1031,19 +1012,20 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 
 ## Известные ограничения
 
-1. **Продвижение по ответу ERP захардкожено** в `match element_id`
-   ([`main.rs`](bpmn-engine/src/main.rs)). Новый сервисный блок с ответом
-   внешней системы не поедет дальше без правки движка — либо вынесите маппинг
-   «шаг → следующий шаг» в таблицу/конфиг.
-2. **Движок не исполняет граф схемы.** `sequenceFlow` не читается: следующий
-   активный узел указывает вызывающая сторона (клиент) или ветка `match`.
-   Схема используется как справочник `id` и как визуализация состояния.
+1. **Воркера `serviceTask` нет (M2).** Ответ ERP уже двигает экземпляр по графу
+   (M1, шаг 3), но сама задача не активируется движком и команду воркеру никто не
+   шлёт: `Task_ERP_*` в демо — `userTask` с кнопкой. Контракт воркера —
+   [дорожная карта](erp-simulator/docs/dairy-plant-roadmap.md), M2.
+2. **Проходные токены (`startEvent`, шлюзы) остаются в вендорной таблице
+   `token`.** В `Waiting` они копятся и не проецируются в шаги кабинета;
+   уборка/GC — M5.
 3. **`event_name` не участвует в маршрутизации** (движок его не читает), а
    литерал `erp` в subject HTTP-шлюза (`mes.in.v1.event.erp.<event_name>`)
    зашит в код шлюза.
-4. **Компенсация/ретраи не реализованы**: любой `status != SUCCESS` в ответе
-   ERP сразу переводит шаг и экземпляр в `FAILED`; на таймауте движок лишь
-   публикует `ActionRequiredEvent` с `action: CANCEL_OR_RETRY`.
+4. **Компенсация/ретраи не реализованы**: ответ ERP со `status != SUCCESS`
+   только логируется — шаг остаётся активным; на таймауте SLA-воркер публикует
+   `ActionRequiredEvent` с `action: CANCEL_OR_RETRY` и помечает legacy-токен
+   `TIMED_OUT` (граф при этом не двигается — M6).
 5. **`migrations/` — пустой каталог:** в git пустые каталоги не хранятся, его
    создаёт `deploy.sh`. Каталог нужен макросу `sqlx::migrate!("./migrations")` на
    этапе сборки, а структура таблиц описана в [`schema.sql`](schema.sql) и
@@ -1074,13 +1056,11 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
     Роль нельзя задать событию или шлюзу: `resourceRole`
     по спецификации BPMN 2.0 есть только у Activity — SDK и редактор это
     блокируют вместо молчаливой потери элемента при сохранении.
-11. **Инвариант «один `ACTIVE`-токен на экземпляр» несовместим с параллельными
-   ветками.** Активируя узел, движок закрывает все прежние `ACTIVE`-токены
-   экземпляра ([`db::complete_active_tokens`](bpmn-engine/src/db.rs)), потому что
-   клиент показывает один «текущий шаг». `parallelGateway`/`inclusiveGateway` с
-   несколькими одновременными ветками так не выразить: на экземпляре останется
-   только последняя активация. Для ветвлений понадобится хранить набор активных
-   токенов и снимать состояние с графа (`sequenceFlow`), а не с одной записи.
+11. **Кабинет подсвечивает один «текущий шаг».** Движок хранит набор активных
+    токенов, `parallelGateway`/`inclusiveGateway` исполняются, и несколько
+    `ACTIVE` в `tokens` — норма для параллельных ветвей. Но клиент берёт последнее
+    `ACTIVE`-сообщение и не рисует набор одновременно активных узлов: подсветка
+    набора запланирована в M1.1 (`token_id` уже приходит в `token_updated`).
 12. **Движок не читает `trg:processTrigger`.** Триггер живёт в схеме и
     настраивается в редакторе, но запуск второго процесса по-прежнему делает
     клиент отдельным `sendEvent` (демо-сценарий «передать заказ поставщику»):
@@ -1101,7 +1081,8 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 
 | Файл | Отвечает за |
 | --- | --- |
-| [`bpmn-engine/src/main.rs`](bpmn-engine/src/main.rs) | Приём событий, токены, SLA-воркер, `match element_id` для ответов ERP |
+| [`bpmn-engine/src/main.rs`](bpmn-engine/src/main.rs) | Приём событий, SLA-воркер; сообщения уходят в `runtime` |
+| [`bpmn-engine/src/runtime/mod.rs`](bpmn-engine/src/runtime/mod.rs) | `GraphRuntime`: деплой схемы, старт, завершение шага, ответ ERP, публикация `Outcome` |
 | [`bpmn-engine/src/db.rs`](bpmn-engine/src/db.rs) | `process_definitions`, `process_instances`, `tokens` (id = `instance:element`) |
 | [`bpmn-engine/src/nats_client.rs`](bpmn-engine/src/nats_client.rs) | Subject'ы: `mes.bpmn.v1.event.<instance>`, `mes.out.v1.cmd.<system>` |
 | [`bpmn-engine/src/events.rs`](bpmn-engine/src/events.rs) | Контракты `InboundEvent`, `ErpResponseEvent`, `ActionRequiredEvent` |

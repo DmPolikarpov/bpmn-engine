@@ -229,7 +229,7 @@ def force_expire_token(instance_id, element_id):
         conn.close()
 
 def table_exists(cursor, name):
-    """Проверяет наличие таблицы: в legacy-режиме вендорной схемы может не быть."""
+    """Проверяет наличие таблицы: на стенде без вендорной схемы её может не быть."""
     cursor.execute("SELECT to_regclass(%s);", (name,))
     return cursor.fetchone()[0] is not None
 
@@ -244,9 +244,9 @@ def cleanup_test_data(instance_id, process_def_id):
         cursor.execute("DELETE FROM process_instances WHERE id = %s;", (instance_id,))
         cursor.execute("DELETE FROM process_definitions WHERE id = %s;", (process_def_id,))
 
-        # Вендорная схема (источник истины в ENGINE_ROUTING=graph). token и прочие
-        # дочерние таблицы уходят каскадом от process_instance, но token чистим
-        # явно: так cleanup работает и на схеме, где каскад не создался.
+        # Вендорная схема — источник истины: движок ведёт экземпляр по графу.
+        # token и прочие дочерние таблицы уходят каскадом от process_instance,
+        # но token чистим явно: так cleanup работает и там, где каскад не создался.
         if table_exists(cursor, "process_instance"):
             if table_exists(cursor, "token"):
                 cursor.execute("DELETE FROM token WHERE instance_id = %s;", (instance_id,))

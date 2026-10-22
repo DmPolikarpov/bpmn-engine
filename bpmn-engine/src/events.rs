@@ -20,13 +20,6 @@ pub struct ActionRequiredEvent {
     pub payload: Value,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct BpmnEvent {
-    pub process_id: String,
-    pub event_type: String,
-    pub payload: Value,
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ErpResponseEvent {
     pub process_instance_id: String,

@@ -1,4 +1,4 @@
-use crate::events::{ActionRequiredEvent, BpmnEvent};
+use crate::events::ActionRequiredEvent;
 use async_nats::jetstream::{self, Context, consumer::pull::Config as PullConfig};
 use serde_json::{json, Value};
 use std::env;
@@ -40,8 +40,8 @@ impl NatsAdapter {
 
     /// То же, но с `token_id` движка.
     ///
-    /// Режим `ENGINE_ROUTING=graph` публикует его для M1.1 (подсветка набора
-    /// активных узлов); legacy-путь оставляет поле пустым.
+    /// Публикуется для M1.1 (подсветка набора активных узлов): без него два
+    /// токена на одном узле не различить.
     pub async fn publish_token_event_with_token_id(
         &self,
         instance_id: &str,
@@ -100,16 +100,6 @@ impl NatsAdapter {
         self.js.publish(subject, payload_bytes).await?;
         println!("📡 [NATS Publish] {} для {} опубликован в NATS", event, instance_id);
 
-        Ok(())
-    }
-
-    pub async fn publish_audit_event(&self, event: &BpmnEvent) -> Result<(), async_nats::Error> {
-        let subject = format!("mes.bpmn.v1.event.{}", event.process_id);
-        let payload = serde_json::to_vec(event)?.into();
-
-        let _ack = self.js.publish(subject, payload).await?;
-        println!("Published audit event for process: {}", event.process_id);
-        
         Ok(())
     }
 

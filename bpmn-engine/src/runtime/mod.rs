@@ -1,13 +1,11 @@
 //! Рантайм маршрутизации по графу схемы (M1).
 //!
 //! Модуль — единственное место, где встречаются NATS-контракт сервиса и типы
-//! вендорного `bpm-engine`: `main.rs` знает только [`Routing`],
-//! [`GraphRuntime`], [`Outcome`] и [`StepEvent`] (дизайн
-//! `docs/runtime-m1-design.md`, 9.1).
+//! вендорного `bpm-engine`: `main.rs` знает только [`GraphRuntime`],
+//! [`Outcome`] и [`StepEvent`] (дизайн `docs/runtime-m1-design.md`, 9.1).
 //!
-//! Переключатель режима — переменная окружения `ENGINE_ROUTING`:
-//! `graph` (по умолчанию) исполняет граф схемы, `legacy` — аварийный откат,
-//! в котором маршрут считает клиент (дизайн 10.1).
+//! Режим один — маршрут считает движок по графу схемы (дизайн 10.1).
+//! Legacy-ветка, где следующий узел называл клиент, удалена шагом 3 (M2).
 
 pub mod mapper;
 pub mod project;
@@ -27,46 +25,10 @@ use self::store::GraphStores;
 use crate::db;
 use crate::events::{ErpResponseEvent, InboundEvent};
 
-/// Режим маршрутизации (`ENGINE_ROUTING`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Routing {
-    /// Аварийный откат: маршрут считает клиент, токен ставится по `element_id`.
-    Legacy,
-    /// Основной режим: маршрут считает движок по графу схемы.
-    Graph,
-}
-
-impl Routing {
-    /// Читает режим из окружения; всё, кроме явного `legacy`, — `graph`.
-    pub fn from_env() -> Self {
-        Self::parse(&std::env::var("ENGINE_ROUTING").unwrap_or_default())
-    }
-
-    /// Разбирает значение переменной (регистр не важен).
-    ///
-    /// `legacy` — единственное значение, которое выключает граф: это
-    /// аварийный откат при выкатке. Пустое или неизвестное значение означает,
-    /// что маршрут считает оркестратор — режим по умолчанию.
-    pub fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "legacy" => Routing::Legacy,
-            _ => Routing::Graph,
-        }
-    }
-
-    /// Строковое имя режима для логов.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Routing::Legacy => "legacy",
-            Routing::Graph => "graph",
-        }
-    }
-}
-
 /// Подключает структурированные логи вендора (`tracing`).
 ///
-/// Вызывается только в режиме `graph`: в `legacy` остаются текущие
-/// `println!`, чтобы шаг 0 не менял наблюдаемость.
+/// Вызывается один раз при старте; `println!` остаются только для событий
+/// самого сервиса (SLA, ответы NATS).
 pub fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -84,7 +46,8 @@ pub struct StepEvent {
     pub element_id: String,
     /// `ACTIVE` или `COMPLETED`.
     pub state: &'static str,
-    /// `output_data` события — только для `ACTIVE`, как и в legacy-пути.
+    /// `output_data` события — только для `ACTIVE`: `COMPLETED` не должен
+    /// перезаписывать данные заказа на клиенте.
     pub payload: Option<Value>,
 }
 
@@ -108,7 +71,7 @@ pub struct GraphRuntime {
 impl GraphRuntime {
     /// Собирает сторы и создаёт вендорные таблицы.
     ///
-    /// Вызывается только при `ENGINE_ROUTING=graph`.
+    /// Единственный режим исполнения: вызывается при старте движка.
     pub async fn new(database_url: &str, legacy: PgPool) -> anyhow::Result<Self> {
         let stores = GraphStores::new(database_url)?;
         stores.ensure_schema().await?;
@@ -402,22 +365,6 @@ mod tests {
     use super::pump::Step;
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn routing_defaults_to_graph() {
-        assert_eq!(Routing::parse(""), Routing::Graph);
-        assert_eq!(Routing::parse("graph"), Routing::Graph);
-        assert_eq!(Routing::parse(" Graph "), Routing::Graph);
-        assert_eq!(
-            Routing::parse("unknown"),
-            Routing::Graph,
-            "неизвестное значение не должно незаметно отключать оркестратор"
-        );
-        assert_eq!(Routing::parse("legacy"), Routing::Legacy);
-        assert_eq!(Routing::parse(" LEGACY "), Routing::Legacy);
-        assert_eq!(Routing::Graph.as_str(), "graph");
-        assert_eq!(Routing::Legacy.as_str(), "legacy");
-    }
 
     #[test]
     fn outcome_closes_old_step_and_activates_new() {
