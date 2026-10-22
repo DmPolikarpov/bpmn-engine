@@ -132,10 +132,14 @@ curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/eve
   -d '{
         "event_name": "StartProcess",
         "correlation_key": "corr-abc123",
-        "element_id": "StartEvent_Customer",
+        "element_id": "Task_CreatePurchaseOrder",
         "output_data": { "bpmn_xml": "<bpmn:definitions ...>", "orderNum": "№101" }
       }'
 ```
+
+`element_id` у старта — **первый шаг** процесса, а не стартовое событие: так одно
+и то же событие работает и в `ENGINE_ROUTING=legacy` (токен сразу на узле), и в
+`ENGINE_ROUTING=graph` (движок сам проводит токен от `startEvent` до этого узла).
 
 ### 2. NATS-предметы (subjects) и потоки JetStream
 
@@ -183,11 +187,12 @@ curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/eve
 приходит в момент активации следующего, поэтому на него нельзя ни откатывать шаг
 назад, ни закрывать карточку заказа ([`App.jsx`](erp-simulator/src/App.jsx)).
 
-Старт процесса — единственное место, где клиент отправляет два события на одно
-действие: `StartProcess` (в его `payload` уходит `bpmn_xml`) и сразу второе
-событие, которое ставит токен на первый шаг схемы (`startProcess` в `App.jsx`,
-таблица действий ниже). Так первый блок проходит через оба состояния —
-`ACTIVE` при старте и `COMPLETED` после выполнения — и подсвечивается целиком.
+Старт процесса — одно событие на действие: `StartProcess` (в его `payload` уходит
+`bpmn_xml`), а `element_id` — **первый шаг** схемы (`startProcess` в `App.jsx`,
+таблица действий ниже). Так первый блок сразу получает токен (`ACTIVE`) и после
+выполнения уходит в `COMPLETED`. Второго события нет: в режиме графа
+(`ENGINE_ROUTING=graph`) движок сам проводит токен от `startEvent` до первого
+узла, и лишний `CompleteBlock` закрыл бы шаг, который только что активировали.
 
 **Команда внешней системе (SLA-воркер), `ActionRequiredEvent`** → `mes.out.v1.cmd.<target_system>`:
 
@@ -262,11 +267,9 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 | --- | --- | --- | --- | --- |
 | Руководитель (EXECUTIVE) | Деплой схемы (`deploySchema('CUSTOMER', xml)`) | `DeploySchema` | `Process_Deployment` | `inst-deploy-customer` |
 | Руководитель Поставщика | Деплой схемы (`deploySchema('SUPPLIER', xml)`) | `DeploySchema` | `Process_Deployment` | `inst-deploy-supplier` |
-| Мастер производства (`handleProductionCreateOrder`) | «Создать внутренний заказ на 100 л» | `StartProcess` | `StartEvent_Customer` | `inst-cust-*` |
-| Мастер производства (там же, шаг 2 — `startProcess`) | Первый шаг процесса | `CompleteBlock` | `Task_CreatePurchaseOrder` | `inst-cust-*` |
+| Мастер производства (`handleProductionCreateOrder`) | «Создать внутренний заказ на 100 л» | `StartProcess` | `Task_CreatePurchaseOrder` | `inst-cust-*` |
 | Менеджер закупок (`handleCustomerSendOrderToSupplier`) | Передать заказ поставщику | `CompleteBlock` | `Task_WaitForSupplierShipment` | `inst-cust-*` |
-| Менеджер закупок (там же, шаг 2 — `startProcess`) | Запуск процесса поставщика | `StartProcess` | `StartEvent_Supplier` | `inst-supp-*` |
-| Менеджер закупок (там же, шаг 3 — `startProcess`) | Первый шаг поставщика | `CompleteBlock` | `Task_SupplierCreateDocs` | `inst-supp-*` |
+| Менеджер закупок (там же, шаг 2 — `startProcess`) | Запуск процесса поставщика | `StartProcess` | `Task_SupplierCreateDocs` | `inst-supp-*` |
 | Менеджер поставщика (`handleSupplierCreateDocs`) | Сформировать УПД/ТТН | `CompleteBlock` | `Task_SupplierShipment` | `inst-supp-*` |
 | Менеджер поставщика (`handleSupplierShipment`) | Отгрузить цистерну | `CompleteBlock` | `EndEvent_Supplier` | `inst-supp-*` |
 | Менеджер поставщика (там же, шаг 2) | Сигнал заказчику | `SupplierShippedSignal` | `Task_ReceiveDocsAndIssuePass` | `inst-cust-*` |
@@ -282,19 +285,17 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 имена остались там, где их пишут данные: `DeploySchema`, `StartProcess` и
 `SupplierShippedSignal` (сигнал второй стороне — поле `counterpartEvent`).
 
-Строки с `startProcess` — про запуск процесса: **старт это два события.** Движок
-не делает переходов сам (событие называет узел, который станет `ACTIVE`), поэтому
-`StartProcess` оставляет токен на стартовом событии, а второе событие переносит
-его на первый шаг — тот самый блок, который интерфейс сразу показывает «текущим
-шагом» (`customerActiveElementId`/`supplierActiveElementId`). Без второго события
-движок закрыл бы `COMPLETED` стартовое событие, а первый блок в его состоянии не
-появлялся бы вовсе: после выполнения он не подсветился бы (ни зелёным, ни как-то
-иначе) — именно так первый прямоугольник «не красился» и у заказчика, и у
-поставщика.
+Строки с `startProcess` — про запуск процесса: **старт это одно событие.** Клиент
+называет им не стартовое событие, а **первый шаг** процесса. В режиме графа
+(`ENGINE_ROUTING=graph`, M1) движок сам проводит токен от `startEvent` до первого
+узла, а в legacy-режиме событие просто активирует названный узел. Второй
+`CompleteBlock` (так было до M1) в графе закрыл бы шаг, который движок только что
+активировал, — подсветка уехала бы на следующий узел. Узел первого шага схема
+выводит из кнопки старта: `act:userAction/@elementId`, а если поле пусто — по
+единственной исходящей связи стартового события (`resolveAction`).
 
-У «старт — два события» есть следствие для списка заказов: раз событий два, токен
-`StartProcess` движок публикует **раньше**, чем обработчик кнопки дождётся обоих
-ответов HTTP (кадр WS успевает между двумя `sendEvent`). Заказ к этому моменту уже
+У старта есть следствие для списка заказов: токен `StartProcess` движок публикует
+**раньше**, чем обработчик кнопки дождётся ответа HTTP. Заказ к этому моменту уже
 заводит ветка «заказ по токену» в подписке на токены, поэтому
 `handleProductionCreateOrder` не добавляет свой `pendingOrder` вслепую, а сливает
 его с найденным по `custInstId` (`{ ...pendingOrder, ...order }` — состояние из WS
@@ -304,11 +305,11 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 тестом «токен старта, обогнавший ответ HTTP, не удваивает заказ».
 
 Тот же приём используется и в интеграционном тесте:
-[`App.test.js`](erp-simulator/src/App.test.js) проверяет оба вызова кнопки
-производства — `sendEvent(inst-cust-*, 'StartProcess', 'StartEvent_Customer', {...})`
-и `sendEvent(inst-cust-*, 'CompleteBlock', 'Task_CreatePurchaseOrder', {...})`.
-Второе имя события — умолчание схемы (в кнопке старта записана только роль
-инициатора), узел первого шага схема выводит по исходящей связи.
+[`App.test.js`](erp-simulator/src/App.test.js) проверяет **один** вызов кнопки
+производства — `sendEvent(inst-cust-*, 'StartProcess', 'Task_CreatePurchaseOrder',
+{ orderNum, volume, initiator, bpmn_xml })` — и то, что второго события на первый
+шаг нет: узел первого шага (умолчание `CompleteBlock` не отправляется вовсе)
+схема выводит по исходящей связи стартового события.
 
 ### B. Сервисные задачи в движке (ответ ERP)
 
@@ -789,7 +790,9 @@ API SDK: `listActions`, `getElementActions`, `getElementAction`,
 вместе со стартом процесса (так делает тест):
 
 ```js
-await client.sendEvent('inst-cust-abc123', 'StartProcess', 'StartEvent_Customer', {
+// `element_id` — первый шаг процесса: legacy поставит туда токен, граф сам
+// дойдёт от стартового события до того же узла (M1, дизайн 10.2 п. 1).
+await client.sendEvent('inst-cust-abc123', 'StartProcess', 'Task_CreatePurchaseOrder', {
   bpmn_xml: bpmnXml,
   orderNum: '№101',
 });
@@ -858,11 +861,13 @@ setElementActions(xml, 'Task_SecurityCheck', [
 роли вызывает `sendEvent` из шага 3, больше ничего не нужно — движок переведёт
 указанный узел в `ACTIVE` и разошлёт это по WS.
 
-Исключение — **первый шаг процесса**: он не «двигается», его нужно активировать
-отдельным событием. `StartProcess` называет стартовое событие (и несёт
-`bpmn_xml`), поэтому сразу за ним отправьте второе событие с `element_id` первого
-блока — тогда шаг попадёт в состояние движка и после выполнения уйдёт в `COMPLETED`
-(в демо это делает `startProcess` в [`App.jsx`](erp-simulator/src/App.jsx)).
+Исключение — **первый шаг процесса**: у него нет предшественника, поэтому его
+называет сам старт. `StartProcess` несёт `bpmn_xml` и `element_id` **первого
+блока**: legacy-движок ставит токен прямо на него, а движок графа
+(`ENGINE_ROUTING=graph`, M1) сам доходит от `startEvent` до того же узла. Второго
+события не нужно: в режиме графа оно закрыло бы шаг, который движок только что
+активировал (в демо старт делает `startProcess` в
+[`App.jsx`](erp-simulator/src/App.jsx)).
 
 **Вариант B — внешняя система (ERP/MES).** Система подписывается на
 `mes.bpmn.v1.event.>` (или читает таблицу `tokens`), находит свой узел по
@@ -935,14 +940,14 @@ kubectl logs deploy/websocket-cluster-deployment -f
    стоял токен: движок закрывает **прежний `ACTIVE`**, а не «блок перед текущим».
    Если шаг живёт только в интерфейсе (клиент показал его «текущим», а события
    движку не отправил), подсветки у него не будет ни в каком состоянии. Так было
-   с первым прямоугольником обеих демо-схем: интерфейс сразу считал текущим
-   `Task_CreatePurchaseOrder` (`Task_SupplierCreateDocs` у поставщика), а токен
-   стоял на `StartEvent_Customer` (`StartEvent_Supplier`) — после выполнения шага
-   движок закрывал `COMPLETED` стартовое событие, а сам блок не подсвечивался
-   вообще. Лечится вторым событием старта (`startProcess` в
-   [`App.jsx`](erp-simulator/src/App.jsx), таблица действий выше): перед проверкой
-   состояния посмотрите `SELECT element_id, state FROM tokens`, чтобы убедиться,
-   что токен вообще был на этом узле.
+   до M1: интерфейс сразу считал текущим `Task_CreatePurchaseOrder`
+   (`Task_SupplierCreateDocs` у поставщика), а токен стоял на `StartEvent_Customer`
+   (`StartEvent_Supplier`) — после выполнения шага движок закрывал `COMPLETED`
+   стартовое событие, а сам блок не подсвечивался вообще. Сейчас `StartProcess`
+   называет первый шаг (см. `startProcess` в [`App.jsx`](erp-simulator/src/App.jsx),
+   таблица действий выше); перед проверкой состояния посмотрите
+   `SELECT element_id, state FROM tokens`, чтобы убедиться, что токен вообще был на
+   этом узле.
 
 ## Правила и ограничения идентификаторов
 
@@ -981,7 +986,7 @@ kubectl logs deploy/websocket-cluster-deployment -f
 | `503` «JetStream is not connected» | нет стрима `INBOUND_EVENTS` или NATS недоступен | `kubectl apply -f nats-init-streams-job.yaml`, проверить `nats stream ls` |
 | `500` / «Ошибка сети» в UI | нет проброса портов (CRA-прокси не может достучаться до 8080) | `./translate_ports.sh` (перезапускает `kubectl port-forward`) |
 | Токен `ACTIVE`, но шаг не подсвечен | `element_id` отсутствует в задеплоенной схеме | сверить `id` узла и `element_id`, передеплоить схему |
-| Первый блок схемы не подсвечен / не уходит в зелёный | токен стоит на стартовом событии: клиент не отправил событие первого шага | после `StartProcess` активировать первый блок (`startProcess` в [`App.jsx`](erp-simulator/src/App.jsx)); проверить `SELECT element_id, state FROM tokens` |
+| Первый блок схемы не подсвечен / не уходит в зелёный | токен стоит не на нём: `StartProcess` назвал другое `element_id` (у кнопки старта `act:userAction/@elementId`, иначе — цель единственной исходящей связи) | `SELECT element_id, state FROM tokens`; передеплоить схему с кнопкой старта и запустить процесс заново |
 | Токен висит `ACTIVE` | шаг никто не завершил | внешний сервис должен ответить в `mes.in.v1.erp.response`; иначе через `SLA_TIMEOUT_MINUTES` (по умолчанию 30) прилетит `TIMED_OUT` |
 | Процесс не доходит до `COMPLETED` | нет ветки `match element_id` в `main.rs` (для ответа ERP) | добавить ветку с активацией следующего узла/завершением |
 | WS-подсветки нет вообще | не подключён WS-шлюз (`ws://localhost:8081/ws/status`) или движок не публикует `mes.bpmn.v1.event.>` | проверить логи `websocket-cluster` и `bpmn-engine` |
