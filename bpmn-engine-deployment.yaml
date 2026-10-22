@@ -31,6 +31,12 @@ spec:
             secretKeyRef:
               name: db-secrets
               key: database-url
+        # Режим маршрутизации M1 (`docs/runtime-m1-design.md`, 10.1):
+        # `legacy` — маршрут считает клиент (текущее поведение);
+        # `graph` — движок исполняет граф схемы (шаг 2 выкатки).
+        # Неизвестное значение движок читает как `legacy`.
+        - name: ENGINE_ROUTING
+          value: "legacy"
               
         # Ограничения по ресурсам (Rust потребляет очень мало)
         resources:

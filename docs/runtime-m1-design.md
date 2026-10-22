@@ -817,6 +817,14 @@ load(id):
 | 2 | `ENGINE_ROUTING=graph` на одном поде/стенде, затем на всех | включение графа на схеме без условий увело бы `Gateway_Stock` в `Task_CreatePO` (7.1, п. 1) |
 | 3 | удаление legacy-ветки `main.rs`, `db::complete_active_tokens`, `_main_tmp.rs` | после того как граф отработал E2E и демо-сценарий; задача M2 |
 
+Флаг выставляется в манифесте [`bpmn-engine-deployment.yaml`](../bpmn-engine-deployment.yaml)
+(`env: ENGINE_ROUTING`, по умолчанию `legacy`): включение шага 2 — правка одного
+значения и `kubectl apply -f bpmn-engine-deployment.yaml` (затем
+`kubectl rollout status deploy/bpmn-engine-deployment`). Значение читает
+`Routing::from_env()` в `main.rs` и печатает режим в лог при старте
+(`🔀 Маршрутизация событий: ...`) — по этой строке проверяют, что под уже в
+`graph`.
+
 Ограничения шага 1:
 
 - **Кэш схемы в браузере.** `bpmn_xml` приходит из проекта в `localStorage`;
@@ -931,6 +939,7 @@ legacy-путь снова пишет `tokens` по `element_id`; экземпл
 | JS unit | `variables` кнопки: разбор, запись/чтение XML, `normalizeAction`, ошибки формата | `bpmnXml.test.js` |
 | JS unit | валидатор: шесть новых кодов (7.4), демо-проект без проблем | `bpmnXml.test.js`, `dairyPlant.test.js` |
 | JS unit | маршрут кнопок: для каждого шлюза переменные кнопок дают её же `elementId` | `dairyPlant.test.js` |
+| JS integration | старт — одно событие: `StartProcess` с `element_id` первого шага у заказчика, поставщика, склада и схемы без кнопки; второй `CompleteBlock` не отправляется | `App.test.js` |
 | E2E | `tests/test_workflow.py` без изменений: ERP-ответы двигают `ServiceTask_*`, экземпляр закрывается `process_completed`, в `tokens` ровно один `ACTIVE` на линейном сценарии | `tests/` |
 
 Отдельно — тест «нет утечки»: сто вызовов `CachedDefStore::load` дают одну
