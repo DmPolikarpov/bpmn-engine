@@ -1,4 +1,4 @@
-use crate::events::ActionRequiredEvent;
+use crate::events::{ActionRequiredEvent, ServiceCommand};
 use async_nats::jetstream::{self, Context, consumer::pull::Config as PullConfig};
 use serde_json::{json, Value};
 use std::env;
@@ -103,11 +103,31 @@ impl NatsAdapter {
         Ok(())
     }
 
+    /// SLA-команда (`ActionRequiredEvent`) — совместимый контракт M1.
     pub async fn publish_outbound_command(&self, event: &ActionRequiredEvent) -> Result<(), async_nats::Error> {
-        let subject = format!("mes.out.v1.cmd.{}", event.target_system.to_lowercase());
+        let subject = command_subject(&event.target_system);
         let payload = serde_json::to_vec(event)?.into();
 
         self.js.publish(subject, payload).await?;
+        Ok(())
+    }
+
+    /// Команда воркеру `serviceTask` (контракт M2) → `mes.out.v1.cmd.<system>`.
+    ///
+    /// Уходит сразу после активации узла; поле `target_system` в теле
+    /// дублирует subject, чтобы получатель мог проверить адресацию.
+    pub async fn publish_service_command(
+        &self,
+        command: &ServiceCommand,
+    ) -> Result<(), async_nats::Error> {
+        let subject = command_subject(&command.target_system);
+        let payload = serde_json::to_vec(command)?.into();
+
+        self.js.publish(subject.clone(), payload).await?;
+        println!(
+            "📤 [NATS Publish] Команда {}:{} → {}",
+            command.instance_id, command.element_id, subject
+        );
         Ok(())
     }
 
@@ -140,4 +160,10 @@ impl NatsAdapter {
         
         Ok(consumer)
     }
+}
+
+/// Subject исходящей команды: `target_system` приводится к нижнему регистру
+/// (`ERP` → `mes.out.v1.cmd.erp`), как в `nats-init-streams-job.yaml`.
+fn command_subject(target_system: &str) -> String {
+    format!("mes.out.v1.cmd.{}", target_system.to_lowercase())
 }

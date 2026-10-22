@@ -171,6 +171,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// Ошибки публикации не отменяют уже записанное состояние: это телеметрия для
 /// кабинета, а сообщение уже подтверждено.
 async fn publish_outcome(nats: &NatsAdapter, instance_id: &str, outcome: &runtime::Outcome) {
+    for command in &outcome.commands {
+        if let Err(e) = nats.publish_service_command(command).await {
+            eprintln!(
+                "❌ [Graph] Ошибка публикации команды {}:{}: {}",
+                command.instance_id, command.element_id, e
+            );
+        }
+    }
+
     for step in &outcome.steps {
         if let Err(e) = nats
             .publish_token_event_with_token_id(

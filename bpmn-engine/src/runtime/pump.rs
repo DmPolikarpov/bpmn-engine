@@ -114,6 +114,56 @@ pub fn step_kind(definition: &ProcessDefinition, node_id: &str) -> Option<StepKi
     }
 }
 
+/// Параметры `serviceTask` из схемы (дизайн `docs/runtime-m1-design.md`, 10.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalTaskSpec {
+    /// Тема воркера: `camunda:topic` (по умолчанию `default`).
+    pub task_type: String,
+    /// Сколько раз задача может быть переотправлена (ретраи — следующий шаг M2).
+    pub retries: i32,
+    /// Таймаут выполнения в секундах: из него считается `deadline` команды.
+    pub timeout_secs: u64,
+}
+
+/// Достаёт параметры `serviceTask`; для остальных узлов — `None`.
+pub fn external_task_spec(
+    definition: &ProcessDefinition,
+    node_id: &str,
+) -> Option<ExternalTaskSpec> {
+    match &definition.nodes.get(node_id)?.node_type {
+        NodeType::ExternalTask {
+            task_type,
+            retries,
+            timeout_secs,
+        } => Some(ExternalTaskSpec {
+            task_type: task_type.clone(),
+            retries: *retries,
+            timeout_secs: *timeout_secs,
+        }),
+        _ => None,
+    }
+}
+
+/// Хост-узел ответа ERP.
+///
+/// Явный `element_id` — адрес задачи: если такого ожидающего `serviceTask`
+/// нет, ответ не применяется. Иначе устаревший или повторный ответ закрыл бы
+/// соседний узел, который ждёт своей команды (дизайн 10.4). Без `element_id`
+/// работает прежний выбор по `token_id` или единственному ожидающему шагу.
+pub fn erp_host_step(
+    snapshot: &Snapshot,
+    element_id: Option<&str>,
+    token_id: Option<&str>,
+) -> Option<Step> {
+    match element_id {
+        Some(node_id) => snapshot.waiting_steps().into_iter().find(|step| {
+            step.element_id == node_id
+                && step_kind(&snapshot.definition, &step.element_id) == Some(StepKind::ExternalTask)
+        }),
+        None => snapshot.host_step(StepKind::ExternalTask, token_id, None),
+    }
+}
+
 /// Список хендлеров M1 (дизайн 9.2).
 ///
 /// `HistoryHandler` без `history_repo` в контексте сразу возвращает пусто,
@@ -370,6 +420,72 @@ mod tests {
             snapshot.host_step(StepKind::UserTask, None, None),
             None,
             "serviceTask не завершается событием userTask"
+        );
+    }
+
+    #[test]
+    fn erp_response_targets_only_its_node() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="http://bpmn-engine.local">
+  <process id="runtime_pump_test" name="Pump" isExecutable="true">
+    <startEvent id="Start"/>
+    <serviceTask id="ServiceTask_A" name="A"/>
+    <serviceTask id="ServiceTask_B" name="B"/>
+    <endEvent id="End"/>
+    <sequenceFlow id="F1" sourceRef="Start" targetRef="ServiceTask_A"/>
+    <sequenceFlow id="F2" sourceRef="ServiceTask_A" targetRef="ServiceTask_B"/>
+    <sequenceFlow id="F3" sourceRef="ServiceTask_B" targetRef="End"/>
+  </process>
+</definitions>"#;
+        let definition = parse_and_compile(xml).expect("схема компилируется");
+        let snapshot = Snapshot {
+            instance: instance(vec![
+                waiting_token("token-a", "ServiceTask_A"),
+                waiting_token("token-b", "ServiceTask_B"),
+            ]),
+            definition,
+        };
+
+        assert_eq!(
+            erp_host_step(&snapshot, Some("ServiceTask_A"), None).map(|step| step.token_id),
+            Some("token-a".to_string())
+        );
+        assert_eq!(
+            erp_host_step(&snapshot, Some("ServiceTask_Old"), None),
+            None,
+            "ответ на чужой/устаревший узел не должен закрывать соседний"
+        );
+        assert_eq!(
+            erp_host_step(&snapshot, None, None),
+            None,
+            "без element_id и двух ожидающих задач выбор неоднозначен"
+        );
+    }
+
+    #[test]
+    fn external_task_spec_reads_topic_and_retries() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+             targetNamespace="http://bpmn-engine.local">
+  <process id="runtime_pump_spec" name="Spec" isExecutable="true">
+    <startEvent id="Start"/>
+    <serviceTask id="ServiceTask_ERP" name="ERP" camunda:topic="erp" camunda:retries="2"/>
+    <endEvent id="End"/>
+    <sequenceFlow id="Flow_Start" sourceRef="Start" targetRef="ServiceTask_ERP"/>
+    <sequenceFlow id="Flow_End" sourceRef="ServiceTask_ERP" targetRef="End"/>
+  </process>
+</definitions>"#;
+        let definition = parse_and_compile(xml).expect("схема компилируется");
+
+        let spec = external_task_spec(&definition, "ServiceTask_ERP").expect("serviceTask");
+        assert_eq!(spec.task_type, "erp", "тема воркера — camunda:topic");
+        assert_eq!(spec.retries, 2);
+        assert_eq!(spec.timeout_secs, 60);
+        assert_eq!(
+            external_task_spec(&definition, "Start"),
+            None,
+            "проходной узел не является внешней задачей"
         );
     }
 

@@ -34,6 +34,10 @@ CORRELATION_KEY = f"corr-{TEST_UUID}"
 TASK_1_ID = "ServiceTask_ValidateOrder"
 TASK_2_ID = "ServiceTask_ReserveStock"
 
+# Ключ идемпотентности первой команды (M2, дизайн 9.5/10.4): движок пишет его
+# в consumed_event, а повторный ответ с тем же ключом не двигает токен.
+ERP_IDEMPOTENCY_KEY = f"{INSTANCE_ID}:{TASK_1_ID}:e2e-{TEST_UUID}"
+
 COMPLEX_BPMN_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
@@ -125,7 +129,8 @@ def send_gateway_event(instance_id, event_name, element_id, payload_data):
     with urllib.request.urlopen(req, timeout=10) as response:
         return response.status, response.read().decode('utf-8')
 
-def send_nats_erp_response(instance_id, element_id, status="SUCCESS", payload_data=None):
+def send_nats_erp_response(instance_id, element_id, status="SUCCESS", payload_data=None,
+                           idempotency_key=None):
     subject = "mes.in.v1.erp.response"
     erp_event = {
         "process_instance_id": instance_id,
@@ -134,6 +139,8 @@ def send_nats_erp_response(instance_id, element_id, status="SUCCESS", payload_da
         "error_message": None,
         "payload": payload_data or {"executed_at": datetime.now(timezone.utc).isoformat()}
     }
+    if idempotency_key:
+        erp_event["idempotency_key"] = idempotency_key
     
     payload_bytes = json.dumps(erp_event).encode('utf-8')
     
@@ -233,6 +240,19 @@ def table_exists(cursor, name):
     cursor.execute("SELECT to_regclass(%s);", (name,))
     return cursor.fetchone()[0] is not None
 
+def fetch_consumed_event(event_id):
+    """Записан ли ключ идемпотентности (`consumed_event`, дизайн 9.5)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        if not table_exists(cursor, "consumed_event"):
+            return False
+        cursor.execute("SELECT 1 FROM consumed_event WHERE event_id = %s;", (event_id,))
+        return cursor.fetchone() is not None
+    finally:
+        cursor.close()
+        conn.close()
+
 def cleanup_test_data(instance_id, process_def_id):
     try:
         conn = get_db_connection()
@@ -312,7 +332,8 @@ def run_complex_workflow_test():
             instance_id=INSTANCE_ID,
             element_id=TASK_1_ID,
             status="SUCCESS",
-            payload_data={"validation_status": "APPROVED", "credit_limit_ok": True}
+            payload_data={"validation_status": "APPROVED", "credit_limit_ok": True},
+            idempotency_key=ERP_IDEMPOTENCY_KEY
         )
         print("   ✅ Ответ ERP опубликован в NATS.")
 
@@ -335,6 +356,28 @@ def run_complex_workflow_test():
         else:
             raise AssertionError(
                 f"❌ Ожидался единственный ACTIVE-токен '{TASK_2_ID}', получено: {active_elements}"
+            )
+
+        # Шаг 7.2: повторная доставка того же ответа ERP (тот же idempotency_key)
+        # не должна ни вернуть TASK_1, ни сдвинуть TASK_2 (M2, дизайн 9.5).
+        print(f"\n📌 [Шаг 7.2] Повторный ответ ERP с тем же idempotency_key...")
+        send_nats_erp_response(
+            instance_id=INSTANCE_ID,
+            element_id=TASK_1_ID,
+            status="SUCCESS",
+            payload_data={"validation_status": "APPROVED", "credit_limit_ok": True},
+            idempotency_key=ERP_IDEMPOTENCY_KEY
+        )
+        time.sleep(2)
+
+        duplicate_marked = fetch_consumed_event(ERP_IDEMPOTENCY_KEY)
+        active_after_duplicate = fetch_active_element_ids(INSTANCE_ID)
+        if duplicate_marked and active_after_duplicate == [TASK_2_ID]:
+            print(f"   ✅ Повтор отклонён: ключ в consumed_event есть, активен только '{TASK_2_ID}'")
+        else:
+            raise AssertionError(
+                f"❌ Повтор сдвинул состояние: ключ в consumed_event={duplicate_marked}, "
+                f"активные токены={active_after_duplicate}"
             )
 
         # Шаг 8
@@ -376,7 +419,7 @@ def run_complex_workflow_test():
             print("   ⚠️ Внимание: Пакеты в WS не обнаружены.")
 
         print("\n=====================================================================")
-        print("✅ ВСЕ 10 ЭТАПОВ И ПРОВЕРКА WEBSOCKET УСПЕШНО ПРОЙДЕНЫ!")
+        print("✅ ВСЕ 10 ЭТАПОВ, ПОВТОР ERP (IDEMPOTENCY) И WEBSOCKET УСПЕШНО ПРОВЕРЕНЫ!")
         print("=====================================================================")
 
     finally:

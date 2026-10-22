@@ -165,6 +165,7 @@ mod tests {
             status: status.to_string(),
             error_message: None,
             payload: json!({}),
+            idempotency_key: None,
         };
 
         assert!(erp_succeeded(&response("SUCCESS")));

@@ -145,7 +145,7 @@ curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/eve
 | --- | --- | --- | --- |
 | `INBOUND_EVENTS` | `mes.in.v1.event.>` | HTTP-шлюз (`...event.erp.<event_name>`) | движок, consumer `engine-inbound-consumer` |
 | `ERP_RESPONSES` | `mes.in.v1.erp.>` | внешние системы (ответы сервисов) | движок, consumer `engine-erp-response-consumer` |
-| `OUTBOUND_DISPATCH` | `mes.out.v1.cmd.<target_system>` | движок (SLA-команды), `target_system` в нижнем регистре | внешние системы |
+| `OUTBOUND_DISPATCH` | `mes.out.v1.cmd.<target_system>` | движок (`serviceTask` и SLA-команды), `target_system` в нижнем регистре | воркеры внешних систем |
 | `BPMN_EVENTS` | `mes.bpmn.v1.event.>` | движок (токены, завершение процесса) | WS-шлюз |
 | `WS_NOTIFICATIONS` | `mes.ws.v1.event.>` | (резерв) | — |
 
@@ -192,6 +192,31 @@ curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/eve
 `COMPLETED`. Второго события нет: лишний `CompleteBlock` закрыл бы шаг, который
 движок только что активировал.
 
+**Команда воркеру `serviceTask`, `ServiceCommand`** → `mes.out.v1.cmd.<target_system>`:
+
+Движок публикует её сам, как только активировал узел `bpmn:serviceTask`:
+
+```json
+{ "instance_id": "inst-cust-abc123", "element_id": "Task_ERP_CriticalAlert",
+  "target_system": "erp",
+  "payload": { "orderNum": "№101", "pasteurizeOk": "false" },
+  "idempotency_key": "inst-cust-abc123:Task_ERP_CriticalAlert:0190a1b2-…",
+  "deadline": "2026-10-22T10:01:00+00:00" }
+```
+
+| Поле | Обяз. | Назначение |
+| --- | --- | --- |
+| `instance_id` | да | Экземпляр процесса |
+| `element_id` | да | Узел `serviceTask` — его же нужно вернуть в ответе |
+| `target_system` | да | Тема воркера из `camunda:topic` узла; дублирует subject |
+| `payload` | да | Переменные экземпляра на момент активации; транспортных полей (`bpmn_xml`, `token_id`) в них нет |
+| `idempotency_key` | да | `<instance>:<element>:<token>`; стабилен для одной активации, новый — при повторном входе в узел |
+| `deadline` | да | RFC 3339, `now + timeout_secs` узла (вендор: 60 с) |
+
+Тема воркера задаётся в схеме: `<bpmn:serviceTask camunda:topic="erp">`
+(пространство имён `http://camunda.org/schema/1.0/bpmn`). Без атрибута команда
+уходит в `mes.out.v1.cmd.default`.
+
 **Команда внешней системе (SLA-воркер), `ActionRequiredEvent`** → `mes.out.v1.cmd.<target_system>`:
 
 ```json
@@ -205,10 +230,11 @@ curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/eve
 | Поле | Обяз. | Назначение |
 | --- | --- | --- |
 | `process_instance_id` | да | Экземпляр процесса |
-| `element_id` | нет | Подсказка, какой шаг закрываем; пусто → узел ищется по `token_id` из `payload`, иначе берётся единственный ожидающий `serviceTask` |
+| `element_id` | нет | Адрес шага: если указан, он обязан совпасть с ожидающим `serviceTask`, иначе ответ игнорируется (`erp_target_mismatch`) — так устаревший ответ не закроет соседний узел. Пусто → узел ищется по `token_id` из `payload`, иначе берётся единственный ожидающий `serviceTask` |
 | `status` | да | `SUCCESS` (регистр не важен) — шаг завершается, граф идёт дальше; любой другой — только лог, шаг остаётся активным (ретраи/компенсация — M2) |
 | `error_message` | нет | Текст ошибки для логов/аудита |
 | `payload` | да | Данные сервиса; уезжают клиентам вместе с токеном. Поле у `ErpResponseEvent` объявлено без `#[serde(default)]`, поэтому без него ответ не десериализуется и теряется (в логах движка — `❌ [ERP Consumer] Ошибка десериализации`) |
+| `idempotency_key` | нет | Ключ из `ServiceCommand`: повтор с тем же ключом не двигает токен. Без него ответ гасится отсутствием ожидающего токена, как в M1 |
 
 ```bash
 nats pub mes.in.v1.erp.response \
@@ -864,14 +890,16 @@ setElementActions(xml, 'Task_SecurityCheck', [
 не нужно: оно закрыло бы шаг, который движок только что активировал (в демо старт
 делает `startProcess` в [`App.jsx`](erp-simulator/src/App.jsx)).
 
-**Вариант B — внешняя система (ERP/MES).** Система подписывается на
-`mes.bpmn.v1.event.>` (или читает таблицу `tokens`), находит свой узел по
-`element_id` и, выполнив работу, отвечает:
+**Вариант B — внешняя система (ERP/MES).** Узел `bpmn:serviceTask` не ждёт
+человека: движок сам публикует команду в `mes.out.v1.cmd.<camunda:topic>`
+(контракт — раздел 3), а система отвечает:
 
 ```bash
 nats pub mes.in.v1.erp.response \
-  '{"process_instance_id":"inst-cust-abc123","element_id":"Task_FlashPasteurization",
-    "status":"SUCCESS","payload":{"batch":"B-42"}}' --server=nats-service:4222
+  '{"process_instance_id":"inst-cust-abc123","element_id":"ServiceTask_FlashPasteurization",
+    "status":"SUCCESS","payload":{"batch":"B-42"},
+    "idempotency_key":"inst-cust-abc123:ServiceTask_FlashPasteurization:<token>"}' \
+  --server=nats-service:4222
 ```
 
 Ответ закрывает `serviceTask` в движке: тот завершает внешнюю задачу и сам ведёт
@@ -880,11 +908,12 @@ nats pub mes.in.v1.erp.response \
 только логируется: ретраи, `retryable` и компенсация — задача M2
 ([дорожная карта](erp-simulator/docs/dairy-plant-roadmap.md)).
 
-**Вариант C — адресация конкретной системе.** SLA-воркер публикует команду в
-`mes.out.v1.cmd.<target_system>`. Чтобы работа уходила системе сразу по активации
-узла, команду должен порождать сам `serviceTask`: контракт
-`mes.out.v1.cmd.<system>` (`instance_id`, `element_id`, `payload`,
-`idempotency_key`, `deadline`) и ответ `mes.in.v1.erp.response` — задача M2.
+**Вариант C — адресация конкретной системе.** Работа уходит системе сразу по
+активации узла: `ServiceCommand` в `mes.out.v1.cmd.<system>`
+(`instance_id`, `element_id`, `payload`, `idempotency_key`, `deadline`), ответ —
+тот же `mes.in.v1.erp.response` с `idempotency_key` из команды. Тема задаётся в
+схеме: `<bpmn:serviceTask camunda:topic="erp">`. SLA-воркер шлёт по этому же
+subject свой `ActionRequiredEvent`.
 
 ### Шаг 5. Проверить привязку
 

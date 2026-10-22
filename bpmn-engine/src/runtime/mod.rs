@@ -23,7 +23,7 @@ use self::project::Projection;
 use self::pump::{Snapshot, StepKind};
 use self::store::GraphStores;
 use crate::db;
-use crate::events::{ErpResponseEvent, InboundEvent};
+use crate::events::{ErpResponseEvent, InboundEvent, ServiceCommand};
 
 /// Подключает структурированные логи вендора (`tracing`).
 ///
@@ -59,6 +59,8 @@ pub struct Outcome {
     /// Имя WS-события завершения процесса: `process_completed` /
     /// `process_terminated`.
     pub process_finished: Option<&'static str>,
+    /// Команды воркерам по только что активированным `serviceTask` (M2).
+    pub commands: Vec<ServiceCommand>,
 }
 
 /// Рантайм графа: сторы движка, пумпа и проекция в legacy read-model.
@@ -223,8 +225,12 @@ impl GraphRuntime {
 
     /// Ответ ERP (`mes.in.v1.erp.response`).
     ///
-    /// Успешный ответ завершает внешнюю задачу `serviceTask` уже в M1;
-    /// остальные статусы только логируются (M2 добавит ретраи).
+    /// Успешный ответ завершает внешнюю задачу `serviceTask`; остальные
+    /// статусы только логируются (ретраи — следующий шаг M2).
+    ///
+    /// Идемпотентность: ответ с `idempotency_key` из команды обрабатывается
+    /// один раз (`consumed_event`). Ответ без ключа, как и раньше, гасится
+    /// отсутствием ожидающего токена (дизайн 9.5).
     pub async fn handle_erp(&self, event: &ErpResponseEvent) -> anyhow::Result<Outcome> {
         if !mapper::erp_succeeded(event) {
             eprintln!(
@@ -234,10 +240,39 @@ impl GraphRuntime {
             return Ok(Outcome::default());
         }
 
+        let idempotency_key = event
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+
+        if let Some(key) = idempotency_key {
+            if pump::is_consumed(&self.legacy, key).await? {
+                println!("🔁 [Graph] duplicate_event event_id={} source=erp", key);
+                return Ok(Outcome::default());
+            }
+        }
+
         let lock = pump::lock_instance(&self.legacy, &event.process_instance_id).await?;
         let result = self.handle_erp_locked(event).await;
         match &result {
-            Ok(_) => lock.commit().await?,
+            Ok(outcome) => {
+                lock.commit().await?;
+                // Ключ пишется после коммита: если процесс упадёт между
+                // коммитом и записью, повтор всё равно не найдёт ожидающий
+                // токен и не сдвинет граф (9.5).
+                if let Some(key) = idempotency_key {
+                    if !outcome.steps.is_empty() {
+                        pump::mark_consumed(
+                            &self.legacy,
+                            key,
+                            &event.process_instance_id,
+                            "ErpResponse",
+                        )
+                        .await?;
+                    }
+                }
+            }
             Err(_) => {
                 let _ = lock.rollback().await;
             }
@@ -261,9 +296,9 @@ impl GraphRuntime {
 
         let token_id = mapper::token_id_hint(&event.payload);
         let node_id = Some(event.element_id.as_str()).filter(|id| !id.is_empty());
-        let Some(step) = snapshot.host_step(StepKind::ExternalTask, token_id, node_id) else {
+        let Some(step) = pump::erp_host_step(snapshot, node_id, token_id) else {
             eprintln!(
-                "⚠️ [Graph] no_waiting_token instance={} element={} source=erp",
+                "⚠️ [Graph] erp_target_mismatch instance={} element={} source=erp",
                 instance_id, event.element_id
             );
             return Ok(Outcome::default());
@@ -304,12 +339,50 @@ impl GraphRuntime {
             &projection,
         )
         .await?;
-        Ok(to_outcome(&projection, payload))
+        let commands = service_commands(instance_id, &after, &projection);
+        Ok(to_outcome(&projection, payload, commands))
     }
 }
 
+/// Команды воркерам по активированным `serviceTask` (контракт M2).
+///
+/// `payload` — переменные экземпляра: воркер видит те же данные, что ушли
+/// клиенту с `ACTIVE`, но без транспортных полей события — их отсекает
+/// [`super::vars::flatten`] ещё на входе.
+///
+/// `idempotency_key` детерминирован: `<instance>:<element>:<token>`. Движок
+/// выдаёт новый токен на каждый вход в узел (`transition.rs`), поэтому петля
+/// процесса даёт новый ключ, а повторная доставка того же ответа — тот же.
+fn service_commands(
+    instance_id: &str,
+    after: &Snapshot,
+    projection: &Projection,
+) -> Vec<ServiceCommand> {
+    let payload = serde_json::json!(&after.instance.variables);
+    projection
+        .activated
+        .iter()
+        .filter_map(|step| {
+            let spec = pump::external_task_spec(&after.definition, &step.element_id)?;
+            let deadline = chrono::Utc::now() + chrono::Duration::seconds(spec.timeout_secs as i64);
+            Some(ServiceCommand {
+                instance_id: instance_id.to_string(),
+                element_id: step.element_id.clone(),
+                target_system: spec.task_type,
+                payload: payload.clone(),
+                idempotency_key: format!("{}:{}:{}", instance_id, step.element_id, step.token_id),
+                deadline: deadline.to_rfc3339(),
+            })
+        })
+        .collect()
+}
+
 /// Проекция → сообщения для WebSocket (и legacy пишет [`project::apply_legacy`]).
-fn to_outcome(projection: &Projection, payload: Option<&Value>) -> Outcome {
+fn to_outcome(
+    projection: &Projection,
+    payload: Option<&Value>,
+    commands: Vec<ServiceCommand>,
+) -> Outcome {
     let mut steps = Vec::with_capacity(projection.activated.len() + projection.closed.len());
 
     for step in &projection.closed {
@@ -332,6 +405,7 @@ fn to_outcome(projection: &Projection, payload: Option<&Value>) -> Outcome {
     Outcome {
         steps,
         process_finished: projection.finished.and_then(ws_process_event),
+        commands,
     }
 }
 
@@ -380,7 +454,7 @@ mod tests {
             finished: None,
         };
 
-        let outcome = to_outcome(&projection, Some(&json!({"order_amount": 10})));
+        let outcome = to_outcome(&projection, Some(&json!({"order_amount": 10})), Vec::new());
 
         assert_eq!(outcome.steps.len(), 2);
         assert_eq!(outcome.steps[0].state, "COMPLETED");
@@ -407,7 +481,7 @@ mod tests {
             finished: Some(InstanceState::Completed),
         };
 
-        let outcome = to_outcome(&projection, None);
+        let outcome = to_outcome(&projection, None, Vec::new());
 
         assert_eq!(outcome.process_finished, Some("process_completed"));
         assert_eq!(active_elements(&outcome), Vec::<&str>::new());
@@ -421,8 +495,117 @@ mod tests {
             finished: Some(InstanceState::Terminated),
         };
 
-        let outcome = to_outcome(&projection, None);
+        let outcome = to_outcome(&projection, None, Vec::new());
 
         assert_eq!(outcome.process_finished, Some("process_terminated"));
+    }
+
+    /// Схема с `serviceTask`: тема воркера — `camunda:topic`.
+    const SERVICE_TASK_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+             targetNamespace="http://bpmn-engine.local">
+  <process id="runtime_service_cmd" name="Service" isExecutable="true">
+    <startEvent id="Start"/>
+    <serviceTask id="ServiceTask_ERP" name="ERP" camunda:topic="erp"/>
+    <endEvent id="End"/>
+    <sequenceFlow id="Flow_Start" sourceRef="Start" targetRef="ServiceTask_ERP"/>
+    <sequenceFlow id="Flow_End" sourceRef="ServiceTask_ERP" targetRef="End"/>
+  </process>
+</definitions>"#;
+
+    fn service_snapshot() -> Snapshot {
+        let definition = parse_and_compile(SERVICE_TASK_XML).expect("схема компилируется");
+        let instance = bpm_engine::bpm_engine_core::ProcessInstance {
+            id: "instance-1".to_string(),
+            process_def_id: "runtime_service_cmd".to_string(),
+            tenant_id: None,
+            tokens: vec![],
+            variables: std::collections::HashMap::from([
+                ("orderNum".to_string(), "№101".to_string()),
+                ("stockSufficient".to_string(), "false".to_string()),
+            ]),
+            state: InstanceState::Running,
+            version: 0,
+            parent_instance_id: None,
+            parent_token_id: None,
+        };
+        Snapshot {
+            instance,
+            definition,
+        }
+    }
+
+    #[test]
+    fn activated_service_task_yields_worker_command() {
+        let snapshot = service_snapshot();
+        let projection = Projection {
+            activated: vec![Step {
+                token_id: "token-1".to_string(),
+                element_id: "ServiceTask_ERP".to_string(),
+            }],
+            closed: vec![],
+            finished: None,
+        };
+
+        let commands = service_commands("instance-1", &snapshot, &projection);
+
+        assert_eq!(commands.len(), 1);
+        let command = &commands[0];
+        assert_eq!(command.instance_id, "instance-1");
+        assert_eq!(command.element_id, "ServiceTask_ERP");
+        assert_eq!(command.target_system, "erp", "subject — mes.out.v1.cmd.erp");
+        assert_eq!(
+            command.payload,
+            json!({"orderNum": "№101", "stockSufficient": "false"}),
+            "воркер получает переменные экземпляра"
+        );
+        assert_eq!(
+            command.idempotency_key, "instance-1:ServiceTask_ERP:token-1",
+            "ключ стабилен для одной активации"
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&command.deadline).is_ok(),
+            "deadline — RFC 3339, иначе воркер его не разберёт"
+        );
+    }
+
+    #[test]
+    fn user_task_activation_has_no_worker_command() {
+        let mut snapshot = service_snapshot();
+        // Узел userTask берём из той же схемы: Start — проходной узел,
+        // команда не должна появиться ни для него, ни для неизвестного id.
+        snapshot.definition = parse_and_compile(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="http://bpmn-engine.local">
+  <process id="runtime_user_cmd" name="User" isExecutable="true">
+    <startEvent id="Start"/>
+    <userTask id="Task_A" name="A"/>
+    <endEvent id="End"/>
+    <sequenceFlow id="Flow_Start" sourceRef="Start" targetRef="Task_A"/>
+    <sequenceFlow id="Flow_End" sourceRef="Task_A" targetRef="End"/>
+  </process>
+</definitions>"#,
+        )
+        .expect("схема компилируется");
+        let projection = Projection {
+            activated: vec![
+                Step {
+                    token_id: "token-1".to_string(),
+                    element_id: "Task_A".to_string(),
+                },
+                Step {
+                    token_id: "token-2".to_string(),
+                    element_id: "Unknown_Node".to_string(),
+                },
+            ],
+            closed: vec![],
+            finished: None,
+        };
+
+        assert!(
+            service_commands("instance-1", &snapshot, &projection).is_empty(),
+            "команду получает только serviceTask"
+        );
     }
 }

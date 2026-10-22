@@ -795,6 +795,12 @@ load(id):
 только транзакцией «состояние + consumed_event», а её нет в вендорных сторах;
 это цена M1, зафиксирована в 12, п. 4.
 
+Ответ ERP с `idempotency_key` (контракт M2, 10.4) проверяется по той же таблице:
+ключ `<instance>:<element>:<token>` однозначно называет одну активацию
+`serviceTask`. Запись ключа — после коммита пумпы; если под упал между коммитом
+и записью, повтор не найдёт `Waiting`-токен и граф не сдвинется (та же цена,
+12, п. 4). Ответ без ключа (ручной `nats pub`, E2E) гасится так же, как в M1.
+
 ### 9.6 Ошибки и наблюдаемость
 
 Логи — `tracing` вендора плюс наши события (структурированные поля
@@ -805,6 +811,7 @@ load(id):
 | `compile_failed` | `error` | схема не компилируется (деплой или старт) |
 | `unknown_instance` | `warn` | событие по экземпляру, которого нет |
 | `no_waiting_token` | `warn` | завершать нечего (повтор, чужая вкладка) |
+| `erp_target_mismatch` | `warn` | ответ ERP адресован узлу, который сейчас не ждёт (устаревшая команда) |
 | `duplicate_event` | `info` | `consumed_event` сработал |
 | `client_target_mismatch` | `info` | `element_id` не совпал с итоговым активным узлом |
 | `gateway_no_match` | `warn` | шлюз не выбрал ветку (токен остался `Waiting`) |
@@ -938,6 +945,64 @@ DDL дополнительно сериализуется advisory-блокир�
 вместе с патчем 3 из 4.3; без него `Gateway_Stock` уводил бы в `Task_CreatePO`
 при любом решении, и `haveStock=true` никогда не доезжал бы до `Task_Ship`.
 
+### 10.4 Воркеры `serviceTask` (M2)
+
+Активация внешней задачи — часть проекции: отдельного события от вендора не
+требуется. Как только `Waiting`-токен встал на `bpmn:serviceTask`, `runtime`
+собирает команду, а `main.rs` публикует её воркеру.
+
+```text
+projection.activated: Waiting-токен на serviceTask
+        │
+        ▼
+runtime::service_commands
+  spec = external_task_spec(definition, node)   // camunda:topic, retries, timeout
+  command = { instance_id, element_id, target_system: spec.task_type,
+              payload: variables, idempotency_key: "<instance>:<element>:<token>",
+              deadline: now + spec.timeout_secs }
+        │
+        ▼
+main::publish_outcome → NATS mes.out.v1.cmd.<target_system> (нижний регистр)
+        │
+        ▼
+воркер (ERP/MES/мок) выполняет работу
+        │
+        ▼
+NATS mes.in.v1.erp.response { process_instance_id, element_id, status, payload,
+                              idempotency_key }
+        │
+        ▼
+runtime::handle_erp: ключ уже в consumed_event → ack;
+                    иначе ExternalTaskCompleted и следующий шаг графа
+```
+
+Правила:
+
+- тема воркера — `bpmn:serviceTask/@camunda:topic`: её же вендор кладёт в
+  `NodeType::ExternalTask.task_type` (`crates/bpmn/src/parser.rs:215-257`). Без
+  атрибута тема — `default`, то есть `mes.out.v1.cmd.default`. Нарезка схемы
+  (`extractProcessXml`) режет `bpmn:process` целиком, поэтому атрибут и
+  `extensionElements` доезжают до движка;
+- `payload` — переменные экземпляра (`HashMap<String, String>`), без
+  транспортных полей `bpmn_xml`/`org_type`/`token_id` (5.1);
+- `deadline` — `now + timeout_secs` узла (вендор фиксирует 60 с). SLA-воркер
+  остаётся независимым; дедлайн нужен, чтобы воркер сам не держал задачу вечно;
+- ключ идемпотентности детерминирован и не требует отдельной таблицы:
+  вендорный токен создаётся заново на каждый вход в узел
+  (`crates/runtime/src/transition.rs:9`), поэтому петля процесса даёт новый
+  ключ, а повторная доставка того же ответа — тот же (9.5);
+- ответ адресный: если `element_id` указан, он должен совпасть с ожидающим
+  `serviceTask` (`pump::erp_host_step`). Иначе ответ игнорируется с
+  `erp_target_mismatch` — без этого устаревший ответ закрывал бы соседний
+  узел через fallback «единственный ожидающий» (5.2);
+- публикация команды не отменяет уже записанное состояние: ошибка NATS
+  логируется, событие клиента остаётся подтверждённым. Потеря команды лечится
+  повтором события или рестартом; outbox — M5.
+
+Осталось за рамками шага: ретраи (`retries`, `retryable`, backoff),
+компенсация через `ActionRequiredEvent`, перевод демо-`Task_ERP_*` на
+`bpmn:serviceTask` и мок-воркер — следующие пункты M2.
+
 ## 11. Тесты
 
 | Уровень | Что проверяем | Где |
@@ -952,6 +1017,8 @@ DDL дополнительно сериализуется advisory-блокир�
 | Rust integration | пять шлюзов демо-схемы, обе/три ветки; `stockSufficient=true/false` доходит до `Task_Ship`/`Task_CreatePO` | `bpmn-engine/tests/dairy_routing.rs` (Postgres из `DATABASE_URL`, скип без него) |
 | Rust integration | `parallelGateway`: две ветки живут одновременно, слияние ждёт обе | `bpmn-engine/tests/parallel.rs` |
 | Rust integration | повторный `event_id` не двигает токен; повторный `UserTaskCompleted` без `Waiting`-токена — no-op | `bpmn-engine/tests/idempotency.rs` |
+| Rust unit | `serviceTask`: тема воркера из `camunda:topic`, `retries`, `timeout_secs` | `runtime/pump.rs` (реализовано) |
+| Rust unit | активация `serviceTask` даёт команду (`payload` = переменные, ключ `<instance>:<element>:<token>`, `deadline` RFC 3339); `userTask` команду не даёт | `runtime/mod.rs` (реализовано) |
 | JS unit | `variables` кнопки: разбор, запись/чтение XML, `normalizeAction`, ошибки формата | `bpmnXml.test.js` |
 | JS unit | валидатор: шесть новых кодов (7.4), демо-проект без проблем | `bpmnXml.test.js`, `dairyPlant.test.js` |
 | JS unit | маршрут кнопок: для каждого шлюза переменные кнопок дают её же `elementId` | `dairyPlant.test.js` |
