@@ -959,7 +959,7 @@ legacy-путь снова пишет `tokens` по `element_id`; экземпл
 | Rust unit | шлюз: `default` при `false` (в т.ч. default-связь **без** `conditionExpression` — после патча 3), первая связь без условия выигрывает, порядок связей | `runtime/pump.rs` тесты на memory-сторах, `bpmn-engine/tests/vendor_patches.rs` |
 | Rust unit | проекция: старт активирует ожидающие шаги, движение токена закрывает прежний шаг и активирует новый, `End` закрывает последний шаг, повторная доставка пуста | `runtime/project.rs` (реализовано) |
 | Rust unit | кэш определений: сто `load` → одна компиляция, изменение XML → перекомпиляция, предел 64 записи | `runtime/store.rs` (реализовано) |
-| Rust unit | `ENGINE_ROUTING`: `graph` (в любом регистре) включает граф, всё остальное — `legacy` | `runtime/mod.rs` (реализовано) |
+| Rust unit | `ENGINE_ROUTING`: явный `legacy` включает legacy-путь; `graph`, пустое и неизвестное значение — граф (режим по умолчанию) | `runtime/mod.rs` (реализовано) |
 | Rust unit | `default` без условия (патч 3): `parse_and_compile` даёт `Some(Default)` на default-связи и `Some(Expression)` на остальных | `bpmn-engine/tests/vendor_patches.rs` |
 | Rust unit | `UserTaskCompleted` (патч): переменные попали в инстанс, удалён только один `Waiting`-токен, `parallel_group_id` сохранён | `bpmn-engine/tests/vendor_patches.rs` |
 | Rust integration | пять шлюзов демо-схемы, обе/три ветки; `stockSufficient=true/false` доходит до `Task_Ship`/`Task_CreatePO` | `bpmn-engine/tests/dairy_routing.rs` (Postgres из `DATABASE_URL`, скип без него) |
@@ -969,7 +969,7 @@ legacy-путь снова пишет `tokens` по `element_id`; экземпл
 | JS unit | валидатор: шесть новых кодов (7.4), демо-проект без проблем | `bpmnXml.test.js`, `dairyPlant.test.js` |
 | JS unit | маршрут кнопок: для каждого шлюза переменные кнопок дают её же `elementId` | `dairyPlant.test.js` |
 | JS integration | старт — одно событие: `StartProcess` с `element_id` первого шага у заказчика, поставщика, склада и схемы без кнопки; второй `CompleteBlock` не отправляется | `App.test.js` |
-| E2E | `tests/test_workflow.py` без изменений: ERP-ответы двигают `ServiceTask_*`, экземпляр закрывается `process_completed`, в `tokens` ровно один `ACTIVE` на линейном сценарии | `tests/` |
+| E2E | `tests/test_workflow.py`: ERP-ответы двигают `ServiceTask_*`, экземпляр закрывается `process_completed`, в `tokens` ровно один `ACTIVE` на линейном сценарии; cleanup удаляет строки и legacy (`tokens`, `process_instances`, `process_definitions`), и вендорной схемы (`token`, `process_instance`, `consumed_event`, `process_definition`) | `tests/` |
 
 Отдельно — тест «нет утечки»: сто вызовов `CachedDefStore::load` дают одну
 компиляцию (счётчик в тестовой обёртке), потому что иначе 128 MiB лимита не

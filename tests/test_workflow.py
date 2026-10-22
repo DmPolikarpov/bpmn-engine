@@ -228,19 +228,38 @@ def force_expire_token(instance_id, element_id):
         cursor.close()
         conn.close()
 
+def table_exists(cursor, name):
+    """Проверяет наличие таблицы: в legacy-режиме вендорной схемы может не быть."""
+    cursor.execute("SELECT to_regclass(%s);", (name,))
+    return cursor.fetchone()[0] is not None
+
 def cleanup_test_data(instance_id, process_def_id):
     try:
         conn = get_db_connection()
         conn.autocommit = True
         cursor = conn.cursor()
-        
+
+        # Legacy read-model (пишет runtime::project / db.rs).
         cursor.execute("DELETE FROM tokens WHERE instance_id = %s;", (instance_id,))
         cursor.execute("DELETE FROM process_instances WHERE id = %s;", (instance_id,))
         cursor.execute("DELETE FROM process_definitions WHERE id = %s;", (process_def_id,))
-        
+
+        # Вендорная схема (источник истины в ENGINE_ROUTING=graph). token и прочие
+        # дочерние таблицы уходят каскадом от process_instance, но token чистим
+        # явно: так cleanup работает и на схеме, где каскад не создался.
+        if table_exists(cursor, "process_instance"):
+            if table_exists(cursor, "token"):
+                cursor.execute("DELETE FROM token WHERE instance_id = %s;", (instance_id,))
+            cursor.execute("DELETE FROM process_instance WHERE id = %s;", (instance_id,))
+        if table_exists(cursor, "consumed_event"):
+            cursor.execute("DELETE FROM consumed_event WHERE instance_id = %s;", (instance_id,))
+        if table_exists(cursor, "process_definition"):
+            cursor.execute("DELETE FROM process_definition WHERE id = %s;", (process_def_id,))
+
         cursor.close()
         conn.close()
-        print(f"🧹 [Cleanup] Данные процесса '{instance_id}' удалены из PostgreSQL.")
+        print(f"🧹 [Cleanup] Данные процесса '{instance_id}' удалены из PostgreSQL "
+              f"(legacy + vendor).")
     except Exception as e:
         print(f"⚠️ [Cleanup] Ошибка при очистке БД: {e}")
 
