@@ -207,8 +207,33 @@ impl GraphStores {
 
     /// Создаёт вендорные таблицы (`process_definition`, `process_instance`,
     /// `token`, `history_event`, ...).
+    ///
+    /// `replicas: 3` поднимают `migrate` одновременно, а PostgreSQL не
+    /// гарантирует, что параллельные `CREATE TABLE IF NOT EXISTS` не упадут
+    /// на гонке системных каталогов. Поэтому DDL сериализуется
+    /// advisory-блокировкой (`pg_advisory_xact_lock`): её держит транзакция
+    /// этого пула, а сам `migrate` работает на другом соединении — таблицы
+    /// ему не нужны, нужен только порядок.
     pub async fn ensure_schema(&self) -> anyhow::Result<()> {
-        migrate(&self.pool).await
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
+        transaction
+            .execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended('bpm-engine:migrate', 0))",
+                &[],
+            )
+            .await?;
+
+        match migrate(&self.pool).await {
+            Ok(()) => {
+                transaction.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     /// Деплой определения (upsert по `def.id`, дизайн 9.4).

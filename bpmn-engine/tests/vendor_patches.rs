@@ -5,7 +5,11 @@
 //!
 //! 1. переменные `userTask` доезжают до условий шлюза;
 //! 2. завершение шага закрывает один токен узла и сохраняет группу ветки;
-//! 3. `default`-связь без `conditionExpression` компилируется в `Default`.
+//! 3. `default`-связь без `conditionExpression` компилируется в `Default`;
+//! 5. `PostgresProcessStore::load` выбирает все колонки, которые читает
+//!    (проверка по исходнику: живой БД в юнит-прогоне пакета нет).
+//!
+//! Патч 4 (`migrate`) юнит-тестом не проверяется по той же причине.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -342,4 +346,37 @@ async fn external_task_completion_keeps_group() {
         Some("group-2"),
         "группа параллельной ветки должна сохраниться"
     );
+}
+
+// --- Патч 5: `load` выбирает колонки, которые читает -----------------------
+
+/// Исходник вендорного postgres-адаптера. Живого Postgres в юнит-прогоне пакета
+/// нет, поэтому патч проверяется по тексту запроса: `load` падал в рантайме на
+/// колонке, которой не было в его же `SELECT`.
+const POSTGRES_PROCESS_STORE: &str =
+    include_str!("../vendor/bpm-engine/crates/adapters/postgres/src/process_store.rs");
+
+#[test]
+fn instance_load_selects_parent_columns() {
+    let load = POSTGRES_PROCESS_STORE
+        .split("async fn load(&self, id: &str)")
+        .nth(1)
+        .expect("`PostgresProcessStore::load` найден в вендорном адаптере");
+    let query = load
+        .split("FROM process_instance")
+        .next()
+        .expect("в `load` есть запрос по `process_instance`");
+
+    for column in ["parent_instance_id", "parent_token_id"] {
+        assert!(
+            query.contains(column),
+            "SELECT в `load` не выбирает `{column}`, хотя строка её читает: \
+             `row.get` паникует с `invalid column`, старт процесса обрывается \
+             после записи Ready-токена"
+        );
+        assert!(
+            load.contains(&format!("row.get(\"{column}\")")),
+            "`{column}` больше не читается в `load` — проверка патча 5 устарела"
+        );
+    }
 }

@@ -79,7 +79,8 @@ impl ProcessInstanceStore for PostgresProcessStore {
         let row = client
             .query_opt(
                 r#"
-                SELECT id, process_def_id, tenant_id, variables, state, version
+                SELECT id, process_def_id, tenant_id, variables, state, version,
+                       parent_instance_id, parent_token_id
                 FROM process_instance
                 WHERE id = $1
                 "#,

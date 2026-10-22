@@ -173,7 +173,7 @@ pub async fn migrate(pool: &Pool) -> anyhow::Result<()> {
         .execute(
             r#"
             CREATE INDEX IF NOT EXISTS idx_token_state_updated
-            ON token(state, updated_at)
+            ON token(status, updated_at)
             "#,
             &[],
         )

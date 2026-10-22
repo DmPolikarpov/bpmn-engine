@@ -31,9 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     sqlx::migrate!("./migrations").run(&pool).await?;
     println!("✅ Миграции базы данных успешно применены!");
 
-    // Маршрутизация: `legacy` (по умолчанию) — маршрут считает клиент,
-    // `graph` — движок по графу схемы (`src/runtime/`, дизайн
-    // `docs/runtime-m1-design.md`, 10.1).
+    // Маршрутизация: `graph` (по умолчанию) — движок ведёт экземпляр по графу
+    // схемы (`src/runtime/`, дизайн `docs/runtime-m1-design.md`, 10.1);
+    // `legacy` — аварийный откат, где маршрут считает клиент.
     let routing = Routing::from_env();
     println!("🔀 Маршрутизация событий: {}", routing.as_str());
 

@@ -1022,7 +1022,7 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 | `NATS_URL` | движок, шлюзы | `nats://nats-service:4222` | брокер |
 | `SLA_CHECK_INTERVAL_SECS` | движок | `3` | период сканирования «зависших» токенов |
 | `SLA_TIMEOUT_MINUTES` | движок | `30` | после какого простоя токен уходит в `TIMED_OUT` + команда в `mes.out.v1.cmd.erp` |
-| `ENGINE_ROUTING` | движок | `legacy` | `legacy` — следующий узел называет клиент, `graph` — исполнение по графу схемы (M1, шаг 2; см. [`docs/runtime-m1-design.md`](docs/runtime-m1-design.md), 10.1) |
+| `ENGINE_ROUTING` | движок | `graph` | `graph` — исполнение по графу схемы, `legacy` — аварийный откат, где следующий узел называет клиент (M1, шаг 2; см. [`docs/runtime-m1-design.md`](docs/runtime-m1-design.md), 10.1). Пустое/неизвестное значение читается как `graph` |
 | `PORT` | шлюзы | `8080` | порт шлюза внутри пода |
 | `JSON_BODY_LIMIT` | http-cluster | `10mb` | лимит тела (BPMN-схема приезжает в `output_data.bpmn_xml`) |
 | `CORS_ORIGIN` | http-cluster | `*` | источник(и) для браузера |

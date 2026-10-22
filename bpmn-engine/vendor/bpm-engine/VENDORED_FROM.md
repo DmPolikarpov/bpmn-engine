@@ -34,10 +34,11 @@ codeload-тарболла нет `.git`, поэтому при обновлен�
 `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `SECURITY.md`, `README_zh.md` —
 сборке не нужны, наших тестов не касаются.
 
-## Локальные патчи (3)
+## Локальные патчи (5)
 
-Каждый помечен в коде комментарием `M1 patch` и покрыт тестом
-[`tests/vendor_patches.rs`](../../tests/vendor_patches.rs).
+Патчи 1–3 и 5 зафиксированы тестами
+[`tests/vendor_patches.rs`](../../tests/vendor_patches.rs); патч 4 без живой
+БД не проверяется (вендорский тест адаптера требует Postgres).
 
 1. **Переменные человеческого шага, адрес и группа токена** —
    `crates/runtime/src/user_task_completed_handler.rs`. Завершение шага:
@@ -59,6 +60,23 @@ codeload-тарболла нет `.git`, поэтому при обновлен�
    `evaluate_exclusive_gateway` (`transition.rs`) выигрывает у всех условий
    немедленно, то есть без патча default работал только когда его связь
    объявлена последней.
+4. **Схема `migrate` соответствует таблицам** —
+   `crates/adapters/postgres/src/lib.rs`: индекс `idx_token_state_updated`
+   создаётся по `token(status, updated_at)`, а не по несуществующей колонке
+   `state`. Без патча `migrate` падает на `column "state" does not exist` и
+   `ENGINE_ROUTING=graph` не поднимается ни на одном поде (вендорный тест
+   `cargo test -p bpm-engine-adapter-postgres` требует Postgres, поэтому в
+   юнит-прогон пакета не попадает).
+5. **`load` читает только выбранные колонки** —
+   `crates/adapters/postgres/src/process_store.rs`: `SELECT` в
+   `PostgresProcessStore::load` выбирает `parent_instance_id` и
+   `parent_token_id`, которые сразу же читаются через `row.get`. Без патча
+   `load` паникует на `error retrieving column parent_instance_id: invalid
+   column` сразу после старта экземпляра: `ProcessStartHandler` уже записал
+   инстанс и токен, поэтому строка остаётся в `Ready` и процесс не двигается,
+   а паника в основном цикле (future на главном потоке `#[tokio::main]`)
+   роняет под — все реплики уходят в `CrashLoopBackOff`. Как и патч 4,
+   вендорский юнит-прогон этого не видит: нужен живой Postgres.
 
 Хелпер `move_token_preserving_group` — upstream-код
 (`crates/runtime/src/transition.rs`), это не патч.
@@ -85,7 +103,7 @@ codeload-тарболла нет `.git`, поэтому при обновлен�
 2. заменить `crates/`, `src/`, `tests/`, `Cargo.toml`, `Cargo.lock`,
    `LICENSE.txt`, `README.md`, `CHANGELOG.md` — состав тот же, что в разделе
    «Что скопировано»;
-3. переприменить три патча из раздела выше (после обновления проверить, не
+3. переприменить патчи из раздела выше (после обновления проверить, не
    исправлены ли они в upstream — тогда патч снимается, а тест остаётся);
 4. обновить таблицу «Источник» и `Cargo.lock` пакета (`cargo update`);
 5. прогнать `cargo test -p bpm-engine-core -p bpm-engine-runtime -p bpm-engine-bpmn`

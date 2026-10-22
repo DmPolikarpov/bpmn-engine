@@ -6,8 +6,8 @@
 //! `docs/runtime-m1-design.md`, 9.1).
 //!
 //! Переключатель режима — переменная окружения `ENGINE_ROUTING`:
-//! `legacy` (по умолчанию) оставляет маршрут за клиентом, `graph` включает
-//! исполнение по графу (дизайн 10.1).
+//! `graph` (по умолчанию) исполняет граф схемы, `legacy` — аварийный откат,
+//! в котором маршрут считает клиент (дизайн 10.1).
 
 pub mod mapper;
 pub mod project;
@@ -30,23 +30,27 @@ use crate::events::{ErpResponseEvent, InboundEvent};
 /// Режим маршрутизации (`ENGINE_ROUTING`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Routing {
-    /// Маршрут считает клиент: токен ставится по `element_id` (как до M1).
+    /// Аварийный откат: маршрут считает клиент, токен ставится по `element_id`.
     Legacy,
-    /// Маршрут считает движок по графу схемы.
+    /// Основной режим: маршрут считает движок по графу схемы.
     Graph,
 }
 
 impl Routing {
-    /// Читает режим из окружения; неизвестное значение — `legacy`.
+    /// Читает режим из окружения; всё, кроме явного `legacy`, — `graph`.
     pub fn from_env() -> Self {
         Self::parse(&std::env::var("ENGINE_ROUTING").unwrap_or_default())
     }
 
     /// Разбирает значение переменной (регистр не важен).
+    ///
+    /// `legacy` — единственное значение, которое выключает граф: это
+    /// аварийный откат при выкатке. Пустое или неизвестное значение означает,
+    /// что маршрут считает оркестратор — режим по умолчанию.
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "graph" => Routing::Graph,
-            _ => Routing::Legacy,
+            "legacy" => Routing::Legacy,
+            _ => Routing::Graph,
         }
     }
 
@@ -120,6 +124,10 @@ impl GraphRuntime {
     /// Деплой (`bpmn_xml` в `output_data`) выполняется всегда, дальше событие
     /// либо стартует экземпляр, либо завершает человеческий шаг — оба пути
     /// идут под advisory-блокировкой экземпляра.
+    ///
+    /// `element_id` в событии — адрес кнопки, а не маршрут (дизайн 5.2):
+    /// старт идёт от `startEvent` схемы и **не требует** `element_id`, а
+    /// завершение шага выбирает хост-узел по `Waiting`-токену.
     pub async fn handle_inbound(&self, event: &InboundEvent) -> anyhow::Result<Outcome> {
         let mut deployed_process = None;
         if let Some(xml) = mapper::deploy_xml(event) {
@@ -146,14 +154,6 @@ impl GraphRuntime {
             println!(
                 "📦 [Graph] deploy instance={} (инстанс и токены не создаются)",
                 event.instance_id
-            );
-            return Ok(Outcome::default());
-        }
-
-        if event.element_id.trim().is_empty() {
-            eprintln!(
-                "⚠️ [Graph] event_without_element_id instance={} event_id={}",
-                event.instance_id, event.event_id
             );
             return Ok(Outcome::default());
         }
@@ -201,7 +201,10 @@ impl GraphRuntime {
                     return Ok(Outcome::default());
                 }
                 let Some(process_id) = deployed_process else {
-                    eprintln!("⚠️ [Graph] unknown_instance instance={}", instance_id);
+                    eprintln!(
+                        "⚠️ [Graph] unknown_instance instance={} element={} (нет bpmn_xml для старта)",
+                        instance_id, event.element_id
+                    );
                     return Ok(Outcome::default());
                 };
                 (
@@ -237,7 +240,10 @@ impl GraphRuntime {
             .pump_and_project(instance_id, before.as_ref(), engine_event, Some(&event.payload))
             .await?;
 
-        if completes_step && !has_active_step(&outcome, &event.element_id) {
+        if completes_step
+            && !event.element_id.trim().is_empty()
+            && !has_active_step(&outcome, &event.element_id)
+        {
             println!(
                 "ℹ️ [Graph] client_target_mismatch instance={} client={} graph={:?}",
                 instance_id,
@@ -398,13 +404,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn routing_defaults_to_legacy() {
-        assert_eq!(Routing::parse(""), Routing::Legacy);
-        assert_eq!(Routing::parse("legacy"), Routing::Legacy);
-        assert_eq!(Routing::parse("LEGACY"), Routing::Legacy);
-        assert_eq!(Routing::parse("unknown"), Routing::Legacy);
+    fn routing_defaults_to_graph() {
+        assert_eq!(Routing::parse(""), Routing::Graph);
         assert_eq!(Routing::parse("graph"), Routing::Graph);
         assert_eq!(Routing::parse(" Graph "), Routing::Graph);
+        assert_eq!(
+            Routing::parse("unknown"),
+            Routing::Graph,
+            "неизвестное значение не должно незаметно отключать оркестратор"
+        );
+        assert_eq!(Routing::parse("legacy"), Routing::Legacy);
+        assert_eq!(Routing::parse(" LEGACY "), Routing::Legacy);
         assert_eq!(Routing::Graph.as_str(), "graph");
         assert_eq!(Routing::Legacy.as_str(), "legacy");
     }
