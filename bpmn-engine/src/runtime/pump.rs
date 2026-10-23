@@ -4,12 +4,14 @@
 //! (`pump.rs:44-51`), поэтому проекция строится по снимкам «до/после»
 //! (дизайн `docs/runtime-m1-design.md`, 5.3 и 9.3).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use bpm_engine::bpm_engine_core::{NodeType, ProcessDefinition, ProcessInstance, TokenStatus};
 use bpm_engine::bpm_engine_runtime::{
-    BpmEngine, ExternalTaskCompletedHandler, HistoryHandler, ProcessCompletedHandler,
-    ProcessStartHandler, TokenArrivedHandler, UserTaskCompletedHandler,
+    BpmEngine, EngineContext, EventHandler, ExternalTaskCompletedHandler, HistoryHandler,
+    MessageCatchHandler, ProcessCompletedHandler, ProcessStartHandler, TokenArrivedHandler,
+    UserTaskCompletedHandler,
 };
 use bpm_engine::bpm_engine_storage::{ProcessDefinitionStore, ProcessInstanceStore};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -164,13 +166,92 @@ pub fn erp_host_step(
     }
 }
 
-/// Список хендлеров M1 (дизайн 9.2).
+/// Сообщение, которое движок отправил за проход (M3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedMessage {
+    /// Экземпляр-отправитель.
+    pub instance_id: String,
+    /// Узел `intermediateThrowEvent`, отправивший сообщение.
+    pub node_id: String,
+    /// Имя сообщения (`bpmn:message/@name`).
+    pub message_name: String,
+}
+
+/// Копилка исходящих сообщений одного прохода пумпы.
+///
+/// Пумпа не возвращает события, поэтому throw-события перехватываются
+/// хендлером [`CaptureHandler`], а рантайм разбирает их после `run_async`:
+/// запускает второй процесс (триггер узла) и доставляет сообщение ожидающему
+/// экземпляру по бизнес-ключу.
+#[derive(Debug, Clone, Default)]
+pub struct MessageCapture(Arc<Mutex<Vec<CapturedMessage>>>);
+
+impl MessageCapture {
+    /// Забывает сообщения предыдущего прохода.
+    pub fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
+
+    /// Забирает сообщения прохода.
+    pub fn take(&self) -> Vec<CapturedMessage> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+
+    fn push(&self, message: CapturedMessage) {
+        self.0.lock().unwrap().push(message);
+    }
+}
+
+/// Хендлер-перехватчик: складывает `MessageSent` в [`MessageCapture`].
+struct CaptureHandler(MessageCapture);
+
+#[async_trait]
+impl EventHandler for CaptureHandler {
+    async fn handle(
+        &self,
+        event: &bpm_engine::bpm_engine_core::EngineEvent,
+        _ctx: &mut EngineContext,
+    ) -> Vec<bpm_engine::bpm_engine_core::EngineEvent> {
+        if let bpm_engine::bpm_engine_core::EngineEvent::MessageSent(message) = event {
+            self.0.push(CapturedMessage {
+                instance_id: message.instance_id.clone(),
+                node_id: message.node_id.clone(),
+                message_name: message.message_name.clone(),
+            });
+        }
+        vec![]
+    }
+}
+
+/// Список хендлеров M1 (дизайн 9.2) плюс перехватчик сообщений M3.
 ///
 /// `HistoryHandler` без `history_repo` в контексте сразу возвращает пусто,
 /// поэтому список не зависит от режима аудита.
-pub fn engine() -> BpmEngine {
+///
+/// `MessageCatchHandler` сюда **не входит**: throw-событие не должно будить
+/// все ожидающие экземпляры — доставку делает [`message_engine`] по карте
+/// корреляции.
+pub fn engine(messages: MessageCapture) -> BpmEngine {
     BpmEngine::new(vec![
         Box::new(ProcessStartHandler),
+        Box::new(TokenArrivedHandler::new()),
+        Box::new(UserTaskCompletedHandler),
+        Box::new(ExternalTaskCompletedHandler),
+        Box::new(ProcessCompletedHandler),
+        Box::new(HistoryHandler),
+        Box::new(CaptureHandler(messages)),
+    ])
+}
+
+/// Движок доставки сообщений: `MessageSent` → `MessageCatchHandler`.
+///
+/// Используется только для явной доставки с корреляцией: `MessageCatchHandler`
+/// поднимает токены catch-событий и отдаёт `TokenArrived`, которые
+/// обрабатывает обычный набор хендлеров.
+pub fn message_engine() -> BpmEngine {
+    BpmEngine::new(vec![
+        Box::new(ProcessStartHandler),
+        Box::new(MessageCatchHandler),
         Box::new(TokenArrivedHandler::new()),
         Box::new(UserTaskCompletedHandler),
         Box::new(ExternalTaskCompletedHandler),
@@ -475,7 +556,7 @@ mod tests {
         let mut context =
             EngineContext::builder(repo.clone(), repo.clone(), def_store.clone()).build();
 
-        engine()
+        engine(MessageCapture::default())
             .run_async(
                 mapper::process_started(PROCESS_ID, "instance-1", &json!({"order_amount": 150000})),
                 &mut context,
@@ -663,7 +744,7 @@ mod tests {
             let (repo, def_store) = harness(&gateway_xml());
             let mut context =
                 EngineContext::builder(repo.clone(), repo.clone(), def_store.clone()).build();
-            let engine = engine();
+            let engine = engine(MessageCapture::default());
 
             engine
                 .run_async(

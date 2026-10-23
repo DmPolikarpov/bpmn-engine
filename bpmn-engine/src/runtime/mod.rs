@@ -8,19 +8,21 @@
 //! Legacy-ветка, где следующий узел называл клиент, удалена шагом 3 (M2).
 
 pub mod mapper;
+pub mod messages;
 pub mod project;
 pub mod pump;
 pub mod store;
 pub mod vars;
 
 use bpm_engine::bpm_engine_bpmn::parse_and_compile;
-use bpm_engine::bpm_engine_core::{EngineEvent, InstanceState};
+use bpm_engine::bpm_engine_core::{payloads, EngineEvent, InstanceState, TokenStatus};
 use bpm_engine::bpm_engine_runtime::BpmEngine;
+use bpm_engine::bpm_engine_storage::{ProcessDefinitionStore, ProcessInstanceStore};
 use serde_json::Value;
 use sqlx::PgPool;
 
 use self::project::Projection;
-use self::pump::{ExternalTaskSpec, Snapshot, Step, StepKind};
+use self::pump::{ExternalTaskSpec, MessageCapture, Snapshot, Step, StepKind};
 use self::store::GraphStores;
 use crate::db;
 use crate::events::{ActionRequiredEvent, ErpResponseEvent, InboundEvent, ServiceCommand};
@@ -64,6 +66,40 @@ pub struct Outcome {
     /// Появляются, когда ответ воркера не повторяемый или ретраи исчерпаны:
     /// токен остаётся на шаге, а внешняя система получает запрос человека.
     pub actions: Vec<ActionRequiredEvent>,
+    /// Другие экземпляры, которые двинулись из-за сообщений этого события (M3).
+    ///
+    /// Экземпляр второй стороны мог быть создан триггером узла
+    /// (`trg:processTrigger`) или разбужен сообщением на catch-событии.
+    /// `main.rs` публикует шаги каждого из них в свой subject
+    /// `mes.bpmn.v1.event.<instance>`.
+    pub peers: Vec<PeerOutcome>,
+}
+
+/// Изменения в «соседнем» экземпляре, вызванные сообщением (M3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerOutcome {
+    /// Экземпляр второй стороны.
+    pub instance_id: String,
+    /// Изменения его шагов.
+    pub steps: Vec<StepEvent>,
+    /// `process_completed` / `process_terminated`, если он завершился.
+    pub process_finished: Option<&'static str>,
+    /// Команды воркерам по его активированным `serviceTask`.
+    pub commands: Vec<ServiceCommand>,
+    /// Компенсации по его шагам.
+    pub actions: Vec<ActionRequiredEvent>,
+}
+
+impl PeerOutcome {
+    fn from_outcome(instance_id: &str, outcome: Outcome) -> Self {
+        Self {
+            instance_id: instance_id.to_string(),
+            steps: outcome.steps,
+            process_finished: outcome.process_finished,
+            commands: outcome.commands,
+            actions: outcome.actions,
+        }
+    }
 }
 
 /// Политика ретраев внешних задач (M2).
@@ -106,6 +142,10 @@ fn env_secs(name: &str, default: u64) -> u64 {
 pub struct GraphRuntime {
     stores: GraphStores,
     engine: BpmEngine,
+    /// Движок доставки сообщений (только `MessageCatchHandler`, M3).
+    message_engine: BpmEngine,
+    /// Сообщения, отправленные движком за текущий проход.
+    messages: MessageCapture,
     legacy: PgPool,
     retry: RetryPolicy,
 }
@@ -117,9 +157,12 @@ impl GraphRuntime {
     pub async fn new(database_url: &str, legacy: PgPool) -> anyhow::Result<Self> {
         let stores = GraphStores::new(database_url)?;
         stores.ensure_schema().await?;
+        let messages = MessageCapture::default();
         Ok(Self {
             stores,
-            engine: pump::engine(),
+            engine: pump::engine(messages.clone()),
+            message_engine: pump::message_engine(),
+            messages,
             legacy,
             retry: RetryPolicy::from_env(),
         })
@@ -518,6 +561,7 @@ impl GraphRuntime {
         payload: Option<&Value>,
     ) -> anyhow::Result<Outcome> {
         let mut context = self.stores.context();
+        self.messages.clear();
         self.engine.run_async(engine_event, &mut context).await;
 
         let after = pump::load(
@@ -540,7 +584,355 @@ impl GraphRuntime {
         )
         .await?;
         let commands = service_commands(instance_id, &after, &projection);
-        Ok(to_outcome(&projection, payload, commands))
+        let mut outcome = to_outcome(&projection, payload, commands);
+        outcome.peers = self.dispatch_messages(&after).await?;
+        Ok(outcome)
+    }
+
+    /// Разбирает сообщения, отправленные за проход, и двигает вторую сторону (M3).
+    ///
+    /// Для каждого `MessageSent`:
+    ///
+    /// - триггер узла (`trg:processTrigger`) запускает экземпляр целевого
+    ///   процесса — с детерминированным id `<prefix><orderNum>` и только
+    ///   перечисленными в `payloadKeys` переменными;
+    /// - сообщение доставляется ожидающему catch-событию другого экземпляра,
+    ///   найденного по бизнес-ключу (`orderNum`), — не всем сразу.
+    ///
+    /// Схема читается из `process_definition`: она уже задеплоена тем же
+    /// событием или раньше, поэтому разбор не требует отдельного хранилища.
+    async fn dispatch_messages(&self, sender: &Snapshot) -> anyhow::Result<Vec<PeerOutcome>> {
+        let captured = self.messages.take();
+        if captured.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Some(xml) = self
+            .stores
+            .load_xml(&sender.instance.process_def_id)
+            .await?
+        else {
+            eprintln!(
+                "⚠️ [Graph] message_schema_missing instance={}",
+                sender.instance.id
+            );
+            return Ok(Vec::new());
+        };
+        let Some(catalog) = messages::parse(&xml) else {
+            eprintln!(
+                "⚠️ [Graph] message_schema_unparsed instance={}",
+                sender.instance.id
+            );
+            return Ok(Vec::new());
+        };
+
+        let mut peers = Vec::new();
+
+        for message in captured {
+            println!(
+                "📨 [Graph] message_sent instance={} node={} message={}",
+                message.instance_id, message.node_id, message.message_name
+            );
+
+            // Сверка с разбором схемы: имя сообщения пришло из движка, а
+            // `trg:processTrigger`/`messageFlow` — из XML. Расхождение значит,
+            // что схему обновили между деплоем и проходом, — сообщение всё
+            // равно доставляется по имени движка.
+            if let Some(declared) = catalog.throw_message(&message.node_id) {
+                if declared != message.message_name {
+                    eprintln!(
+                        "⚠️ [Graph] message_name_mismatch node={} engine={} schema={}",
+                        message.node_id, message.message_name, declared
+                    );
+                }
+            }
+
+            if let Some(flow) = catalog.flow_for(&message.message_name) {
+                println!(
+                    "🔗 [Graph] message_flow id={} source={} target={}",
+                    flow.id, flow.source, flow.target
+                );
+            }
+
+            if let Some(trigger) = catalog.trigger_for(&message.node_id) {
+                match self.start_counterpart(sender, trigger).await {
+                    Ok(Some(peer)) => peers.push(peer),
+                    Ok(None) => {}
+                    Err(error) => eprintln!(
+                        "❌ [Graph] message_trigger_failed instance={} target={}: {:#}",
+                        sender.instance.id, trigger.target_process, error
+                    ),
+                }
+            }
+
+            match self.deliver_message(sender, &message).await {
+                Ok(delivered) => peers.extend(delivered),
+                Err(error) => eprintln!(
+                    "❌ [Graph] message_delivery_failed instance={} message={}: {:#}",
+                    sender.instance.id, message.message_name, error
+                ),
+            }
+        }
+
+        Ok(peers)
+    }
+
+    /// Запускает экземпляр второй стороны по `trg:processTrigger`.
+    ///
+    /// Идемпотентность: id экземпляра детерминирован (`<prefix><orderNum>`),
+    /// поэтому повторная доставка сообщения (ретрай, второй под) не создаёт
+    /// второй экземпляр. `firstElementId` совпадает со штатным первым шагом
+    /// целевого процесса; расхождение логируется — вход в произвольный узел
+    /// появится вместе с явной активацией узла (M3.2).
+    async fn start_counterpart(
+        &self,
+        sender: &Snapshot,
+        trigger: &messages::ProcessTrigger,
+    ) -> anyhow::Result<Option<PeerOutcome>> {
+        let Some(business_key) = messages::correlation_value(&sender.instance.variables) else {
+            eprintln!(
+                "⚠️ [Graph] message_trigger_without_correlation instance={} target={}",
+                sender.instance.id, trigger.target_process
+            );
+            return Ok(None);
+        };
+
+        let Some(instance_id) = messages::instance_id(&trigger.instance_prefix, &business_key)
+        else {
+            eprintln!(
+                "⚠️ [Graph] message_trigger_bad_instance_id instance={} key={}",
+                sender.instance.id, business_key
+            );
+            return Ok(None);
+        };
+
+        if self
+            .stores
+            .process_store
+            .load(&instance_id)
+            .await?
+            .is_some()
+        {
+            println!(
+                "🔁 [Graph] message_trigger_duplicate instance={} target={}",
+                instance_id, trigger.target_process
+            );
+            return Ok(None);
+        }
+
+        if self
+            .stores
+            .cached_def_store
+            .load(&trigger.target_process)
+            .await?
+            .is_none()
+        {
+            eprintln!(
+                "⚠️ [Graph] message_target_not_deployed target={} instance={}",
+                trigger.target_process, instance_id
+            );
+            return Ok(None);
+        }
+
+        let variables = messages::select_payload(&sender.instance.variables, &trigger.payload_keys);
+        let start = EngineEvent::ProcessStarted(payloads::ProcessStarted {
+            process_id: trigger.target_process.clone(),
+            instance_id: instance_id.clone(),
+            initial_variables: Some(variables.clone()),
+        });
+
+        println!(
+            "🚀 [Graph] message_trigger instance={} target={} key={} payload={:?}",
+            instance_id, trigger.target_process, business_key, trigger.payload_keys
+        );
+
+        let mut context = self.stores.context();
+        self.messages.clear();
+        self.engine.run_async(start, &mut context).await;
+        // Каскад сообщений внутри нового экземпляра — M3.2: сейчас триггер
+        // запускает процесс, но не разбирает его собственные throw-события.
+        let _ = self.messages.take();
+
+        let payload = serde_json::json!(&variables);
+        let peer = self
+            .project_peer(&instance_id, None, Some(&payload))
+            .await?;
+
+        if let (Some(first_element), Some(peer)) = (&trigger.first_element, &peer) {
+            let active = peer
+                .steps
+                .iter()
+                .find(|step| step.state == "ACTIVE")
+                .map(|step| step.element_id.as_str());
+            if active != Some(first_element.as_str()) {
+                eprintln!(
+                    "⚠️ [Graph] message_entry_mismatch instance={} expected={} actual={:?}",
+                    instance_id, first_element, active
+                );
+            }
+        }
+
+        Ok(peer)
+    }
+
+    /// Доставляет сообщение ожидающему catch-событию второй стороны.
+    ///
+    /// Кандидаты — запущенные экземпляры, у которых:
+    ///
+    /// - в схеме есть catch-событие с этим именем сообщения и `Waiting`-токен
+    ///   стоит именно на нём;
+    /// - переменные совпадают с картой корреляции (`orderNum`), то есть это
+    ///   тот же заказ, а не соседний.
+    ///
+    /// Доставку выполняет отдельный движок с `MessageCatchHandler`: он поднимает
+    /// токен и отдаёт `TokenArrived`, а сообщение приносит свои переменные.
+    /// Без бизнес-ключа доставки нет — «во все экземпляры» сообщение не уходит.
+    async fn deliver_message(
+        &self,
+        sender: &Snapshot,
+        message: &pump::CapturedMessage,
+    ) -> anyhow::Result<Vec<PeerOutcome>> {
+        let correlation = messages::correlation(&sender.instance.variables);
+        if correlation.is_empty() {
+            eprintln!(
+                "⚠️ [Graph] message_without_correlation instance={} message={} (ключ '{}' не найден)",
+                sender.instance.id,
+                message.message_name,
+                messages::CORRELATION_KEY
+            );
+            return Ok(Vec::new());
+        }
+
+        let running = self.stores.process_store.list_running(None).await?;
+        let mut targets = Vec::new();
+
+        for instance_id in running {
+            if instance_id == sender.instance.id {
+                continue;
+            }
+            let Some(snapshot) = pump::load(
+                &self.stores.process_store,
+                &self.stores.cached_def_store,
+                &instance_id,
+            )
+            .await?
+            else {
+                continue;
+            };
+            if !messages::matches_correlation(&snapshot.instance.variables, &correlation) {
+                continue;
+            }
+
+            let Some(xml) = self
+                .stores
+                .load_xml(&snapshot.instance.process_def_id)
+                .await?
+            else {
+                continue;
+            };
+            let Some(catalog) = messages::parse(&xml) else {
+                continue;
+            };
+            if catalog.catch_nodes(&message.message_name).is_empty() {
+                continue;
+            }
+
+            let waiting = snapshot.instance.tokens.iter().any(|token| {
+                token.status == TokenStatus::Waiting
+                    && catalog.catch_message(&token.node_id) == Some(message.message_name.as_str())
+            });
+            if !waiting {
+                continue;
+            }
+
+            targets.push(snapshot);
+        }
+
+        if targets.is_empty() {
+            println!(
+                "ℹ️ [Graph] message_no_waiter message={} key={:?}",
+                message.message_name,
+                correlation.get(messages::CORRELATION_KEY)
+            );
+            return Ok(Vec::new());
+        }
+
+        // Сообщение несёт скалярные переменные отправителя: вендор хранит их
+        // строками, вложенные объекты отсекаются ещё на входе (`vars::flatten`).
+        let payload = sender.instance.variables.clone();
+        let delivery = payloads::MessageSent {
+            instance_id: sender.instance.id.clone(),
+            message_name: message.message_name.clone(),
+            node_id: message.node_id.clone(),
+            correlation: Some(correlation),
+            payload: Some(payload.clone()),
+        };
+
+        println!(
+            "📬 [Graph] message_delivery message={} from={} targets={:?}",
+            message.message_name,
+            sender.instance.id,
+            targets
+                .iter()
+                .map(|target| target.instance.id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let mut context = self.stores.context();
+        self.message_engine
+            .run_async(EngineEvent::MessageSent(delivery), &mut context)
+            .await;
+
+        let payload = serde_json::json!(&payload);
+        let mut peers = Vec::new();
+        for before in &targets {
+            if let Some(peer) = self
+                .project_peer(&before.instance.id, Some(before), Some(&payload))
+                .await?
+            {
+                peers.push(peer);
+            }
+        }
+
+        Ok(peers)
+    }
+
+    /// Снимок «после» для экземпляра второй стороны: проекция, legacy, команды.
+    ///
+    /// Пустая проекция — экземпляр не изменился (например, сообщение пришло
+    /// повторно и ждать уже нечего): ничего не публикуется.
+    async fn project_peer(
+        &self,
+        instance_id: &str,
+        before: Option<&Snapshot>,
+        payload: Option<&Value>,
+    ) -> anyhow::Result<Option<PeerOutcome>> {
+        let Some(after) = pump::load(
+            &self.stores.process_store,
+            &self.stores.cached_def_store,
+            instance_id,
+        )
+        .await?
+        else {
+            eprintln!("⚠️ [Graph] peer_instance_lost instance={}", instance_id);
+            return Ok(None);
+        };
+
+        let projection = project::diff(before, &after);
+        if projection.is_empty() {
+            return Ok(None);
+        }
+
+        project::apply_legacy(
+            &self.legacy,
+            instance_id,
+            &after.instance.process_def_id,
+            &projection,
+        )
+        .await?;
+        let commands = service_commands(instance_id, &after, &projection);
+        let outcome = to_outcome(&projection, payload, commands);
+        Ok(Some(PeerOutcome::from_outcome(instance_id, outcome)))
     }
 }
 
@@ -682,6 +1074,7 @@ fn to_outcome(
         process_finished: projection.finished.and_then(ws_process_event),
         commands,
         actions: Vec::new(),
+        peers: Vec::new(),
     }
 }
 

@@ -276,6 +276,7 @@ dependencies = [
  "chrono",
  "deadpool-postgres",
  "futures",
+ "roxmltree",
  "serde",
  "serde_json",
  "sqlx",

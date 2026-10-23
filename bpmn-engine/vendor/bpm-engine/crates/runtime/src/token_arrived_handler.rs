@@ -324,6 +324,9 @@ impl EventHandler for TokenArrivedHandler {
                 out.push(EngineEvent::MessageSent(payloads::MessageSent {
                     instance_id: e.instance_id.clone(),
                     message_name: message_name.clone(),
+                    node_id: e.node_id.clone(),
+                    correlation: None,
+                    payload: None,
                 }));
                 instance.tokens[token_idx].status = TokenStatus::Waiting;
                 let new_tokens = move_token(node);

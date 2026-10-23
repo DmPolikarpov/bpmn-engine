@@ -7,7 +7,9 @@
 //! 2. завершение шага закрывает один токен узла и сохраняет группу ветки;
 //! 3. `default`-связь без `conditionExpression` компилируется в `Default`;
 //! 5. `PostgresProcessStore::load` выбирает все колонки, которые читает
-//!    (проверка по исходнику: живой БД в юнит-прогоне пакета нет).
+//!    (проверка по исходнику: живой БД в юнит-прогоне пакета нет);
+//! 6. сообщение доставляется только экземпляру с совпадающим бизнес-ключом
+//!    (M3: `MessageSent::correlation`).
 //!
 //! Патч 4 (`migrate`) юнит-тестом не проверяется по той же причине.
 
@@ -22,8 +24,8 @@ use bpm_engine::bpm_engine_core::{
     TokenStatus,
 };
 use bpm_engine::bpm_engine_runtime::{
-    BpmEngine, EngineContext, EventHandler, ExternalTaskCompletedHandler, ProcessStartHandler,
-    TokenArrivedHandler, UserTaskCompletedHandler,
+    BpmEngine, EngineContext, EventHandler, ExternalTaskCompletedHandler, MessageCatchHandler,
+    ProcessStartHandler, TokenArrivedHandler, UserTaskCompletedHandler,
 };
 use bpm_engine::bpm_engine_storage::ProcessInstanceStore;
 
@@ -350,6 +352,105 @@ async fn external_task_completion_keeps_group() {
 /// Исходник вендорного postgres-адаптера. Живого Postgres в юнит-прогоне пакета
 /// нет, поэтому патч проверяется по тексту запроса: `load` падал в рантайме на
 /// колонке, которой не было в его же `SELECT`.
+// --- Патч 6: корреляция сообщения по бизнес-ключу (M3) ---------------------
+
+/// Идентификатор процесса со схемой сообщений.
+const MESSAGE_PROCESS_ID: &str = "messages";
+
+/// Схема с catch-событием: `WaitMessage` ждёт сообщение `POConfirmed`.
+fn message_xml() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="http://bpmn-engine.local">
+  <message id="Message_PO" name="POConfirmed"/>
+  <process id="messages" name="Messages" isExecutable="true">
+    <startEvent id="Start"/>
+    <intermediateCatchEvent id="WaitMessage">
+      <messageEventDefinition messageRef="Message_PO"/>
+    </intermediateCatchEvent>
+    <userTask id="Task_After" name="After"/>
+    <endEvent id="End"/>
+    <sequenceFlow id="Flow_Start" sourceRef="Start" targetRef="WaitMessage"/>
+    <sequenceFlow id="Flow_Message" sourceRef="WaitMessage" targetRef="Task_After"/>
+    <sequenceFlow id="Flow_End" sourceRef="Task_After" targetRef="End"/>
+  </process>
+</definitions>"#
+        .to_string()
+}
+
+/// Экземпляр, который ждёт сообщение и уже знает свой бизнес-ключ.
+fn waiting_for_message(instance_id: &str, order_num: &str) -> ProcessInstance {
+    ProcessInstance {
+        id: instance_id.to_string(),
+        process_def_id: MESSAGE_PROCESS_ID.to_string(),
+        tenant_id: None,
+        tokens: vec![waiting_token("token-wait", "WaitMessage", None)],
+        variables: HashMap::from([("orderNum".to_string(), order_num.to_string())]),
+        state: InstanceState::Running,
+        version: 0,
+        parent_instance_id: None,
+        parent_token_id: None,
+    }
+}
+
+#[tokio::test]
+async fn message_delivery_respects_correlation() {
+    let Harness { repo, mut ctx } = harness(&message_xml(), None).await;
+    repo.save(&waiting_for_message("inst-a", "ORD-A"))
+        .await
+        .expect("инстанс A сохраняется");
+    repo.save(&waiting_for_message("inst-b", "ORD-B"))
+        .await
+        .expect("инстанс B сохраняется");
+    let engine = BpmEngine::new(vec![
+        Box::new(MessageCatchHandler),
+        Box::new(TokenArrivedHandler::new()),
+    ]);
+
+    engine
+        .run_async(
+            EngineEvent::MessageSent(payloads::MessageSent {
+                instance_id: "inst-supplier".to_string(),
+                message_name: "POConfirmed".to_string(),
+                node_id: "Event_ThrowPO".to_string(),
+                correlation: Some(HashMap::from([(
+                    "orderNum".to_string(),
+                    "ORD-A".to_string(),
+                )])),
+                payload: Some(HashMap::from([(
+                    "shippedAt".to_string(),
+                    "10:00".to_string(),
+                )])),
+            }),
+            &mut ctx,
+        )
+        .await;
+
+    let correlated = load_instance(&repo, "inst-a").await;
+    assert!(
+        correlated
+            .tokens
+            .iter()
+            .any(|token| token.node_id == "Task_After" && token.status == TokenStatus::Waiting),
+        "сообщение должно поднять токен своего заказа, токены: {:?}",
+        correlated.tokens
+    );
+    assert_eq!(
+        correlated.variables.get("shippedAt"),
+        Some(&"10:00".to_string()),
+        "payload сообщения доезжает до получателя"
+    );
+
+    let foreign = load_instance(&repo, "inst-b").await;
+    assert!(
+        !foreign
+            .tokens
+            .iter()
+            .any(|token| token.node_id == "Task_After"),
+        "экземпляр с другим orderNum не должен получать сообщение, токены: {:?}",
+        foreign.tokens
+    );
+}
+
 const POSTGRES_PROCESS_STORE: &str =
     include_str!("../vendor/bpm-engine/crates/adapters/postgres/src/process_store.rs");
 
