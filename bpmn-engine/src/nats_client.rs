@@ -1,11 +1,17 @@
 use crate::events::{ActionRequiredEvent, ServiceCommand};
+use crate::orders::{PgOrderStore, API_QUEUE, API_SUBJECT};
 use async_nats::jetstream::{self, consumer::pull::Config as PullConfig, Context};
+use futures::StreamExt;
 use serde_json::{json, Value};
 use std::env;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct NatsAdapter {
     pub js: Context,
+    /// Ядровой клиент: нужен для request/reply API (JetStream отвечает только
+    /// на публикацию и вытягивание, а запрос кабинета ждёт ответ в `reply`).
+    pub client: async_nats::Client,
 }
 
 impl NatsAdapter {
@@ -15,10 +21,51 @@ impl NatsAdapter {
 
         println!("Connecting to NATS at {}...", nats_url);
         let client = async_nats::connect(&nats_url).await?;
-        let js = jetstream::new(client);
+        let js = jetstream::new(client.clone());
 
         println!("Successfully connected to NATS JetStream!");
-        Ok(Self { js })
+        Ok(Self { js, client })
+    }
+
+    /// NATS-API заказов (M4): HTTP-шлюз перекладывает REST в `nc.request`.
+    ///
+    /// Очередь [`API_QUEUE`] нужна, чтобы на запрос ответила **одна** реплика
+    /// движка: у всех общий Postgres, и три одинаковых ответа только гонялись
+    /// бы за первый.
+    pub async fn serve_orders_api(
+        &self,
+        store: Arc<PgOrderStore>,
+    ) -> Result<(), async_nats::Error> {
+        let mut subscriber = self
+            .client
+            .queue_subscribe(API_SUBJECT, API_QUEUE.to_string())
+            .await?;
+        println!("📚 [Orders] API заказов слушает {API_SUBJECT}");
+
+        while let Some(message) = subscriber.next().await {
+            let today = chrono::Utc::now().date_naive();
+            let response =
+                crate::orders::handle_bytes(store.as_ref(), &message.payload, today).await;
+
+            // Ответ уходит в `reply` запроса. В async-nats 0.34 у сообщения нет
+            // метода `respond`, поэтому публикуем сами; запрос без `reply`
+            // (обычный `nats pub`) просто некому адресовать.
+            let Some(reply) = message.reply.clone() else {
+                eprintln!("⚠️ [Orders] запрос без reply-адреса: {}", message.subject);
+                continue;
+            };
+
+            match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    if let Err(error) = self.client.publish(reply, body.into()).await {
+                        eprintln!("❌ [Orders] не удалось ответить на запрос: {error}");
+                    }
+                }
+                Err(error) => eprintln!("❌ [Orders] сериализация ответа: {error}"),
+            }
+        }
+
+        Ok(())
     }
 
     /// Публикация изменения статуса токена ВМЕСТЕ с полезной нагрузкой (payload)

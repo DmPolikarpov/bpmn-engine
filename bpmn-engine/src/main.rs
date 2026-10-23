@@ -1,6 +1,7 @@
 mod db;
 mod events;
 mod nats_client;
+mod orders;
 mod runtime;
 
 use async_nats::jetstream::AckKind;
@@ -46,6 +47,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pool_sla = pool.clone();
 
     let graph_erp = graph.clone();
+
+    // 0. API заказов (M4): NATS-запрос от HTTP-шлюза, ответ — JSON заказа.
+    //
+    // Заказы живут в БД движка, а не в `useState` кабинета: F5 и второй
+    // браузер видят один список, а `orderNum` остаётся бизнес-ключом и
+    // корреляционным ключом сообщений (M3).
+    let orders_store = Arc::new(orders::PgOrderStore::new(pool.clone()));
+    let nats_orders = nats_adapter.clone();
+    tokio::spawn(async move {
+        if let Err(error) = nats_orders.serve_orders_api(orders_store).await {
+            eprintln!("❌ [Orders] API заказов остановлено: {error}");
+        }
+    });
 
     // 1. Фоновый воркер SLA / таймаутов
     tokio::spawn(async move {

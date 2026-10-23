@@ -305,7 +305,7 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 | --- | --- | --- | --- | --- |
 | Руководитель (EXECUTIVE) | Деплой схемы (`deploySchema('CUSTOMER', xml)`) | `DeploySchema` | `Process_Deployment` | `inst-deploy-customer` |
 | Руководитель Поставщика | Деплой схемы (`deploySchema('SUPPLIER', xml)`) | `DeploySchema` | `Process_Deployment` | `inst-deploy-supplier` |
-| Мастер производства (`handleProductionCreateOrder`) | «Создать внутренний заказ на 100 л» | `StartProcess` | `Task_CreatePurchaseOrder` | `inst-cust-*` |
+| Мастер производства (`handleProductionCreateOrder`) | «Принять заказ клиента»: форма заказа (номенклатура, объём, жирность, упаковка, срок, контрагент) | `StartProcess` | `Task_CreatePurchaseOrder` | `inst-cust-*` |
 | Менеджер закупок (`handleCustomerSendOrderToSupplier`) | Передать заказ поставщику | `CompleteBlock` | `Task_WaitForSupplierShipment` | `inst-cust-*` |
 | Менеджер закупок (там же, шаг 2 — `startProcess`) | Запуск процесса поставщика | `StartProcess` | `Task_SupplierCreateDocs` | `inst-supp-*` |
 | Менеджер поставщика (`handleSupplierCreateDocs`) | Сформировать УПД/ТТН | `CompleteBlock` | `Task_SupplierShipment` | `inst-supp-*` |
@@ -341,12 +341,52 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 таблицах заказов, а «текущий шаг» мог уехать на чужой заказ. Регрессия закрыта
 тестом «токен старта, обогнавший ответ HTTP, не удваивает заказ».
 
+#### Заказы переживают F5 (M4)
+
+Заказ — запись в БД движка (`orders`), а не `useState` кабинета:
+`orderNum` — бизнес-ключ и ключ корреляции сообщений M3. Клиент ходит в REST
+шлюза через [`ordersApi.js`](erp-simulator/src/ordersApi.js):
+
+| Метод клиента | HTTP | Что делает |
+| --- | --- | --- |
+| `ordersClient.listOrders()` | `GET /api/v1/orders` | список последних заказов при входе в кабинет |
+| `ordersClient.getOrder(orderNum)` | `GET /api/v1/orders/:orderNum` | карточка: предметные поля и текущие шаги обоих контуров |
+| `ordersClient.createOrder(payload)` | `POST /api/v1/orders` | заказ **до** `startProcess`: движку нужно, к чему привязать экземпляр |
+| `ordersClient.attachInstance(orderNum, org, instanceId)` | `POST /api/v1/orders/:orderNum/instances` | какой экземпляр относится к стороне заказа |
+
+Порядок в `handleProductionCreateOrder`: `nextOrderNum(orders)` → `createOrder` →
+`startProcess` → `attachInstance('CUSTOMER')`. Экземпляр поставщика создаёт движок
+(M3), поэтому к заказу его привязывает подписка на токены — по первому
+`ACTIVE`-кадру `inst-supp-*`, один раз (`attachedInstances`). Без `attachInstance`
+после F5 карточка осталась бы без текущего шага: шаг сервер считает по `tokens`,
+а не по `useState` браузера.
+
+Список перечитывается при **входе** в кабинет (эффект на `currentUser`), а не на
+монтировании: после «Выхода» локальный список очищается, и без повторного чтения
+он остался бы пустым, хотя заказы на сервере есть. Прочитанное сливается с
+локальным (`mergeOrders`): серверные поля главнее, локальные
+«документы/пропуск/время» не теряются, а заказы, о которых сервер ещё не знает,
+остаются в списке. API может быть недоступен — тогда
+`listOrders`/`createOrder` возвращают `{ok:false}`, и кабинет работает как до M4:
+заказы живут в этой сессии, а `409` на создание считается нормой (заказ уже есть).
+
 Тот же приём используется и в интеграционном тесте:
 [`App.test.js`](erp-simulator/src/App.test.js) проверяет **один** вызов кнопки
 производства — `sendEvent(inst-cust-*, 'StartProcess', 'Task_CreatePurchaseOrder',
-{ orderNum, volume, initiator, bpmn_xml })` — и то, что второго события на первый
-шаг нет: узел первого шага (умолчание `CompleteBlock` не отправляется вовсе)
-схема выводит по исходящей связи стартового события.
+{ orderNum, volume, nomenclature, fatContent, packaging, dueDate, counterparty,
+initiator, bpmn_xml })` — и то, что второго события на первый шаг нет: узел первого
+шага (умолчание `CompleteBlock` не отправляется вовсе) схема выводит по исходящей
+связи стартового события.
+
+Живой прогон всего контура (шлюз → NATS `request/reply` → движок → Postgres) —
+[`tests/orders-api.e2e.cjs`](tests/orders-api.e2e.cjs): коды `200/400/404/409`,
+camelCase, `IDLE`/`ACTIVE` контуров и текущий шаг из `tokens`. Скрипт сам
+открывает `kubectl port-forward`, заводит экземпляр и токен через
+`kubectl exec … psql` и убирает за собой:
+
+```bash
+node tests/orders-api.e2e.cjs   # 29 проверок; GATEWAY_URL — если шлюз уже доступен
+```
 
 ### B. Сервисные задачи в движке (ответ ERP)
 
@@ -889,7 +929,7 @@ API SDK: `listActions`, `getElementActions`, `getElementAction`,
 
 Поэтому проверку повторяет клиент (`validateEngineSchema` из SDK) и делает отказ
 видимым: панель схемы показывает причину до деплоя, деплой несовместимой схемы не
-отправляется, а «Создать внутренний заказ» не заводит заказ — иначе в списке
+отправляется, а «Принять заказ клиента» не заводит заказ — иначе в списке
 остался бы «заказ-призрак» без экземпляра процесса. Проверка зеркалит правила
 компилятора и лежит в SDK рядом с остальной логикой XML (см.
 [README SDK](erp-simulator/src/bpmn-sdk/README.md#совместимость-схемы-с-движком)).
@@ -1245,7 +1285,9 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 | [`erp-simulator/src/schemaStore.js`](erp-simulator/src/schemaStore.js) | Старый кэш схем по организациям: `saveSchema`/`loadSchema`/`clearSchema`, ключ `bpmn-schema:<ORG>`; читается только для миграции в проект |
 | [`erp-simulator/src/metricsStore.js`](erp-simulator/src/metricsStore.js) | Метрики запусков в браузере: `beginRun`/`completeRun`/`loadRuns`/`clearRuns`, ключ `bpmn-process-metrics`, агрегаты инфографики (`summarizeRuns`, `groupRunsByProcess`) |
 | [`erp-simulator/src/MetricsPanel.jsx`](erp-simulator/src/MetricsPanel.jsx) | Инфографика руководителя: карточка на процесс, плитки времени, столбики последних запусков |
+| [`erp-simulator/src/ordersApi.js`](erp-simulator/src/ordersApi.js) | Заказы в БД движка (M4): `ordersClient.listOrders`/`getOrder`/`createOrder`/`attachInstance`, нормализация серверной карточки (`normalizeOrder`, `mergeOrders`), продолжение нумерации (`nextOrderNum`) и форма заказа (`defaultOrderDraft`, `toOrderPayload`, `formatDueDate`) |
 | [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) | Демо-привязки: роль → кнопка из схемы (`ACTION_ID`) → `sendEvent`; кнопки вне `ACTION_ID` — общим шагом (`schemaStepActions`); сохранение/сброс схемы; подсказки триггера — `getProcessIds` из схемы второй стороны; метрики запусков — `beginRun` на старте и `completeRun` по токену на конечном узле |
 | [`tests/test_workflow.py`](tests/test_workflow.py) | E2E-проверка привязок через HTTP, БД, NATS и WS |
+| [`tests/orders-api.e2e.cjs`](tests/orders-api.e2e.cjs) | Живой E2E API заказов (M4): HTTP-шлюз → NATS `request/reply` → движок → Postgres, контракт кабинета и уборка следов через `psql` |
 | [`schema.sql`](schema.sql), [`db-init-configmap.yaml`](db-init-configmap.yaml) | Таблицы и ограничения по длинам идентификаторов |
 | [`erp-simulator/docs/dairy-plant-roadmap.md`](erp-simulator/docs/dairy-plant-roadmap.md) | Дорожная карта демо-проекта «Молочный завод»: что уже играется в кабинете, какие разрывы (граф, воркеры, межпроцессные сообщения, роли, метрики) и в каком порядке закрываются (M1–M8) |

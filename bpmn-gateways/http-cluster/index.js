@@ -54,6 +54,17 @@ const NATS_URL = process.env.NATS_URL || 'nats://nats-service:4222';
 const PORT = process.env.PORT || 8080;
 const sc = StringCodec();
 
+/**
+ * API заказов (M4).
+ *
+ * Заказы живут в БД движка, поэтому шлюз не ходит в Postgres сам: он
+ * перекладывает REST в NATS-запрос `request/reply` и отдаёт ответ как есть.
+ * Subject и таймаут настраиваются, чтобы тот же образ работал в кластере и
+ * на локальном стенде.
+ */
+const ORDERS_SUBJECT = process.env.ORDERS_API_SUBJECT || 'mes.in.v1.api.orders';
+const ORDERS_TIMEOUT_MS = Number(process.env.ORDERS_TIMEOUT_MS || 5000);
+
 let nc;
 let js;
 
@@ -148,6 +159,94 @@ app.post('/api/v1/process/instances/:id/events', async (req, res) => {
 });
 
 /**
+ * Запрос к API заказов движка через NATS `request/reply`.
+ *
+ * Движок отвечает на `mes.in.v1.api.orders` (очередь `orders-api` — отвечает
+ * одна реплика): тело запроса и ответа описано в
+ * `bpmn-engine/src/orders.rs`.
+ */
+async function requestOrders(payload) {
+    if (!nc) {
+        const error = new Error('NATS не подключён: заказы недоступны');
+        error.status = 503;
+        throw error;
+    }
+
+    const message = await nc.request(
+        ORDERS_SUBJECT,
+        sc.encode(JSON.stringify(payload)),
+        { timeout: ORDERS_TIMEOUT_MS }
+    );
+
+    return JSON.parse(sc.decode(message.data));
+}
+
+/**
+ * Переносит ответ движка в HTTP: `status` из тела — это код (400/404/409/500),
+ * остальные поля уходят клиенту как есть (`order`, `orders`, `details`).
+ */
+function sendOrdersReply(res, body) {
+    const status =
+        typeof body.status === 'number' ? body.status : body.ok === false ? 500 : 200;
+    const { status: _status, ...rest } = body;
+
+    res.status(status).json(rest);
+}
+
+/** Общая обёртка маршрутов заказов: таймаут и обрыв NATS — это 503. */
+async function proxyOrders(res, payload, label) {
+    try {
+        sendOrdersReply(res, await requestOrders(payload));
+    } catch (error) {
+        const timedOut =
+            error && (error.code === 'TIMEOUT' || /timeout/i.test(String(error.message)));
+        const status = error && error.status ? error.status : 503;
+
+        console.error(`❌ [Gateway] ${label}: ${error && error.message ? error.message : error}`);
+        res.status(status).json({
+            error: timedOut
+                ? 'Оркестратор не ответил на запрос заказов'
+                : 'Не удалось получить заказы из оркестратора',
+            details: error && error.message ? String(error.message) : String(error)
+        });
+    }
+}
+
+/** `GET /api/v1/orders` — список заказов (последние 200, новые сверху). */
+app.get('/api/v1/orders', async (req, res) => {
+    await proxyOrders(res, { action: 'list' }, 'список заказов');
+});
+
+/** `GET /api/v1/orders/:orderNum` — карточка заказа. */
+app.get('/api/v1/orders/:orderNum', async (req, res) => {
+    await proxyOrders(res, { action: 'get', orderNum: req.params.orderNum }, 'карточка заказа');
+});
+
+/** `POST /api/v1/orders` — создание заказа: тело — поля `NewOrder`. */
+app.post('/api/v1/orders', async (req, res) => {
+    await proxyOrders(res, { action: 'create', order: req.body }, 'создание заказа');
+});
+
+/**
+ * `POST /api/v1/orders/:orderNum/instances` — привязка экземпляра процесса к
+ * стороне заказа: `{ org: 'CUSTOMER' | 'SUPPLIER', instanceId }`.
+ */
+app.post('/api/v1/orders/:orderNum/instances', async (req, res) => {
+    const body = req.body || {};
+
+    await proxyOrders(
+        res,
+        {
+            action: 'attach',
+            orderNum: req.params.orderNum,
+            org: body.org,
+            instanceId: body.instanceId
+        },
+        'привязка экземпляра к заказу'
+    );
+});
+
+/**
  * Диагностика: проверка port-forward и базовое здоровье шлюза.
  * `curl -s localhost:8080/health`
  */
@@ -156,7 +255,8 @@ app.get('/health', (req, res) => {
         status: 'ok',
         nats_connected: Boolean(nc),
         jetstream: Boolean(js),
-        body_limit: JSON_BODY_LIMIT
+        body_limit: JSON_BODY_LIMIT,
+        orders_subject: ORDERS_SUBJECT
     });
 });
 
@@ -176,6 +276,26 @@ app.get('/', (req, res) => {
                 method: 'POST',
                 path: '/api/v1/process/instances/:id/events',
                 description: 'Публикация события процесса в NATS (mes.in.v1.event.erp.<event_name>)'
+            },
+            {
+                method: 'GET',
+                path: '/api/v1/orders',
+                description: 'Список заказов из БД движка (NATS request/reply mes.in.v1.api.orders)'
+            },
+            {
+                method: 'GET',
+                path: '/api/v1/orders/:orderNum',
+                description: 'Карточка заказа: предметные поля и текущие шаги обоих контуров'
+            },
+            {
+                method: 'POST',
+                path: '/api/v1/orders',
+                description: 'Создание заказа: тело — NewOrder (номенклатура, объём, жирность, упаковка, срок, контрагент)'
+            },
+            {
+                method: 'POST',
+                path: '/api/v1/orders/:orderNum/instances',
+                description: 'Привязка экземпляра процесса к стороне заказа: { org, instanceId }'
             },
             {
                 method: 'GET',
