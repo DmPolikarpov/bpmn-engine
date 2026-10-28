@@ -1,5 +1,7 @@
+mod auth;
 mod db;
 mod events;
+mod metrics;
 mod nats_client;
 mod orders;
 mod runtime;
@@ -61,6 +63,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
+    // 0.1. API проверки прав (M6): шлюз спрашивает движок перед публикацией
+    // события. Ответ синхронный, поэтому кабинет получает 403, а не «ничего не
+    // произошло». Рантайм проверяет те же роли ещё раз — прямой `nats pub`
+    // минует шлюз, но не движок.
+    let nats_auth = nats_adapter.clone();
+    let auth_stores = graph.stores();
+    let auth_legacy = pool.clone();
+    tokio::spawn(async move {
+        if let Err(error) = nats_auth.serve_auth_api(auth_stores, auth_legacy).await {
+            eprintln!("❌ [Auth] API проверки прав остановлено: {error}");
+        }
+    });
+
+    // 0.2. API метрик (M7): инфографика запусков считается на сервере.
+    //
+    // Раньше её собирал браузер по событиям текущего пользователя, поэтому у
+    // руководителя панель была пустой. Теперь источник — Postgres, и два
+    // браузера (или F5) видят одни и те же цифры.
+    let metrics_store = Arc::new(metrics::PgMetricsStore::new(pool.clone()));
+    let nats_metrics = nats_adapter.clone();
+    tokio::spawn(async move {
+        if let Err(error) = nats_metrics.serve_metrics_api(metrics_store).await {
+            eprintln!("❌ [Metrics] API метрик остановлено: {error}");
+        }
+    });
+
     // 1. Фоновый воркер SLA / таймаутов
     tokio::spawn(async move {
         let interval_secs = env::var("SLA_CHECK_INTERVAL_SECS")
@@ -105,20 +133,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 "❌ [SLA Worker] Ошибка отправки компенсационной команды: {}",
                                 e
                             );
+                        } else if let Err(e) =
+                            db::save_token_state(&pool_sla, &inst_id, &elem_id, "TIMED_OUT").await
+                        {
+                            eprintln!(
+                                "❌ [SLA Worker] Ошибка БД при обновлении статуса токена: {}",
+                                e
+                            );
                         } else {
-                            if let Err(e) =
-                                db::save_token_state(&pool_sla, &inst_id, &elem_id, "TIMED_OUT")
-                                    .await
-                            {
-                                eprintln!(
-                                    "❌ [SLA Worker] Ошибка БД при обновлении статуса токена: {}",
-                                    e
-                                );
-                            } else {
-                                let _ = nats_sla
-                                    .publish_token_event(&inst_id, &elem_id, "TIMED_OUT", None)
-                                    .await;
-                            }
+                            let _ = nats_sla
+                                .publish_token_event(&inst_id, &elem_id, "TIMED_OUT", None)
+                                .await;
                         }
                     }
                 }

@@ -120,3 +120,34 @@ pub async fn instance_exists(pool: &PgPool, instance_id: &str) -> Result<bool, s
         .await?;
     Ok(row.is_some())
 }
+
+/// Запись аудита шага в `execution_history` (M6).
+///
+/// `event_type` — `USER_TASK_COMPLETED` или `USER_TASK_DENIED`; `actor` —
+/// заявленная роль сессии (`None` — событие без роли: воркер, E2E-скрипт).
+/// Таблица остаётся legacy-аудитом (вендорный `history_event` пишет движок),
+/// но именно её читает кабинет и будущий API метрик (M7).
+pub async fn record_step(
+    pool: &PgPool,
+    instance_id: &str,
+    event_type: &str,
+    element_id: &str,
+    actor: Option<&str>,
+    payload: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO execution_history (instance_id, event_type, element_id, actor, payload)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(instance_id)
+    .bind(event_type)
+    .bind(element_id)
+    .bind(actor)
+    .bind(payload)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}

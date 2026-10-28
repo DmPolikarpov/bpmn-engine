@@ -10,6 +10,14 @@ pub struct InboundEvent {
     pub element_id: String,
     #[serde(default)]
     pub payload: Value,
+    /// Роль сессии, от имени которой пришло событие (M6).
+    ///
+    /// Необязательна: `nats pub` воркеров, E2E-скрипты и старые клиенты шлют
+    /// событие без неё, и движок тогда не проверяет роль (см.
+    /// `runtime/roles.rs`). Кабинет заполняет её всегда — заголовком
+    /// `X-Actor-Role` через HTTP-шлюз.
+    #[serde(default)]
+    pub actor: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -68,6 +68,107 @@ impl NatsAdapter {
         Ok(())
     }
 
+    /// NATS-API серверных метрик (M7): кабинет видит инфографику запусков,
+    /// которую посчитал движок, а не браузер конкретного пользователя.
+    ///
+    /// Очередь [`crate::metrics::API_QUEUE`] — по той же причине, что и у
+    /// заказов: у реплик общий Postgres, отвечать должна одна.
+    pub async fn serve_metrics_api(
+        &self,
+        store: Arc<crate::metrics::PgMetricsStore>,
+    ) -> Result<(), async_nats::Error> {
+        let mut subscriber = self
+            .client
+            .queue_subscribe(
+                crate::metrics::API_SUBJECT,
+                crate::metrics::API_QUEUE.to_string(),
+            )
+            .await?;
+        println!(
+            "📊 [Metrics] API метрик слушает {}",
+            crate::metrics::API_SUBJECT
+        );
+
+        while let Some(message) = subscriber.next().await {
+            let Some(reply) = message.reply.clone() else {
+                eprintln!("⚠️ [Metrics] запрос без reply-адреса: {}", message.subject);
+                continue;
+            };
+
+            let response = crate::metrics::handle_bytes(store.as_ref(), &message.payload).await;
+
+            match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    if let Err(error) = self.client.publish(reply, body.into()).await {
+                        eprintln!("❌ [Metrics] не удалось ответить на запрос: {error}");
+                    }
+                }
+                Err(error) => eprintln!("❌ [Metrics] сериализация ответа: {error}"),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// NATS-API проверки прав (M6): HTTP-шлюз спрашивает движок перед
+    /// публикацией события, чтобы вернуть кабинету `403` с причиной.
+    ///
+    /// Ошибка проверки — не ответ: шлюз получит таймаут и `503`. Молча
+    /// пропускать событие нельзя, иначе сбой БД открывал бы шаг любой роли.
+    pub async fn serve_auth_api(
+        &self,
+        stores: Arc<crate::runtime::store::GraphStores>,
+        legacy: sqlx::PgPool,
+    ) -> Result<(), async_nats::Error> {
+        let mut subscriber = self
+            .client
+            .queue_subscribe(crate::auth::API_SUBJECT, crate::auth::API_QUEUE.to_string())
+            .await?;
+        println!(
+            "🔐 [Auth] API проверки прав слушает {}",
+            crate::auth::API_SUBJECT
+        );
+
+        while let Some(message) = subscriber.next().await {
+            let Some(reply) = message.reply.clone() else {
+                eprintln!("⚠️ [Auth] запрос без reply-адреса: {}", message.subject);
+                continue;
+            };
+
+            let body = match serde_json::from_slice::<crate::auth::AuthRequest>(&message.payload) {
+                Ok(request) => {
+                    match crate::auth::decide(stores.as_ref(), &legacy, &request).await {
+                        Ok(reply_body) => serde_json::to_vec(&reply_body),
+                        Err(error) => {
+                            eprintln!("❌ [Auth] проверка не выполнена: {error:#}");
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("❌ [Auth] некорректный запрос проверки прав: {error}");
+                    serde_json::to_vec(&json!({
+                        "allowed": false,
+                        "reason": "Некорректный запрос проверки прав",
+                        "required": [],
+                        "elementId": "",
+                    }))
+                }
+            };
+
+            match body {
+                Ok(body) => {
+                    if let Err(error) = self.client.publish(reply, body.into()).await {
+                        eprintln!("❌ [Auth] не удалось ответить на запрос: {error}");
+                    }
+                }
+                Err(error) => eprintln!("❌ [Auth] сериализация ответа: {error}"),
+            }
+        }
+
+        Ok(())
+    }
+
     /// Публикация изменения статуса токена ВМЕСТЕ с полезной нагрузкой (payload)
     pub async fn publish_token_event(
         &self,

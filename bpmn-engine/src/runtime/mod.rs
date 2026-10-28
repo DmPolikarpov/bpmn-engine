@@ -11,6 +11,7 @@ pub mod mapper;
 pub mod messages;
 pub mod project;
 pub mod pump;
+pub mod roles;
 pub mod store;
 pub mod vars;
 
@@ -18,12 +19,14 @@ use bpm_engine::bpm_engine_bpmn::parse_and_compile;
 use bpm_engine::bpm_engine_core::{payloads, EngineEvent, InstanceState, TokenStatus};
 use bpm_engine::bpm_engine_runtime::BpmEngine;
 use bpm_engine::bpm_engine_storage::{ProcessDefinitionStore, ProcessInstanceStore};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::sync::Arc;
 
 use self::project::Projection;
 use self::pump::{ExternalTaskSpec, MessageCapture, Snapshot, Step, StepKind};
 use self::store::GraphStores;
+use crate::auth;
 use crate::db;
 use crate::events::{ActionRequiredEvent, ErpResponseEvent, InboundEvent, ServiceCommand};
 
@@ -140,7 +143,7 @@ fn env_secs(name: &str, default: u64) -> u64 {
 
 /// Рантайм графа: сторы движка, пумпа и проекция в legacy read-model.
 pub struct GraphRuntime {
-    stores: GraphStores,
+    stores: Arc<GraphStores>,
     engine: BpmEngine,
     /// Движок доставки сообщений (только `MessageCatchHandler`, M3).
     message_engine: BpmEngine,
@@ -155,7 +158,7 @@ impl GraphRuntime {
     ///
     /// Единственный режим исполнения: вызывается при старте движка.
     pub async fn new(database_url: &str, legacy: PgPool) -> anyhow::Result<Self> {
-        let stores = GraphStores::new(database_url)?;
+        let stores = Arc::new(GraphStores::new(database_url)?);
         stores.ensure_schema().await?;
         let messages = MessageCapture::default();
         Ok(Self {
@@ -166,6 +169,44 @@ impl GraphRuntime {
             legacy,
             retry: RetryPolicy::from_env(),
         })
+    }
+
+    /// Сторы движка для API проверки прав (M6): шлюзу нужен `bpmn_xml`
+    /// определения, а компилировать его ради ролей не требуется.
+    pub fn stores(&self) -> Arc<GraphStores> {
+        self.stores.clone()
+    }
+
+    /// Роли узла из задеплоенной схемы (`None` — схему прочитать не удалось).
+    ///
+    /// Схема читается из определения (`process_definition.bpmn_xml`), а не из
+    /// скомпилированного графа: вендорный компилятор роли не разбирает
+    /// (`bpmn:potentialOwner` ему не нужен). Один запрос на событие — та же
+    /// цена, что у `dispatch_messages` для сообщений.
+    async fn node_roles(&self, definition_id: &str, node_id: &str) -> Option<roles::Roles> {
+        let xml = match self.stores.load_xml(definition_id).await {
+            Ok(Some(xml)) => xml,
+            Ok(None) => {
+                eprintln!("⚠️ [Graph] definition_xml_missing definition={definition_id}");
+                return None;
+            }
+            Err(error) => {
+                eprintln!(
+                    "⚠️ [Graph] definition_xml_failed definition={definition_id} error={error:#}"
+                );
+                return None;
+            }
+        };
+
+        match roles::node_roles(&xml, node_id) {
+            Ok(required) => Some(required),
+            Err(error) => {
+                eprintln!(
+                    "⚠️ [Graph] roles_parse_failed definition={definition_id} element={node_id} error={error}"
+                );
+                None
+            }
+        }
     }
 
     /// Входящее событие клиента (`mes.in.v1.event.>`).
@@ -240,6 +281,9 @@ impl GraphRuntime {
         )
         .await?;
 
+        // Шаг, который закрывает это событие: нужен аудиту исполнителя (M6).
+        let mut completed: Option<Step> = None;
+
         let (engine_event, completes_step) = match before.as_ref() {
             None => {
                 if db::instance_exists(&self.legacy, instance_id).await? {
@@ -256,6 +300,35 @@ impl GraphRuntime {
                     );
                     return Ok(Outcome::default());
                 };
+
+                // Роль кнопки старта (M6): у старта нет `potentialOwner`,
+                // поэтому роль объявляет `act:userAction` самого `startEvent`.
+                // Событие без роли (воркер, E2E-скрипт) не проверяется — так же,
+                // как и завершение шага.
+                if auth::needs_role_check(event.actor.trim()) {
+                    if let Some(xml) = mapper::deploy_xml(event) {
+                        match roles::start_roles(xml) {
+                            Ok(required) => {
+                                let decision =
+                                    roles::decide_start(event.actor.trim(), process_id, &required);
+                                if !decision.allowed {
+                                    eprintln!(
+                                        "⛔ [Graph] auth_denied instance={} actor={} reason={}",
+                                        instance_id,
+                                        event.actor.trim(),
+                                        decision.reason
+                                    );
+                                    return Ok(Outcome::default());
+                                }
+                            }
+                            Err(error) => eprintln!(
+                                "⚠️ [Graph] roles_parse_failed instance={} error={}",
+                                instance_id, error
+                            ),
+                        }
+                    }
+                }
+
                 (
                     mapper::process_started(process_id, instance_id, &event.payload),
                     false,
@@ -278,6 +351,53 @@ impl GraphRuntime {
                     );
                     return Ok(Outcome::default());
                 };
+
+                // Роль исполнителя шага (M6): событие с чужой ролью не двигает
+                // граф. Событие без роли пропускается — так шлют воркеры и
+                // E2E-скрипты, и это же поведение было до M6.
+                let actor = event.actor.trim();
+                let definition_id = snapshot.definition.id.to_string();
+                let required = if auth::needs_role_check(actor) {
+                    self.node_roles(&definition_id, &step.element_id).await
+                } else {
+                    None
+                };
+
+                if let Some(required) = required {
+                    let decision = roles::decide(actor, &step.element_id, &required);
+                    if !decision.allowed {
+                        eprintln!(
+                            "⛔ [Graph] auth_denied instance={} element={} actor={} reason={}",
+                            instance_id, step.element_id, actor, decision.reason
+                        );
+                        record_actor(
+                            &self.legacy,
+                            instance_id,
+                            "USER_TASK_DENIED",
+                            &step.element_id,
+                            event,
+                            json!({
+                                "reason": decision.reason,
+                                "required": decision.required,
+                                "eventId": event_id,
+                            }),
+                        )
+                        .await;
+                        if !event_id.is_empty() {
+                            pump::mark_consumed(
+                                &self.legacy,
+                                event_id,
+                                instance_id,
+                                "InboundEvent",
+                            )
+                            .await?;
+                        }
+                        return Ok(Outcome::default());
+                    }
+                }
+
+                completed = Some(step.clone());
+
                 (
                     mapper::user_task_completed(instance_id, &step, &event.payload),
                     true,
@@ -293,6 +413,20 @@ impl GraphRuntime {
                 Some(&event.payload),
             )
             .await?;
+
+        // Аудит исполнителя (M6): пишется после проекции, потому что FK
+        // `execution_history.instance_id` требует строки экземпляра.
+        if let Some(step) = &completed {
+            record_actor(
+                &self.legacy,
+                instance_id,
+                "USER_TASK_COMPLETED",
+                &step.element_id,
+                event,
+                json!({ "eventId": event_id }),
+            )
+            .await;
+        }
 
         if completes_step
             && !event.element_id.trim().is_empty()
@@ -1091,6 +1225,30 @@ fn has_active_step(outcome: &Outcome, element_id: &str) -> bool {
         .steps
         .iter()
         .any(|step| step.state == "ACTIVE" && step.element_id == element_id)
+}
+
+/// Аудит исполнителя шага (M6).
+///
+/// Ошибка записи не отменяет уже применённое состояние: журнал вторичен по
+/// отношению к графу, поэтому здесь только лог.
+async fn record_actor(
+    pool: &PgPool,
+    instance_id: &str,
+    event_type: &str,
+    element_id: &str,
+    event: &InboundEvent,
+    payload: Value,
+) {
+    let actor = event.actor.trim();
+    let actor = if actor.is_empty() { None } else { Some(actor) };
+
+    if let Err(error) =
+        db::record_step(pool, instance_id, event_type, element_id, actor, &payload).await
+    {
+        eprintln!(
+            "⚠️ [Graph] audit_failed instance={instance_id} element={element_id} type={event_type}: {error}"
+        );
+    }
 }
 
 fn active_elements(outcome: &Outcome) -> Vec<&str> {

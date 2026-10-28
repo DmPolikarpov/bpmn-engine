@@ -10,8 +10,9 @@ COPY package*.json ./
 # Устанавливаем только production-зависимости
 RUN npm install --omit=dev
 
-# Копируем исходный код микросервиса
-COPY index.js ./
+# Копируем исходный код микросервиса. `filters.js` — чистые фильтры подписки
+# (M7), тесты в образ не нужны.
+COPY index.js filters.js ./
 
 # Переключаемся на непривилегированного пользователя node
 USER node

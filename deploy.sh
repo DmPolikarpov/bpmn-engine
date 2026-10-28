@@ -90,6 +90,22 @@ for manifest in *.yaml *.yml; do
     kubectl apply -f "${manifest}"
 done
 
+# 5b. Владение legacy-таблицами (M6).
+# initdb создаёт структуру от суперпользователя, а миграции движка выполняются
+# от bpmn_user. `ALTER TABLE execution_history ADD COLUMN actor` (0005) без
+# владения падает с SQLSTATE 42501, и движок уходит в CrashLoopBackOff.
+# На новом кластере владение передаёт init.sql; здесь — для уже развёрнутой БД.
+DB_POD="${DB_POD:-$(kubectl get pod -l cnpg.io/cluster=bpmn-db,cnpg.io/instanceRole=primary -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)}"
+if [ -n "${DB_POD}" ]; then
+    echo "[5b/8] Ensuring schema ownership for migrations (${DB_POD})..."
+    kubectl exec -i "${DB_POD}" -c postgres -- \
+        psql -U postgres -d bpmn_db -v ON_ERROR_STOP=1 -q \
+        -c "ALTER TABLE IF EXISTS execution_history OWNER TO bpmn_user;" \
+        || echo "WARN: не удалось передать владение execution_history — миграция 0005 может упасть"
+else
+    echo "[5b/8] WARN: primary pod bpmn-db не найден — владение execution_history не проверено"
+fi
+
 # 6. Специфичный деплой манифестов, лежащих во вложенных папках
 echo "[6/8] Deploying BPMN Engine Service..."
 kubectl apply -f ./bpmn-engine/deployment.yaml

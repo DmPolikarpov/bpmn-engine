@@ -44,6 +44,8 @@ data:
         event_type VARCHAR(64) NOT NULL,
         element_id VARCHAR(255),
         payload JSONB,
+        -- Роль сессии, завершившей шаг (M6): пусто у событий без роли.
+        actor TEXT,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -90,3 +92,15 @@ data:
     -- поэтому таблицы создаются от postgres. Выдаём права bpmn_user.
     GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO bpmn_user;
     GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO bpmn_user;
+
+    -- Владение таблицей аудита передаём приложению (M6).
+    --
+    -- GRANT даёт только DML: миграции движка (`_sqlx_migrations` принадлежит
+    -- bpmn_user) выполняются от прикладного пользователя, а `ALTER TABLE`
+    -- требует владения. Без этого первая же миграция к `execution_history`
+    -- (0005: колонка `actor`) валит старт движка:
+    -- `must be owner of table execution_history` (SQLSTATE 42501).
+    --
+    -- Правило для новых таблиц контура: если её структуру двигают миграции,
+    -- владельцем должен быть bpmn_user, а не superuser из initdb.
+    ALTER TABLE execution_history OWNER TO bpmn_user;

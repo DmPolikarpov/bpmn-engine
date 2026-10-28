@@ -120,10 +120,13 @@ Content-Type: application/json
 | `correlation_key` | да | Идемпотентность/трассировка (`event_id` в NATS) |
 | `element_id` | нет | **Ключ привязки блок↔сервис**: узел, который станет `ACTIVE` |
 | `output_data` | нет | Полезная нагрузка; `bpmn_xml` внутри сохраняет определение |
+| `actor` (или заголовок `X-Actor-Role`) | нет | Роль сессии для проверки прав (M6); пусто — событие не проверяется |
 
 Ответы: `202 {status: 'event_accepted', instance_id, subject}`, `400` — не прошла
-JSON-схема, `413` — тело больше `JSON_BODY_LIMIT` (по умолчанию `10mb`),
-`503` — шлюз не подключён к JetStream, `500` — публикация в NATS не удалась.
+JSON-схема, `403` — роль сессии не вправе двигать шаг (`{error, details}` с
+причиной), `413` — тело больше `JSON_BODY_LIMIT` (по умолчанию `10mb`),
+`503` — шлюз не подключён к JetStream или не дозвонился до проверки прав,
+`500` — публикация в NATS не удалась.
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/events \
@@ -149,6 +152,11 @@ curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/eve
 | `BPMN_EVENTS` | `mes.bpmn.v1.event.>` | движок (токены, завершение процесса) | WS-шлюз |
 | `WS_NOTIFICATIONS` | `mes.ws.v1.event.>` | (резерв) | — |
 
+Служебные `request/reply`-subject'ы (это не стримы, а прямой обмен с движком):
+`mes.in.v1.api.orders` — REST заказов (очередь `orders-api`, M4),
+`mes.in.v1.api.auth` — проверка прав на событие (очередь `auth-api`, M6),
+`mes.in.v1.api.metrics` — серверные метрики запусков (очередь `metrics-api`, M7).
+
 Стримы создаёт Job [`nats-init-streams-job.yaml`](nats-init-streams-job.yaml);
 если стрима нет — публикация падает, а шлюз отвечает `503`.
 
@@ -158,8 +166,12 @@ curl -X POST http://localhost:8080/api/v1/process/instances/inst-cust-abc123/eve
 
 ```json
 { "event_id": "corr-abc123", "instance_id": "inst-cust-abc123",
-  "element_id": "StartEvent_Customer", "payload": { "orderNum": "№101" } }
+  "element_id": "StartEvent_Customer", "payload": { "orderNum": "№101" },
+  "actor": "CLIENT" }
 ```
+
+`actor` необязателен: без него событие (воркер, `nats pub`, E2E-скрипт) проходит
+без проверки прав — см. [«Проверка прав на событие»](#проверка-прав-на-событие-m6).
 
 **Изменение токена (WS-клиентам)**, публикует движок в `mes.bpmn.v1.event.<instance_id>`:
 
@@ -350,7 +362,7 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 | Метод клиента | HTTP | Что делает |
 | --- | --- | --- |
 | `ordersClient.listOrders()` | `GET /api/v1/orders` | список последних заказов при входе в кабинет |
-| `ordersClient.getOrder(orderNum)` | `GET /api/v1/orders/:orderNum` | карточка: предметные поля и текущие шаги обоих контуров |
+| `ordersClient.getOrder(orderNum)` | `GET /api/v1/orders/:orderNum` | карточка: предметные поля и текущие шаги всех трёх контуров |
 | `ordersClient.createOrder(payload)` | `POST /api/v1/orders` | заказ **до** `startProcess`: движку нужно, к чему привязать экземпляр |
 | `ordersClient.attachInstance(orderNum, org, instanceId)` | `POST /api/v1/orders/:orderNum/instances` | какой экземпляр относится к стороне заказа |
 
@@ -434,10 +446,103 @@ BPMN 2.0 `bpmn:potentialOwner` (свойство `Activity#resources`):
   `formalExpression`) читается, но при экспорте нормализуется моддлом в
   `bpmn:expression`, поэтому SDK пишет короткую форму с атрибутом `name`.
 
-Роль — это **маршрутизация в интерфейсе, а не авторизация**: движок её не читает
-(проверено на живом движке — процесс со ролями проходит маршрут целиком), а
-WS-шлюз вещает токены всем клиентам. Подробности —
-[«Известные ограничения»](#известные-ограничения).
+Роль — **и маршрутизация в интерфейсе, и авторизация на сервере**: с M6 движок
+сверяет роль сессии с `bpmn:potentialOwner` узла, а шлюз отвечает `403`, если
+роль чужая (см. [«Проверка прав на событие»](#проверка-прав-на-событие-m6)).
+WS-шлюз при этом по-прежнему вещает токены всем клиентам — фильтрация
+подписок на экземпляры остаётся открытой частью M6
+([«Известные ограничения»](#известные-ограничения)).
+
+### Проверка прав на событие (M6)
+
+Раньше шаг можно было провести прямым `sendEvent` мимо роли: движок исполнял
+маршрут по графу и не смотрел, кто нажал кнопку. Теперь роль проверяется дважды
+— в шлюзе (синхронно, чтобы кабинет увидел причину) и в движке (страховка от
+`nats pub` мимо шлюза).
+
+| Слой | Что делает | Где |
+| --- | --- | --- |
+| клиент | шлёт роль сессии заголовком `X-Actor-Role` и полем `actor` | [`httpClient.js`](erp-simulator/src/bpmn-sdk/client/httpClient.js) |
+| HTTP-шлюз | до публикации спрашивает движок (`nc.request`), при отказе — `403` с текстом | [`http-cluster/index.js`](bpmn-gateways/http-cluster/index.js) |
+| движок | отвечает на `mes.in.v1.api.auth` и **повторно** проверяет роль в `handle_inbound` | [`src/auth.rs`](bpmn-engine/src/auth.rs), [`src/runtime/mod.rs`](bpmn-engine/src/runtime/mod.rs) |
+| движок | разбирает роли схемы: `bpmn:potentialOwner/@name`, `act:userAction/@role` | [`src/runtime/roles.rs`](bpmn-engine/src/runtime/roles.rs) |
+| движок | пишет аудит шага: `execution_history.event_type` / `actor` | [`src/db.rs`](bpmn-engine/src/db.rs), миграция `0005` |
+
+Откуда берётся узел:
+
+- **старт** — из `bpmn_xml` самого события (роль кнопки старта лежит в
+  `act:userAction`, потому что у `bpmn:startEvent` нет `resourceRole`);
+- **завершение шага** — из ожидающего токена экземпляра: `potentialOwner`
+  задачи, а если его нет — роль её кнопки.
+
+Ответ шлюза при отказе:
+
+```http
+POST /api/v1/process/instances/inst-cust-102/events
+X-Actor-Role: WAREHOUSE
+
+403 Forbidden
+{
+  "error": "Роль WAREHOUSE не может завершить шаг Task_ReceiveOrder: нужна роль SALES.",
+  "details": { "actor": "WAREHOUSE", "required": ["SALES"], "elementId": "Task_ReceiveOrder" }
+}
+```
+
+Кабинет показывает эту причину вместо общего «попробуйте ещё раз»:
+`httpClient` кладёт текст `error` из тела ответа в `details` результата
+`sendEvent`, а [`App.jsx`](erp-simulator/src/App.jsx) берёт его в
+`eventFailure`.
+
+Живой прогон контура (кабинет → шлюз → NATS → движок → Postgres) —
+[`tests/roles-auth.e2e.cjs`](tests/roles-auth.e2e.cjs). Скрипт сам поднимает схему
+с кнопкой `SALES` (`act:userAction/@role` + `bpmn:potentialOwner`), открывает
+`kubectl port-forward` и сверяет `tokens`/`execution_history`:
+
+| Сценарий | Ожидание |
+| --- | --- |
+| старт чужой ролью | `403` с причиной и `details.required`, экземпляр не создан |
+| шаг чужой ролью через шлюз | `403`, событие не опубликовано, токен на месте |
+| шаг чужой ролью в обход шлюза | токен на месте, `USER_TASK_DENIED` с `actor` |
+| шаг своей ролью / без роли | `202`, токен `COMPLETED`, `actor` = `SALES` / `NULL` |
+
+```bash
+node tests/roles-auth.e2e.cjs   # 28 проверок; GATEWAY_URL — если шлюз уже доступен
+```
+
+Оба живых набора (заказы M4 и роли M6) идут одной командой — она ничего не
+собирает и рассчитана на уже развёрнутый кластер:
+`tests/run-live-e2e.sh` (или `tests/run-live-e2e.sh roles` / `orders` — по одному).
+В Windows, где `bash` оказывается WSL без Node, наборы запускаются напрямую
+(`node tests/roles-auth.e2e.cjs`) или через переменную `NODE_BIN` с путём к `node.exe`.
+
+К ним добавлены живые наборы M7 — контракт метрик и фильтрация WS-подписки:
+
+```bash
+node tests/metrics-api.e2e.cjs   # 37 проверок: сид legacy-таблиц → GET /api/v1/metrics
+node tests/ws-filter.e2e.cjs     # 12 проверок: три WS-клиента, события через NATS из пода
+```
+
+Событие «в обход шлюза» публикует [`tests/nats-publish.cjs`](tests/nats-publish.cjs):
+E2E копирует хелпер в под шлюза (только там есть зависимость `nats`) и пишет в
+JetStream напрямую. Иначе страховку рантайма не увидеть — шлюз отсекает чужую
+роль ещё до публикации, и записи `USER_TASK_DENIED` в аудите не появляется.
+
+Границы M6:
+
+- **роль заявленная, а не удостоверенная**: IdP в демо нет, `X-Actor-Role` —
+  такой же вход, как выбор роли на экране входа. Проверка отвечает на вопрос
+  «можно ли этой роли», а не «кто ты»;
+- **событие без роли не проверяется**: так шлют NATS-воркеры, `nats pub` и
+  E2E-скрипты (`tests/*.e2e.cjs`), и это же поведение было до M6. Кабинет роль
+  заполняет всегда, поэтому из интерфейса мимо проверки шаг не провести;
+- **узел без роли — общая очередь**: схема без `potentialOwner` и кнопок с
+  ролью отыгрывается любой сессией (как и до M6);
+- `role:catalog` в проверке не участвует: это титулы для интерфейса, а не права.
+
+Настройки: `AUTH_API_SUBJECT` (по умолчанию `mes.in.v1.api.auth`) и
+`AUTH_TIMEOUT_MS` (3000) — у HTTP-шлюза; subject и очередь `auth-api` заданы в
+[`src/auth.rs`](bpmn-engine/src/auth.rs). Сбой проверки — `503`, а не «пропустить»:
+иначе недоступный движок открывал бы шаг любой роли.
 
 Роли узлов в демо-схемах (`DEFAULT_CUSTOMER_BPMN_XML` / `DEFAULT_SUPPLIER_BPMN_XML`):
 
@@ -624,7 +729,7 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
 
 ## Межпроцессные сообщения (M3)
 
-Два процесса общаются сообщениями BPMN 2.0, а не вызовами кабинета:
+Процессы общаются сообщениями BPMN 2.0, а не вызовами кабинета:
 
 ```xml
 <bpmn:definitions ... xmlns:trg="http://erp.mes/schema/bpmn/trigger">
@@ -672,12 +777,28 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
 - `startsProcess` и `counterpartEvent` в кнопках остались для **старых схем**:
   если они объявлены, кабинет работает по-прежнему.
 
+Третий пул «Молочного завода» (клиент, M5) говорит с заводом теми же тремя шагами:
+
+| Направление | Узел | Сообщение | Что делает движок |
+| --- | --- | --- | --- |
+| клиент → завод (MF1) | `Event_SendOrder` | `ClientOrder` | триггер создаёт `Process_Dairy` (`inst-cust-<orderNum>`), вход в `Task_ReceiveOrder` |
+| завод → клиент (MF2) | `Event_ConfirmOrder` после `Task_ProcessOrder` | `OrderConfirmed` | будит `Event_OrderConfirmed` клиента; на маршрут завода не влияет — токен идёт дальше в `Task_CheckStock` |
+| завод → клиент (MF6) | `Event_ShipGoods` после `Task_Ship` | `GoodsShipped` | будит `Event_GoodsShipped`; клиент переходит к приёмке по УПД |
+
+Заказ клиента приходит в завод **до** проверки остатков: подтверждение объёма и
+срока не зависит от того, хватает ли готовой продукции, поэтому ветка закупки
+сырья остаётся нетронутой. Схема завода должна быть задеплоена до подтверждения —
+иначе триггеру некуда создать экземпляр (`message_target_not_deployed` в логе
+движка).
+
 Проверки: [`runtime/messages.rs`](bpmn-engine/src/runtime/messages.rs) (разбор
 триггера и связей, payload, корреляция),
 `vendor_patches.rs::message_delivery_respects_correlation` (чужой заказ не
 получает сообщение), [`dairyPlant.test.js`](erp-simulator/src/bpmn-sdk/defaults/dairyPlant.test.js)
 (схема), [`projectXml.test.js`](erp-simulator/src/bpmn-sdk/xml/projectXml.test.js)
-(`bpmn:message` переживает нарезку процесса).
+(`bpmn:message` переживает нарезку процесса),
+[`App.test.js`](erp-simulator/src/App.test.js) (ответы завода двигают шаг клиента
+до приёмки, кнопка приёмки закрывает заказ на `End_Client`).
 
 Ограничения M3:
 
@@ -806,7 +927,7 @@ API SDK: `listActions`, `getElementActions`, `getElementAction`,
   процесса);
 - **деплой сохраняет проект тоже**, иначе после F5 кабинет показывал бы схему,
   которой в кластере уже нет;
-- **«Демо-схема» меняет только процесс своего контура**: второй остаётся в
+- **«Демо-схема» меняет только процесс своего контура**: остальные остаются в
   проекте, иначе сброс одной стороны ломал бы связи `startsProcess`/
   `counterpartEvent` другой;
 - **подпись в панели схемы** говорит, что происходит: «✅ Сохранено в 12:34:56»
@@ -829,13 +950,19 @@ API SDK: `listActions`, `getElementActions`, `getElementAction`,
 Кабинет руководителя показывает инфографику по процессам
 ([`MetricsPanel.jsx`](erp-simulator/src/MetricsPanel.jsx)): сколько запусков
 завершено, среднее/минимальное/максимальное время выполнения и столбики
-последних запусков. Пока измеряется одно — **время выполнения**: от старта
-экземпляра до токена на конечном узле.
+последних запусков. Основной источник — **серверные метрики**
+(`GET /api/v1/metrics`, см. [«Серверные метрики»](#серверные-метрики-m7)): их
+считает движок по Postgres, поэтому панель не пуста у второго клиента и не
+меняется после F5. Метрика браузера
+([`erp-simulator/src/metricsStore.js`](erp-simulator/src/metricsStore.js))
+осталась запасным источником: пока API не ответил (или шлюз недоступен), панель
+показывает её, а подпись в шапке говорит, откуда цифры.
 
 Отдельного события «процесс завершён» движок не публикует: токен просто встаёт
 на `bpmn:endEvent` и остаётся `ACTIVE`. Поэтому финиш определяет клиент по схеме
-(у конечного узла нет исходящих связей — `getOutgoingTargetIds`), а саму метрику
-хранит в браузере ([`erp-simulator/src/metricsStore.js`](erp-simulator/src/metricsStore.js),
+(у конечного узла нет исходящих связей — `getOutgoingTargetIds`), а метрику этого
+браузера хранит в `localStorage`
+([`erp-simulator/src/metricsStore.js`](erp-simulator/src/metricsStore.js),
 ключ `bpmn-process-metrics`):
 
 | Что | Функция | Когда вызывается |
@@ -843,13 +970,15 @@ API SDK: `listActions`, `getElementActions`, `getElementAction`,
 | Старт | `beginRun({id, org, processId, processName, orderNumber})` | `startProcess` в [`App.jsx`](erp-simulator/src/App.jsx) — экземпляр создан |
 | Финиш | `completeRun(instanceId, {finishedAt, lastElementId, orderNumber})` | токен `ACTIVE` встал на конечный узел схемы контура |
 | Чтение | `loadRuns()` | при монтировании кабинета и после каждой записи |
-| Забыть | `clearRuns()` | кнопка «Очистить» в панели инфографики |
+| Забыть | `clearRuns()` | кнопка «Очистить» в панели инфографики (режим метрик браузера) |
 
 Детали:
 
-- **метрика локальная и на браузер**, как и кэш схемы: её видит тот клиент,
-  который запускал процессы (журнал `execution_history` в кластере она не
-  заменяет);
+- **метрика браузера — запасной источник и мгновенный отклик**: её видит тот
+  клиент, который запускал процессы; основной источник — серверный API (M7), а
+  эта копия нужна, когда шлюз недоступен, и чтобы столбик появлялся сразу после
+  финиша, не дожидаясь ответа NATS; журнал `execution_history` в кластере она не
+  заменяет;
 - **финиш определяет схема контура**, а не движок: `org` берётся из префикса
   экземпляра (`inst-cust-*` / `inst-supp-*`), конечный узел — из текущей схемы
   этой стороны. Правка схемы (например, переименование `endEvent`) сразу меняет
@@ -871,10 +1000,134 @@ API SDK: `listActions`, `getElementActions`, `getElementAction`,
 
 Проверки: [`metricsStore.test.js`](erp-simulator/src/metricsStore.test.js)
 (старт/финиш, идемпотентность, кривые часы, отказы хранилища, агрегаты),
+[`metricsApi.test.js`](erp-simulator/src/metricsApi.test.js) (строка запроса,
+разбор ответа движка в записи панели, кэш ответа, отказы шлюза),
 [`MetricsPanel.test.jsx`](erp-simulator/src/MetricsPanel.test.jsx) (карточки
-процессов, плитки времени, столбики) и
+процессов, плитки времени и серверные разрезы, столбики, подпись источника) и
 [`App.test.js`](erp-simulator/src/App.test.js) (метрика переживает смену
-пользователя, промежуточный узел финишем не считается).
+пользователя, промежуточный узел финишем не считается, панель берёт цифры
+сервера и кэш после F5).
+
+### Серверные метрики (M7)
+
+`GET /api/v1/metrics` — те же цифры, но посчитанные движком по Postgres, а не
+браузером: у руководителя панель больше не пуста, а F5 и второй браузер видят
+одно и то же.
+
+```bash
+curl -s 'http://localhost:8080/api/v1/metrics?limit=5&slaMinutes=30'
+curl -s 'http://localhost:8080/api/v1/metrics?processId=zakaz&defectNodes=End_Defect'
+```
+
+Шлюз перекладывает запрос в NATS (`mes.in.v1.api.metrics`), отвечает движок
+([`metrics.rs`](bpmn-engine/src/metrics.rs)). Параметры необязательны:
+
+| Параметр | По умолчанию | Смысл |
+| --- | --- | --- |
+| `processId` | все процессы | разрез по `def_key` определения (завод / поставщик / клиент) |
+| `limit` | `20` (максимум `50`) | сколько последних запусков вернуть |
+| `slaMinutes` | `SLA_TIMEOUT_MINUTES` (`30`) | порог ожидания шага; больше `1440` не бывает |
+| `defectNodes` | env `METRICS_DEFECT_END_EVENTS` → эвристика по имени `endEvent` | какие конечные узлы считать браком |
+
+Ответ (сокращён):
+
+```json
+{ "ok": true, "generatedAt": "2026-10-26T11:00:00.000Z",
+  "slaMinutes": 30, "precisionMs": 1000, "defectEndEvents": ["End_Defect"],
+  "totals": { "instances": 12, "runs": 12, "steps": 34, "openSteps": 2 },
+  "processes": [{ "processId": "zakaz", "processName": "Заказ молока",
+                  "runs": 12, "completed": 9, "active": 3, "terminated": 0,
+                  "averageCycleMs": 540000, "medianCycleMs": 480000,
+                  "averageStepMs": 61000, "slaRuns": 1, "slaSteps": 2,
+                  "defectRuns": 1, "defectShare": 0.111,
+                  "outcomes": [{ "nodeId": "End_Ok", "runs": 8 }],
+                  "lastRuns": [{ "instanceId": "inst-cust-1", "status": "COMPLETED",
+                                 "finishedBy": "graph", "slaBreached": false }] }],
+  "steps": [{ "elementId": "Task_Accept", "role": "operator", "samples": 9, "averageMs": 61000 }],
+  "roles": [{ "role": "operator", "steps": 9, "averageMs": 61000 }],
+  "warnings": [] }
+```
+
+Откуда берутся цифры:
+
+- **запуск** — legacy-проекция `process_instances`; **шаг** — активация
+  `tokens.created_at` и завершение `execution_history.created_at` (миллисекунды),
+  а если пары нет — `TokenArrived`/`TokenCompleted` вендорной истории (секунды,
+  отсюда `precisionMs: 1000`);
+- **финиш** — `ProcessCompleted`/`ProcessTerminated`, иначе последний узел
+  сверяется с `endEvent` **определения** (`bpmn_xml`), а не с «узлом без
+  исходящих связей схемы»; видно источник в `finishedBy` (`event` / `graph` /
+  `legacy`);
+- **роль шага** — `execution_history.actor` (M6), откуда разрезы `steps` и
+  `roles`;
+- **брак** — запуски, закончившиеся на узле брака (`defectEndEvents` показывает,
+  какие узлы приняты за брак: цифра не «магическая»);
+- **SLA** — шаг (включая ещё открытый) ждал дольше `slaMinutes`;
+  `breachedSteps` перечисляет, **что** именно ждало, — видно без консоли.
+
+Контракт проверяется без Postgres: `aggregate` — чистая функция над снимком
+таблиц, 11 юнит-тестов в [`metrics.rs`](bpmn-engine/src/metrics.rs)
+(`cargo test --bin bpmn-engine metrics::`). Живой прогон всего пути (шлюз → NATS →
+движок → Postgres) — [`tests/metrics-api.e2e.cjs`](tests/metrics-api.e2e.cjs),
+37 проверок на развёрнутом кластере.
+
+**Панель руководителя читает этот API** (M7):
+[`erp-simulator/src/metricsApi.js`](erp-simulator/src/metricsApi.js) —
+`metricsClient.load({limit, slaMinutes})` → `toPanelRuns` (ответ движка
+перекладывается в записи запусков панели) → `MetricsPanel`. Числа поэтому
+одинаковы у двух браузеров и после F5, а не только по `curl`. Ответ кэшируется в
+`localStorage` (`bpmn-process-metrics-cache`): после перезагрузки панель
+рисуется сразу, подпись в шапке честно говорит, откуда цифры — `с сервера`,
+`кэш сервера` или `этот браузер` (локальный запасной источник). Кнопка
+«Обновить» перечитывает API; кнопки «Очистить» в режиме сервера нет — цифры
+принадлежат Postgres, а не браузеру. Плитки «Ожидание шага», `SLA`
+(`slaRuns / slaSteps`) и «Брак» — разрезы движка, поэтому превышение SLA видно
+без консоли. Данные браузера держатся отдельно (`bpmn-process-metrics`) и
+подмешиваются только когда API не ответил ни разу.
+
+### Фильтрация WS-подписки (M7)
+
+WS-шлюз вещает `mes.bpmn.v1.event.>` и умеет отсекать чужие экземпляры **до**
+отправки. Клиент объявляет фильтры либо в адресе, либо сообщением:
+
+```js
+// в адресе: ws://localhost:8081/ws/status?instanceId=inst-cust-1&role=OPERATOR
+const socket = new StatusSocket('ws://localhost:8081/ws/status');
+socket.connect();
+socket.subscribe({ instanceIds: ['inst-cust-1'], role: 'OPERATOR' });
+// → {"type":"subscribe","instanceIds":["inst-cust-1"],"role":"OPERATOR"}
+// ← {"type":"subscribed","instanceIds":["inst-cust-1"],"role":"OPERATOR"}
+socket.unsubscribe(); // снова все экземпляры
+```
+
+Правила:
+
+- **ничего не объявлено — приходит всё** (поведение до M7: старые вкладки и
+  демо не ломаются);
+- `instanceIds` — событие проходит, если id экземпляра (поле сообщения,
+  `payload.instance_id` или суффикс subject) есть в списке;
+- `role` — отсекаются только события с **объявленной** чужой ролью
+  (`role`/`roles`/`actor` в сообщении или `payload`); `token_updated` роли не
+  несёт, поэтому фильтр по роли — задел под события с ролью, а не текущий
+  ограничитель;
+- фильтры восстанавливаются после переконнекта (`StatusSocket.subscribe`
+  запоминает их и повторяет при `open`);
+- кабинет по умолчанию подписан на все экземпляры: он **обнаруживает** новые
+  экземпляры по событиям (движок создаёт их сам, например завод по
+  `processTrigger`), и сужение списка сломало бы это.
+
+Проверки: `npm test` в
+[`bpmn-gateways/websocket-cluster`](bpmn-gateways/websocket-cluster/filters.test.js)
+(фильтры — 8 тестов на `node --test`),
+[`wsClient.test.js`](erp-simulator/src/bpmn-sdk/client/wsClient.test.js)
+(объявление фильтров, повтор после реконнекта) и живой
+[`tests/ws-filter.e2e.cjs`](tests/ws-filter.e2e.cjs) — 12 проверок на кластере:
+три WS-клиента (query-фильтр, `subscribe` сообщением, без фильтров), события
+публикуются в NATS из пода шлюза.
+
+`filters.js` — отдельный модуль, поэтому он копируется в образ явно
+(`COPY index.js filters.js ./` в Dockerfile шлюза). Пропущенный `COPY` виден
+сразу: под падает в `CrashLoopBackOff` с `Cannot find module './filters'`.
 
 ## Как привязать новый блок к сервису
 
@@ -1143,6 +1396,11 @@ kubectl logs deploy/websocket-cluster-deployment -f
 | Симптом | Причина | Что делать |
 | --- | --- | --- |
 | `400 Validation Failed` | нет `event_name`/`correlation_key` | дописать поля (см. схему в ответе — шлюз возвращает `expected_schema`) |
+| `403` «Роль … не может завершить шаг …» | роль сессии не совпала с `bpmn:potentialOwner` (или ролью кнопки в `act:userAction`) | войти ролью, которой назначен шаг; кто и когда двигал шаг — `SELECT created_at, event_type, element_id, actor FROM execution_history ORDER BY id DESC` |
+| `503` «Проверка прав недоступна» | движок не ответил на `mes.in.v1.api.auth` (нет подписки `auth-api` или таймаут) | логи `bpmn-engine` с префиксом `[Auth]`; проверить `NATS_URL` и что движок жив |
+| `CrashLoopBackOff` движка, в логе `must be owner of table execution_history` (SQLSTATE 42501) | `execution_history` создал initdb от `postgres`, а миграции идут от `bpmn_user`: `ALTER TABLE` требует владения, `GRANT` даёт только DML | `./deploy.sh` (шаг 5b передаёт владение) или разово: `kubectl exec -i bpmn-db-1 -c postgres -- psql -U postgres -d bpmn_db -c 'ALTER TABLE execution_history OWNER TO bpmn_user;'`, затем `kubectl rollout restart deployment/bpmn-engine-deployment` |
+| Шаг двигается любой ролью, `403` не приходит | образ `http-cluster` старше M6: в `/health` нет `auth_subject`, роль не проверяется до публикации | пересобрать шлюз (`./deploy.sh` целиком) или вручную: `docker build -t http-cluster-service:latest ./bpmn-gateways/http-cluster && kind load docker-image http-cluster-service:latest --name erp && kubectl rollout restart deployment/http-cluster-deployment` |
+
 | `413 request entity too large` | `bpmn_xml` больше лимита | поднять `JSON_BODY_LIMIT` у http-cluster |
 | `503` «JetStream is not connected» | нет стрима `INBOUND_EVENTS` или NATS недоступен | `kubectl apply -f nats-init-streams-job.yaml`, проверить `nats stream ls` |
 | `500` / «Ошибка сети» в UI | нет проброса портов (CRA-прокси не может достучаться до 8080) | `./translate_ports.sh` (перезапускает `kubectl port-forward`) |
@@ -1172,8 +1430,34 @@ cd erp-simulator && npm install && npm start
 cd erp-simulator && npm run test:ci    # Jest: App + SDK (в т.ч. привязки sendEvent)
 cd erp-simulator && npm run sdk:refresh # пересборка вендорного бандла SDK (src/vendor)
 ./run-test.sh                          # E2E в кластере: tests/test_workflow.py в Job
+./tests/run-live-e2e.sh                # живые E2E M4+M6+M7 (заказы, роли, метрики, WS-фильтры)
 ./test_all.sh                          # cargo test + пересборка движка + NATS-сценарии ошибок/SLA
 ```
+
+Миграции и владение таблицами проверяются **без чистого кластера** — на временной БД
+того же пода: `init.sql` проигрывается от суперпользователя (как `postInitApplicationSQLRefs`
+в CNPG), затем `migrations/*.sql` — от `bpmn_user`:
+
+```bash
+DB_POD=bpmn-db-1   # pod примари, см. `kubectl get pod -l cnpg.io/instanceRole=primary`
+
+# 1. Временная БД: владелец — прикладной пользователь, как у bpmn_db
+kubectl exec -i $DB_POD -c postgres -- psql -U postgres -d postgres \
+  -c "CREATE DATABASE m6_init_check OWNER bpmn_user;"
+
+# 2. init.sql — блок `init.sql: |` из db-init-configmap.yaml без 4-пробельного отступа
+kubectl exec -i $DB_POD -c postgres -- psql -U postgres -d m6_init_check -v ON_ERROR_STOP=1 -f - < /tmp/init.sql
+
+# 3. Миграция от прикладного пользователя: тут и вылезает 42501, если таблица чужая
+kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password \
+  psql -h 127.0.0.1 -U bpmn_user -d m6_init_check -v ON_ERROR_STOP=1 -f - < bpmn-engine/migrations/0005_execution_history_actor.sql
+```
+
+Регресс-контроль того же сценария: убрать из `init.sql` строку
+`ALTER TABLE execution_history OWNER TO bpmn_user;` — шаг 3 обязан упасть с
+`must be owner of table execution_history` (SQLSTATE 42501). Так проверено, что
+исправление держится на передаче владения, а не на побочном эффекте. Временную БД
+убирает `DROP DATABASE m6_init_check WITH (FORCE);`.
 
 Переменные окружения, влияющие на привязки:
 
@@ -1185,9 +1469,16 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 | `SLA_TIMEOUT_MINUTES` | движок | `30` | после какого простоя токен уходит в `TIMED_OUT` + команда в `mes.out.v1.cmd.erp` |
 | `PORT` | шлюзы | `8080` | порт шлюза внутри пода |
 | `JSON_BODY_LIMIT` | http-cluster | `10mb` | лимит тела (BPMN-схема приезжает в `output_data.bpmn_xml`) |
+| `AUTH_API_SUBJECT` | http-cluster | `mes.in.v1.api.auth` | subject проверки прав (M6); должен совпадать с подпиской движка |
+| `AUTH_TIMEOUT_MS` | http-cluster | `3000` | сколько ждать ответ движка; таймаут — `503`, а не «пропустить» |
+| `METRICS_API_SUBJECT` | http-cluster | `mes.in.v1.api.metrics` | subject метрик (M7); должен совпадать с подпиской движка |
+| `METRICS_TIMEOUT_MS` | http-cluster | `5000` | сколько ждать ответ движка по метрикам; таймаут — `503` |
+| `METRICS_DEFECT_END_EVENTS` | движок | — | id конечных узлов «брак» через запятую; если пусто — по имени `endEvent` |
+| `BPMN_EVENTS_SUBJECT` | websocket-cluster | `mes.bpmn.v1.event.>` | что слушает WS-шлюз (фильтры — у подписчика) |
 | `CORS_ORIGIN` | http-cluster | `*` | источник(и) для браузера |
 | `REACT_APP_GATEWAY_URL` | клиент | `/api/v1/process/instances` | адрес HTTP-шлюза |
 | `REACT_APP_WS_URL` | клиент | `ws://localhost:8081/ws/status` | адрес WS-шлюза |
+| `REACT_APP_METRICS_API_URL` | клиент | `/api/v1/metrics` | адрес API метрик (M7); в dev — через CRA-прокси, в прод-сборке — адрес шлюза |
 
 ## Известные ограничения
 
@@ -1199,7 +1490,7 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
    [дорожной карты](erp-simulator/docs/dairy-plant-roadmap.md).
 2. **Проходные токены (`startEvent`, шлюзы) остаются в вендорной таблице
    `token`.** В `Waiting` они копятся и не проецируются в шаги кабинета;
-   уборка/GC — M5.
+   уборка/GC пока не сделана — таблица растёт вместе с числом прогонов.
 3. **`event_name` не участвует в маршрутизации** (движок его не читает), а
    литерал `erp` в subject HTTP-шлюза (`mes.in.v1.event.erp.<event_name>`)
    зашит в код шлюза.
@@ -1207,8 +1498,9 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
    с `retryable = true` уходит в `erp_retry` с экспоненциальным backoff, а
    исчерпание `camunda:retries` или `retryable = false` даёт
    `ActionRequiredEvent`; токен при этом остаётся на шаге. Компенсации
-   пройденных шагов (saga) и таймеры/эскалации — M6: SLA-воркер по-прежнему
-   смотрит legacy `tokens`, помечает `TIMED_OUT` и граф не двигает.
+   пройденных шагов (saga) и таймеры/эскалации не реализованы и в дорожную
+   карту не входят: SLA-воркер по-прежнему смотрит legacy `tokens`, помечает
+   `TIMED_OUT` и граф не двигает.
 5. **`migrations/` — пустой каталог:** в git пустые каталоги не хранятся, его
    создаёт `deploy.sh`. Каталог нужен макросу `sqlx::migrate!("./migrations")` на
    этапе сборки, а структура таблиц описана в [`schema.sql`](schema.sql) и
@@ -1222,20 +1514,25 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
    «в свойствах элемента» — только `id` узла плюс код клиента/движка
    (`bpmn-js-properties-panel` есть в зависимостях, но в `BpmnEditor` не
    добавляется через `additionalModules`).
-8. **WS-шлюз вещает всё без фильтрации** (`mes.bpmn.v1.event.>` → всем клиентам),
-   поэтому клиент сам отбрасывает служебные экземпляры (`inst-deploy-*`,
-   `inst-def-*`).
+8. **WS-шлюз отдаёт всё, пока клиент не объявил фильтры.** С M7 подписку можно
+   сузить до экземпляров и роли (`?instanceId=…&role=…` в адресе или
+   `{"type":"subscribe"}`; см. [«Фильтрация WS-подписки»](#фильтрация-ws-подписки-m7)).
+   Кабинет фильтры не объявляет намеренно: он **обнаруживает** новые
+   экземпляры по событиям (движок создаёт вторую сторону сам), поэтому
+   служебные `inst-deploy-*`/`inst-def-*` по-прежнему отбрасывает клиент.
 9. **SLA считает таймаут от `created_at`, а не от последней активации.** В
     `save_token_state` ветка `UPDATE` меняет только `state`, поэтому повторно
     активированный узел (цикл/возврат) может уйти в `TIMED_OUT` сразу после
     активации — если строке токена уже больше `SLA_TIMEOUT_MINUTES`.
-10. **Роль узла в схеме — маршрутизация UI, а не авторизация.** Движок
-    `bpmn:potentialOwner` не читает и не проверяет (проверено на живом движке:
-    маршрут процесса со ролями проходит целиком), WS-шлюз вещает токены всем
-    клиентам, а роли живут в копии схемы у каждой сессии: переназначение роли
-    руководителем не «приезжает» другим клиентам — им нужна та же схема
-    (деплой/перезагрузка). Браузерный кэш схемы («Сохранить схему») переживает
-    только F5 в том же браузере: соседнему пользователю схему он не передаёт.
+10. **Роль узла — авторизация на сервере, но роль сессии не удостоверена.** С M6
+    движок разбирает `bpmn:potentialOwner`/`act:userAction/@role` и отклоняет
+    событие с чужой ролью (`403` от шлюза, аудит в `execution_history`), но
+    роль приходит **заявленным** заголовком `X-Actor-Role`: IdP в демо нет,
+    поэтому проверка отвечает на вопрос «можно ли этой роли», а не «кто ты».
+    Событие без роли (воркер, `nats pub`, E2E-скрипт) не проверяется, а узел
+    без роли — общая очередь. WS-шлюз вещает токены всем клиентам, а схемы
+    живут в копии у каждой сессии: переназначение роли руководителем не
+    «приезжает» другим клиентам — им нужна та же схема (деплой/перезагрузка).
     Роль нельзя задать событию или шлюзу: `resourceRole`
     по спецификации BPMN 2.0 есть только у Activity — SDK и редактор это
     блокируют вместо молчаливой потери элемента при сохранении.
@@ -1251,28 +1548,38 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
     нет каскада (сообщение стартовавшего экземпляра не разбирается в том же
     проходе), `firstElementId` должен совпадать со штатным первым шагом,
     payload — только скалярные переменные, `bpmn:messageFlow` используется как
-    диагностика (пара «источник → цель» берётся из триггера узла).
-13. **Метрики процессов считает клиент, а не движок.** Время выполнения хранится
-    в браузере (ключ `bpmn-process-metrics`) и видно только тому, кто запускал
-    процессы: другой клиент, очищенное хранилище или запуск не из UI оставят
-    инфографику пустой. Финишем считается токен на узле без исходящих связей по
-    текущей схеме контура, поэтому правка схемы меняет и метрику. Серверная
-    метрика (из `tokens.created_at`/`execution_history`) — следующий шаг: там же
-    появятся время по шагам, ожидание и SLA.
+    диагностика (пара «источник → цель» берётся из триггера узла). Триггер
+    срабатывает только по **задеплоенному** целевому процессу: `ClientOrder`
+    создаёт завод, если его схема уже в кластере, иначе в лог уходит
+    `message_target_not_deployed`.
+13. **Инфографика кабинета читает серверный API, а не локальную копию.** С M7
+    движок отдаёт метрики из Postgres (`GET /api/v1/metrics`, см.
+    [«Серверные метрики»](#серверные-метрики-m7)) с разрезами по шагам, ролям и
+    SLA, и панель руководителя берёт цифры оттуда: два браузера и F5 дают одно и
+    то же, а истёкший SLA виден в плитках `SLA`/`Ожидание шага`. Метрика браузера
+    (`bpmn-process-metrics`) осталась запасным источником, когда шлюз недоступен;
+    ответ сервера кэшируется (`bpmn-process-metrics-cache`), чтобы панель не
+    пустела. Ограничение осталось одно: номер заказа на карточке — локальный
+    (`orderNum` в payload), в ответе движка заказ не участвует, поэтому подписью
+    серверного столбика служит id экземпляра.
 
 ## Карта исходников
 
 | Файл | Отвечает за |
 | --- | --- |
 | [`bpmn-engine/src/main.rs`](bpmn-engine/src/main.rs) | Приём событий, SLA-воркер, ретраи; публикация `Outcome` и экземпляров второй стороны (`peers`, M3) |
-| [`bpmn-engine/src/runtime/mod.rs`](bpmn-engine/src/runtime/mod.rs) | `GraphRuntime`: деплой схемы, старт, завершение шага, ответ ERP, запуск второй стороны по триггеру и доставка сообщений |
+| [`bpmn-engine/src/runtime/mod.rs`](bpmn-engine/src/runtime/mod.rs) | `GraphRuntime`: деплой схемы, старт, завершение шага, ответ ERP, запуск второй стороны по триггеру и доставка сообщений; проверка роли на событии и аудит шага (M6) |
 | [`bpmn-engine/src/runtime/messages.rs`](bpmn-engine/src/runtime/messages.rs) | Разбор `trg:processTrigger` / `bpmn:messageFlow`, `payloadKeys`, корреляция по `orderNum` |
+| [`bpmn-engine/src/runtime/roles.rs`](bpmn-engine/src/runtime/roles.rs) | Роли узла из схемы (`bpmn:potentialOwner`, `act:userAction/@role`) и решение по событию (M6) |
+| [`bpmn-engine/src/auth.rs`](bpmn-engine/src/auth.rs) | NATS-API проверки прав `mes.in.v1.api.auth`: узел из ожидающего токена, ответ шлюзу (M6) |
+| [`bpmn-engine/src/metrics.rs`](bpmn-engine/src/metrics.rs) | NATS-API метрик `mes.in.v1.api.metrics` (M7): снимок таблиц, чистая агрегация (`aggregate`), цикл/шаги/роли/SLA/брак, финиш по `endEvent` определения |
 | [`bpmn-engine/src/runtime/pump.rs`](bpmn-engine/src/runtime/pump.rs) | Снимки движка, перехват `MessageSent`, движок доставки сообщений |
-| [`bpmn-engine/src/db.rs`](bpmn-engine/src/db.rs) | `process_definitions`, `process_instances`, `tokens` (id = `instance:element`) |
+| [`bpmn-engine/src/db.rs`](bpmn-engine/src/db.rs) | `process_definitions`, `process_instances`, `tokens` (id = `instance:element`), аудит шага в `execution_history` (M6) |
 | [`bpmn-engine/src/nats_client.rs`](bpmn-engine/src/nats_client.rs) | Subject'ы: `mes.bpmn.v1.event.<instance>`, `mes.out.v1.cmd.<system>` |
 | [`bpmn-engine/src/events.rs`](bpmn-engine/src/events.rs) | Контракты `InboundEvent`, `ErpResponseEvent`, `ActionRequiredEvent` |
-| [`bpmn-gateways/http-cluster/index.js`](bpmn-gateways/http-cluster/index.js) | Валидация, subject `mes.in.v1.event.erp.<event_name>`, CORS, лимиты |
-| [`bpmn-gateways/websocket-cluster/index.js`](bpmn-gateways/websocket-cluster/index.js) | Вещание `mes.bpmn.v1.event.>` в `ws://<host>:8081/ws/status` |
+| [`bpmn-gateways/http-cluster/index.js`](bpmn-gateways/http-cluster/index.js) | Валидация, subject `mes.in.v1.event.erp.<event_name>`, CORS, лимиты, прокси `GET /api/v1/metrics` в NATS (M7) |
+| [`bpmn-gateways/websocket-cluster/index.js`](bpmn-gateways/websocket-cluster/index.js) | Вещание `mes.bpmn.v1.event.>` в `ws://<host>:8081/ws/status` с фильтрами подписчика (M7) |
+| [`bpmn-gateways/websocket-cluster/filters.js`](bpmn-gateways/websocket-cluster/filters.js) | Чистые фильтры WS-подписки: `parseQuery`, `matches`, `applyControl`, `instanceIdOf`, `rolesOf` (+ 8 тестов на `node --test`) |
 | [`erp-simulator/src/bpmn-sdk/client/httpClient.js`](erp-simulator/src/bpmn-sdk/client/httpClient.js) | `sendEvent(instanceId, eventName, elementId, outputData)`, `deploySchema(org, xml)` |
 | [`erp-simulator/src/bpmn-sdk/constants.js`](erp-simulator/src/bpmn-sdk/constants.js) | `ENGINE_EVENTS`, `ENGINE_ELEMENTS`, `INSTANCE_PREFIX`, `TOKEN_STATES`, `ELEMENT_ID_PATTERN` |
 | [`erp-simulator/src/bpmn-sdk/xml/bpmnXml.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.js) | Поиск/переименование узлов (`id`), роли (`bpmn:potentialOwner`), триггер (`trg:processTrigger`) и кнопки участников (`act:userAction`) в XML, вывод адреса кнопки из связей (`resolveAction`, `getNextElementId`), проверка совместимости схемы с движком (`validateEngineSchema`) |
@@ -1283,11 +1590,18 @@ cd erp-simulator && npm run sdk:refresh # пересборка вендорно�
 | [`erp-simulator/src/projectRoles.js`](erp-simulator/src/projectRoles.js) | Роли проекта из схемы: `analyzeProject` (процессы, роли, `roleCodes`, `problems`), `findUser`, `loginOf`, `iconNameOf` |
 | [`erp-simulator/src/projectStore.js`](erp-simulator/src/projectStore.js) | Проекты в браузере: `createProject`/`updateProject`/`deleteProject`/`listProjects`, активный проект (`ensureDefaultProject`), миграция старого кэша схем |
 | [`erp-simulator/src/schemaStore.js`](erp-simulator/src/schemaStore.js) | Старый кэш схем по организациям: `saveSchema`/`loadSchema`/`clearSchema`, ключ `bpmn-schema:<ORG>`; читается только для миграции в проект |
-| [`erp-simulator/src/metricsStore.js`](erp-simulator/src/metricsStore.js) | Метрики запусков в браузере: `beginRun`/`completeRun`/`loadRuns`/`clearRuns`, ключ `bpmn-process-metrics`, агрегаты инфографики (`summarizeRuns`, `groupRunsByProcess`) |
-| [`erp-simulator/src/MetricsPanel.jsx`](erp-simulator/src/MetricsPanel.jsx) | Инфографика руководителя: карточка на процесс, плитки времени, столбики последних запусков |
+| [`erp-simulator/src/metricsStore.js`](erp-simulator/src/metricsStore.js) | Метрики запусков в браузере (запасной источник, когда API недоступен): `beginRun`/`completeRun`/`loadRuns`/`clearRuns`, ключ `bpmn-process-metrics`, агрегаты инфографики (`summarizeRuns`, `groupRunsByProcess`) |
+| [`erp-simulator/src/metricsApi.js`](erp-simulator/src/metricsApi.js) | Клиент серверных метрик (M7): `metricsClient.load` → `GET /api/v1/metrics`, `toPanelRuns` (ответ движка → записи панели), кэш ответа `bpmn-process-metrics-cache` (`loadMetricsCache`/`saveMetricsCache`/`clearMetricsCache`) |
+| [`erp-simulator/src/MetricsPanel.jsx`](erp-simulator/src/MetricsPanel.jsx) | Инфографика руководителя: карточка на процесс, плитки времени и серверные разрезы (ожидание шага, SLA, брак), столбики последних запусков, подпись источника и кнопка «Обновить» |
 | [`erp-simulator/src/ordersApi.js`](erp-simulator/src/ordersApi.js) | Заказы в БД движка (M4): `ordersClient.listOrders`/`getOrder`/`createOrder`/`attachInstance`, нормализация серверной карточки (`normalizeOrder`, `mergeOrders`), продолжение нумерации (`nextOrderNum`) и форма заказа (`defaultOrderDraft`, `toOrderPayload`, `formatDueDate`) |
-| [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) | Демо-привязки: роль → кнопка из схемы (`ACTION_ID`) → `sendEvent`; кнопки вне `ACTION_ID` — общим шагом (`schemaStepActions`); сохранение/сброс схемы; подсказки триггера — `getProcessIds` из схемы второй стороны; метрики запусков — `beginRun` на старте и `completeRun` по токену на конечном узле |
+| [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) | Демо-привязки: роль → кнопка из схемы (`ACTION_ID`) → `sendEvent`; кнопки вне `ACTION_ID` — общим шагом (`schemaStepActions`); сохранение/сброс схемы; подсказки триггера — `getProcessIds` из схемы второй стороны; метрики — `beginRun` на старте, `completeRun` по токену на конечном узле и `refreshMetrics` (`GET /api/v1/metrics`) для панели |
 | [`tests/test_workflow.py`](tests/test_workflow.py) | E2E-проверка привязок через HTTP, БД, NATS и WS |
 | [`tests/orders-api.e2e.cjs`](tests/orders-api.e2e.cjs) | Живой E2E API заказов (M4): HTTP-шлюз → NATS `request/reply` → движок → Postgres, контракт кабинета и уборка следов через `psql` |
+| [`tests/roles-auth.e2e.cjs`](tests/roles-auth.e2e.cjs) | Живой E2E ролей (M6): `403` чужой роли с причиной, отказ движка на событии в обход шлюза, `actor` в `execution_history`; уборка следов через `psql` |
+| [`tests/nats-publish.cjs`](tests/nats-publish.cjs) | Хелпер E2E: publish события прямо в JetStream из пода шлюза — проверяет страховку рантайма, которую шлюз закрывает собой |
+| [`tests/metrics-api.e2e.cjs`](tests/metrics-api.e2e.cjs) | Живой E2E API метрик (M7): сид legacy-таблиц → `GET /api/v1/metrics` через шлюз, цикл запуска, SLA открытого шага, разрезы шага/роли, предупреждение «нет схемы»; уборка следов через `psql` |
+| [`tests/ws-filter.e2e.cjs`](tests/ws-filter.e2e.cjs) | Живой E2E фильтров WS (M7): три клиента (query-фильтр, `subscribe` сообщением, без фильтров), события публикуются в NATS из пода шлюза, проверяется отсечение чужих экземпляров и ролей и сброс `unsubscribe` |
+| [`tests/run-live-e2e.sh`](tests/run-live-e2e.sh) | Раннер живых E2E (заказы M4 + роли M6 + метрики и WS-фильтры M7) по уже развёрнутому кластеру: без сборки образов и без Job'ов |
+
 | [`schema.sql`](schema.sql), [`db-init-configmap.yaml`](db-init-configmap.yaml) | Таблицы и ограничения по длинам идентификаторов |
 | [`erp-simulator/docs/dairy-plant-roadmap.md`](erp-simulator/docs/dairy-plant-roadmap.md) | Дорожная карта демо-проекта «Молочный завод»: что уже играется в кабинете, какие разрывы (граф, воркеры, межпроцессные сообщения, роли, метрики) и в каком порядке закрываются (M1–M8) |

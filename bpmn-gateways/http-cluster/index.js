@@ -30,7 +30,7 @@ function applyCors(req, res) {
     res.setHeader('Access-Control-Allow-Origin', allowOrigin);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Actor-Role');
     res.setHeader('Access-Control-Max-Age', '600');
 }
 
@@ -65,6 +65,34 @@ const sc = StringCodec();
 const ORDERS_SUBJECT = process.env.ORDERS_API_SUBJECT || 'mes.in.v1.api.orders';
 const ORDERS_TIMEOUT_MS = Number(process.env.ORDERS_TIMEOUT_MS || 5000);
 
+/**
+ * Проверка прав (M6).
+ *
+ * Шлюз не знает BPMN-схемы, поэтому перед публикацией события спрашивает
+ * движок: `nc.request(AUTH_SUBJECT, { actor, instanceId, elementId, bpmnXml })`.
+ * Ответ — `{ allowed, reason, required, elementId }` (`bpmn-engine/src/auth.rs`).
+ * Синхронный запрос нужен ради **403 с причиной**: без него кабинет видел бы
+ * «ничего не произошло», хотя событие отклонили.
+ *
+ * Роль сессии приходит заголовком `X-Actor-Role` (кабинет) или полем `actor`
+ * (скрипты). Это заявленная роль, а не аутентификация: IdP в демо нет.
+ */
+const AUTH_SUBJECT = process.env.AUTH_API_SUBJECT || 'mes.in.v1.api.auth';
+const AUTH_TIMEOUT_MS = Number(process.env.AUTH_TIMEOUT_MS || 3000);
+const ACTOR_HEADER = 'x-actor-role';
+
+/**
+ * Серверные метрики (M7).
+ *
+ * Инфографику запусков считает движок (`bpmn-engine/src/metrics.rs`), а не
+ * браузер: иначе у руководителя панель пуста — процессы запускал не он. Шлюз
+ * перекладывает `GET /api/v1/metrics` в NATS-запрос и отдаёт ответ как есть,
+ * без второй копии правил расчёта.
+ */
+const METRICS_SUBJECT = process.env.METRICS_API_SUBJECT || 'mes.in.v1.api.metrics';
+const METRICS_TIMEOUT_MS = Number(process.env.METRICS_TIMEOUT_MS || 5000);
+
+
 let nc;
 let js;
 
@@ -88,6 +116,36 @@ const eventSchema = {
 
 const ajv = new Ajv({ allErrors: true });
 const validateEvent = ajv.compile(eventSchema);
+
+/** Роль сессии из запроса: заголовок кабинета важнее поля тела. */
+function actorOf(req) {
+    const fromHeader = req.headers[ACTOR_HEADER];
+    const fromBody = req.body && req.body.actor;
+
+    return String(fromHeader || fromBody || '').trim();
+}
+
+/**
+ * Спрашивает движок, вправе ли роль сессии двигать шаг.
+ *
+ * `bpmnXml` нужен только старту и деплою: у существующего экземпляра движок
+ * берёт схему из `process_definition` сам.
+ */
+async function authorizeEvent({ actor, instanceId, elementId, bpmnXml }) {
+    if (!nc) {
+        const error = new Error('NATS не подключён: проверка прав недоступна');
+        error.status = 503;
+        throw error;
+    }
+
+    const message = await nc.request(
+        AUTH_SUBJECT,
+        sc.encode(JSON.stringify({ actor, instanceId, elementId, bpmnXml })),
+        { timeout: AUTH_TIMEOUT_MS }
+    );
+
+    return JSON.parse(sc.decode(message.data));
+}
 
 async function initNats() {
     try {
@@ -120,6 +178,7 @@ app.post('/api/v1/process/instances/:id/events', async (req, res) => {
     }
 
     const { event_name, correlation_key, element_id, output_data } = req.body;
+    const actor = actorOf(req);
 
     // JetStream инициализируется асинхронно (initNats), а соединение может
     // отвалиться в рантайме. Без явной проверки `js.publish` падал с
@@ -132,11 +191,48 @@ app.post('/api/v1/process/instances/:id/events', async (req, res) => {
         });
     }
 
+    // Проверка прав (M6): роль сессии против `bpmn:potentialOwner` и
+    // `act:userAction/@role`. Отказ — 403 с причиной, чтобы кабинет показал её,
+    // а не «ничего не произошло». Сбой проверки — 503: молча пускать событие
+    // нельзя, иначе недоступный движок открывал бы шаг любой роли.
+    let decision;
+
+    try {
+        decision = await authorizeEvent({
+            actor,
+            instanceId,
+            elementId: element_id || '',
+            bpmnXml: output_data && output_data.bpmn_xml
+        });
+    } catch (error) {
+        console.error('❌ [Gateway] Проверка прав недоступна:', error && error.message);
+        return res.status(503).json({
+            error: 'Проверка прав недоступна: оркестратор не ответил',
+            details: error && error.message ? String(error.message) : String(error)
+        });
+    }
+
+    if (!decision.allowed) {
+        console.warn(
+            `⛔ [Gateway] Отказ в правах instance=${instanceId} actor=${actor || '(нет)'}: ${decision.reason}`
+        );
+        return res.status(403).json({
+            error: decision.reason || 'Роль сессии не может выполнить этот шаг',
+            details: {
+                actor,
+                required: decision.required || [],
+                elementId: decision.elementId || element_id || ''
+            }
+        });
+    }
+
     const natsPayload = JSON.stringify({
         event_id: correlation_key,
         instance_id: instanceId,
         element_id: element_id || '',
-        payload: output_data || {}
+        payload: output_data || {},
+        // Роль сессии проверяет и движок (страховка от прямого `nats pub`).
+        actor
     });
 
     const subject = `mes.in.v1.event.erp.${event_name}`;
@@ -246,6 +342,72 @@ app.post('/api/v1/orders/:orderNum/instances', async (req, res) => {
     );
 });
 
+/** Запрос метрик у движка (NATS `request/reply`, очередь `metrics-api`). */
+async function requestMetrics(payload) {
+    if (!nc) {
+        const error = new Error('NATS не подключён: метрики недоступны');
+        error.status = 503;
+        throw error;
+    }
+
+    const message = await nc.request(
+        METRICS_SUBJECT,
+        sc.encode(JSON.stringify(payload)),
+        { timeout: METRICS_TIMEOUT_MS }
+    );
+
+    return JSON.parse(sc.decode(message.data));
+}
+
+/**
+ * `GET /api/v1/metrics` — серверные метрики запусков.
+ *
+ * Параметры строки запроса необязательны: `processId` (завод / поставщик /
+ * клиент), `limit` (1..50 последних запусков), `slaMinutes` (порог ожидания
+ * шага) и `defectNodes` (id конечных узлов «брак» через запятую). Код ответа
+ * берётся из `status` тела — как у заказов.
+ */
+app.get('/api/v1/metrics', async (req, res) => {
+    const payload = {};
+
+    if (typeof req.query.processId === 'string' && req.query.processId.trim()) {
+        payload.processId = req.query.processId.trim();
+    }
+    if (Number.isFinite(Number(req.query.limit)) && req.query.limit !== '') {
+        payload.limit = Number(req.query.limit);
+    }
+    if (Number.isFinite(Number(req.query.slaMinutes)) && req.query.slaMinutes !== '') {
+        payload.slaMinutes = Number(req.query.slaMinutes);
+    }
+    if (typeof req.query.defectNodes === 'string' && req.query.defectNodes.trim()) {
+        payload.defectNodes = req.query.defectNodes
+            .split(',')
+            .map((node) => node.trim())
+            .filter(Boolean);
+    }
+
+    try {
+        const body = await requestMetrics(payload);
+        const status =
+            typeof body.status === 'number' ? body.status : body.ok === false ? 500 : 200;
+        const { status: _status, ...rest } = body;
+
+        res.status(status).json(rest);
+    } catch (error) {
+        const timedOut =
+            error && (error.code === 'TIMEOUT' || /timeout/i.test(String(error.message)));
+        const status = error && error.status ? error.status : 503;
+
+        console.error(`❌ [Gateway] метрики: ${error && error.message ? error.message : error}`);
+        res.status(status).json({
+            error: timedOut
+                ? 'Оркестратор не ответил на запрос метрик'
+                : 'Не удалось получить метрики из оркестратора',
+            details: error && error.message ? String(error.message) : String(error)
+        });
+    }
+});
+
 /**
  * Диагностика: проверка port-forward и базовое здоровье шлюза.
  * `curl -s localhost:8080/health`
@@ -256,7 +418,10 @@ app.get('/health', (req, res) => {
         nats_connected: Boolean(nc),
         jetstream: Boolean(js),
         body_limit: JSON_BODY_LIMIT,
-        orders_subject: ORDERS_SUBJECT
+        orders_subject: ORDERS_SUBJECT,
+        auth_subject: AUTH_SUBJECT,
+        metrics_subject: METRICS_SUBJECT,
+        actor_header: 'X-Actor-Role'
     });
 });
 
@@ -275,7 +440,7 @@ app.get('/', (req, res) => {
             {
                 method: 'POST',
                 path: '/api/v1/process/instances/:id/events',
-                description: 'Публикация события процесса в NATS (mes.in.v1.event.erp.<event_name>)'
+                description: 'Публикация события процесса в NATS (mes.in.v1.event.erp.<event_name>). Роль сессии — заголовок X-Actor-Role: чужая роль получает 403 (M6)'
             },
             {
                 method: 'GET',
@@ -296,6 +461,11 @@ app.get('/', (req, res) => {
                 method: 'POST',
                 path: '/api/v1/orders/:orderNum/instances',
                 description: 'Привязка экземпляра процесса к стороне заказа: { org, instanceId }'
+            },
+            {
+                method: 'GET',
+                path: '/api/v1/metrics',
+                description: 'Серверные метрики запусков: цикл, SLA, доля брака, шаги и роли (NATS request/reply mes.in.v1.api.metrics)'
             },
             {
                 method: 'GET',

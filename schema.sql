@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS execution_history (
     event_type VARCHAR(64) NOT NULL,
     element_id VARCHAR(255),
     payload JSONB,
+    -- Роль сессии, завершившей шаг (M6): пусто у событий без роли.
+    actor TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 

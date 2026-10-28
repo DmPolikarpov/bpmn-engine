@@ -220,10 +220,10 @@ async function runChecks() {
   check('неизвестный заказ → 404', missing.status === 404, missing);
 
   const badOrg = await call('POST', `/api/v1/orders/${encodeURIComponent(orderNum)}/instances`, {
-    org: 'CLIENT',
+    org: 'WAREHOUSE',
     instanceId: customerInstance
   });
-  check('org вне CUSTOMER/SUPPLIER → 400', badOrg.status === 400, badOrg);
+  check('org вне CUSTOMER/SUPPLIER/CLIENT → 400', badOrg.status === 400, badOrg);
 
   const badOrder = await call('POST', `/api/v1/orders/${encodeURIComponent('№нет-такого')}/instances`, {
     org: 'CUSTOMER',

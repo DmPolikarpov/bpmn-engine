@@ -30,11 +30,18 @@ pub const DEPLOY_ELEMENT_ID: &str = "Process_Deployment";
 /// Префикс служебного экземпляра деплоя (`ENGINE_ELEMENTS.DEPLOY`).
 pub const DEPLOY_INSTANCE_PREFIX: &str = "inst-deploy-";
 
+/// Служебный адрес деплоя схемы: `element_id` события деплоя либо префикс
+/// экземпляра (`ENGINE_ELEMENTS.DEPLOY`).
+///
+/// Нужен и проверке прав (M6): у деплоя нет шага, роль ему не назначается.
+pub fn is_deploy_address(instance_id: &str, element_id: &str) -> bool {
+    element_id.trim() == DEPLOY_ELEMENT_ID || instance_id.starts_with(DEPLOY_INSTANCE_PREFIX)
+}
+
 /// Служебное событие деплоя: определение сохраняется, инстанс не создаётся
 /// (дизайн 5.1).
 pub fn is_deploy_only(event: &InboundEvent) -> bool {
-    event.element_id.trim() == DEPLOY_ELEMENT_ID
-        || event.instance_id.starts_with(DEPLOY_INSTANCE_PREFIX)
+    is_deploy_address(&event.instance_id, &event.element_id)
 }
 
 /// Необязательный `token_id` из `output_data` — путь для `parallelGateway`,
@@ -97,6 +104,7 @@ mod tests {
             instance_id: "instance-1".to_string(),
             element_id: "Task_Next".to_string(),
             payload,
+            actor: String::new(),
         }
     }
 
@@ -183,6 +191,7 @@ mod tests {
             instance_id: "inst-deploy-DAIRY".to_string(),
             element_id: "Process_Deployment".to_string(),
             payload: json!({"bpmn_xml": "<definitions/>", "org_type": "DAIRY"}),
+            actor: String::new(),
         };
         assert!(
             is_deploy_only(&deploy),
@@ -194,6 +203,7 @@ mod tests {
             instance_id: "inst-cust-1".to_string(),
             element_id: "Task_CheckStock".to_string(),
             payload: json!({"bpmn_xml": "<definitions/>"}),
+            actor: String::new(),
         };
         assert!(!is_deploy_only(&start), "старт процесса — не деплой");
     }

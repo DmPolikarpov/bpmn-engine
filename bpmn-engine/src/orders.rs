@@ -105,6 +105,12 @@ pub struct Order {
     pub supplier_instance_id: Option<String>,
     pub supplier_active_element_id: Option<String>,
     pub supplier_process_state: String,
+    /// Третий контур (M5): клиент завода. До M5 у заказа было две стороны,
+    /// поэтому поля добавлены рядом, а не переделкой в таблицу «сторона →
+    /// экземпляр»: миграция обязана быть дешёвой, а API — совместимым.
+    pub client_instance_id: Option<String>,
+    pub client_active_element_id: Option<String>,
+    pub client_process_state: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -132,6 +138,9 @@ impl Order {
             supplier_instance_id: None,
             supplier_active_element_id: None,
             supplier_process_state: IDLE.to_string(),
+            client_instance_id: None,
+            client_active_element_id: None,
+            client_process_state: IDLE.to_string(),
             created_at: now,
             updated_at: now,
         }
@@ -225,18 +234,25 @@ fn check_text(errors: &mut Vec<FieldError>, field: &str, value: &str, max_len: u
 }
 
 /// Сторона обмена, к которой привязывается экземпляр процесса.
+///
+/// `Customer` и `Supplier` — стороны заказа M3/M4, `Client` — третий пул M5
+/// (клиент завода). Порядок вариантов — порядок контуров кабинета
+/// (`CONTOUR_ORDER` в `erp-simulator/src/projectRoles.js`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Org {
     Customer,
     Supplier,
+    Client,
 }
 
 impl Org {
-    /// Разбирает `org` из запроса (`CUSTOMER` / `SUPPLIER`), регистр не важен.
+    /// Разбирает `org` из запроса (`CUSTOMER` / `SUPPLIER` / `CLIENT`),
+    /// регистр не важен.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_uppercase().as_str() {
             "CUSTOMER" => Some(Self::Customer),
             "SUPPLIER" => Some(Self::Supplier),
+            "CLIENT" => Some(Self::Client),
             _ => None,
         }
     }
@@ -386,7 +402,7 @@ pub async fn handle(store: &dyn OrderStore, request: Request, today: NaiveDate) 
                 return Response::failure(400, "не указан экземпляр процесса (instanceId)");
             };
             let Some(org) = request.org.as_deref().and_then(Org::parse) else {
-                return Response::failure(400, "org должен быть CUSTOMER или SUPPLIER");
+                return Response::failure(400, "org должен быть CUSTOMER, SUPPLIER или CLIENT");
             };
 
             match store.attach(order_num, org, instance_id).await {
@@ -434,19 +450,25 @@ SELECT
     o.status,
     o.customer_instance_id,
     o.supplier_instance_id,
+    o.client_instance_id,
     (SELECT t.element_id FROM tokens t
       WHERE t.instance_id = o.customer_instance_id AND t.state = 'ACTIVE'
       ORDER BY t.created_at DESC, t.element_id LIMIT 1) AS customer_active_element_id,
     (SELECT t.element_id FROM tokens t
       WHERE t.instance_id = o.supplier_instance_id AND t.state = 'ACTIVE'
       ORDER BY t.created_at DESC, t.element_id LIMIT 1) AS supplier_active_element_id,
+    (SELECT t.element_id FROM tokens t
+      WHERE t.instance_id = o.client_instance_id AND t.state = 'ACTIVE'
+      ORDER BY t.created_at DESC, t.element_id LIMIT 1) AS client_active_element_id,
     COALESCE(pi_c.status, 'IDLE') AS customer_process_state,
     COALESCE(pi_s.status, 'IDLE') AS supplier_process_state,
+    COALESCE(pi_k.status, 'IDLE') AS client_process_state,
     o.created_at,
     o.updated_at
 FROM orders o
 LEFT JOIN process_instances pi_c ON pi_c.id = o.customer_instance_id
 LEFT JOIN process_instances pi_s ON pi_s.id = o.supplier_instance_id
+LEFT JOIN process_instances pi_k ON pi_k.id = o.client_instance_id
 "#;
 
 fn map_row(row: &sqlx::postgres::PgRow) -> Order {
@@ -465,6 +487,9 @@ fn map_row(row: &sqlx::postgres::PgRow) -> Order {
         supplier_instance_id: row.get("supplier_instance_id"),
         supplier_active_element_id: row.get("supplier_active_element_id"),
         supplier_process_state: row.get("supplier_process_state"),
+        client_instance_id: row.get("client_instance_id"),
+        client_active_element_id: row.get("client_active_element_id"),
+        client_process_state: row.get("client_process_state"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -563,6 +588,15 @@ impl OrderStore for PgOrderStore {
                 r#"
                 UPDATE orders
                 SET supplier_instance_id = $1,
+                    status = CASE WHEN status = $3 THEN $4 ELSE status END,
+                    updated_at = NOW()
+                WHERE order_num = $2
+                "#
+            }
+            Org::Client => {
+                r#"
+                UPDATE orders
+                SET client_instance_id = $1,
                     status = CASE WHEN status = $3 THEN $4 ELSE status END,
                     updated_at = NOW()
                 WHERE order_num = $2
@@ -769,6 +803,10 @@ mod tests {
                     order.supplier_instance_id = Some(instance_id.to_string());
                     order.supplier_process_state = "ACTIVE".to_string();
                 }
+                Org::Client => {
+                    order.client_instance_id = Some(instance_id.to_string());
+                    order.client_process_state = "ACTIVE".to_string();
+                }
             }
 
             if order.status == STATUS_NEW {
@@ -924,6 +962,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_links_client_contour_without_touching_other_sides() {
+        let store = MemoryStore::default();
+        store.seed(Order::from_new(valid_order(), now()));
+
+        // Клиент — третий контур (M5): экземпляр кладётся в свой слот, а две
+        // первые стороны остаются `IDLE`, иначе кабинет подсветил бы шаг не той
+        // роли.
+        let response = request(
+            &store,
+            json!({
+                "action": "attach",
+                "orderNum": "№101",
+                "org": "client",
+                "instanceId": "inst-client-abc123"
+            }),
+        )
+        .await;
+
+        assert!(response.ok);
+        let order = response.order.expect("заказ");
+        assert_eq!(order.status, STATUS_IN_PROGRESS);
+        assert_eq!(
+            order.client_instance_id.as_deref(),
+            Some("inst-client-abc123")
+        );
+        assert_eq!(order.client_process_state, "ACTIVE");
+        assert_eq!(order.customer_instance_id, None);
+        assert_eq!(order.customer_process_state, IDLE);
+        assert_eq!(order.supplier_instance_id, None);
+        assert_eq!(order.supplier_process_state, IDLE);
+    }
+
+    #[tokio::test]
     async fn list_returns_all_orders() {
         let store = MemoryStore::default();
         store.seed(Order::from_new(valid_order(), now()));
@@ -960,6 +1031,9 @@ mod tests {
         assert!(value["order"]["fatContent"].is_number());
         assert!(value["order"]["dueDate"].is_string());
         assert!(value["order"]["customerProcessState"].is_string());
+        // Третий контур (M5) отдаётся тем же camelCase-контрактом.
+        assert!(value["order"]["clientProcessState"].is_string());
+        assert!(value["order"]["clientInstanceId"].is_null());
         assert_eq!(value["ok"], json!(true));
 
         let failure = serde_json::to_value(Response::failure(409, "дубль")).expect("сериализация");
