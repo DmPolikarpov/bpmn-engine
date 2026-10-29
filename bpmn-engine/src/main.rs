@@ -160,6 +160,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
+    // 1.1. Уборка проходных токенов (M8, ограничение 2).
+    //
+    // Вендорная таблица `token` хранит токены `startEvent`/шлюзов: они остаются
+    // `Waiting` и после финиша экземпляра, поэтому таблица росла вместе с числом
+    // прогонов. Чистятся только токены завершённых экземпляров — живые не
+    // трогаем, иначе рантайм потеряет шаг. `TOKEN_GC_INTERVAL_SECS=0` выключает
+    // уборку.
+    let pool_gc = pool.clone();
+    tokio::spawn(async move {
+        let interval_secs = env::var("TOKEN_GC_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60);
+
+        if interval_secs == 0 {
+            println!("🧹 [Token GC] уборка проходных токенов выключена (TOKEN_GC_INTERVAL_SECS=0)");
+            return;
+        }
+
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+
+        loop {
+            interval.tick().await;
+
+            match db::purge_finished_tokens(&pool_gc).await {
+                Ok(0) => {}
+                Ok(removed) => println!("🧹 [Token GC] удалено проходных токенов: {removed}"),
+                Err(error) => eprintln!("❌ [Token GC] Ошибка уборки токенов: {error}"),
+            }
+        }
+    });
+
     // 2. Воркер ответов от ERP
     tokio::spawn(async move {
         loop {

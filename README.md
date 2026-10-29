@@ -1435,6 +1435,7 @@ kubectl logs deploy/websocket-cluster-deployment -f
 | `400 Validation Failed` | нет `event_name`/`correlation_key` | дописать поля (см. схему в ответе — шлюз возвращает `expected_schema`) |
 | `403` «Роль … не может завершить шаг …» | роль сессии не совпала с `bpmn:potentialOwner` (или ролью кнопки в `act:userAction`) | войти ролью, которой назначен шаг; кто и когда двигал шаг — `SELECT created_at, event_type, element_id, actor FROM execution_history ORDER BY id DESC` |
 | `503` «Проверка прав недоступна» | движок не ответил на `mes.in.v1.api.auth` (нет подписки `auth-api` или таймаут) | логи `bpmn-engine` с префиксом `[Auth]`; проверить `NATS_URL` и что движок жив |
+| `CrashLoopBackOff` движка, в логе `VersionMismatch(N)` | применённая миграция изменена: `sqlx` сверяет контрольную сумму файла с `_sqlx_migrations`, а правка даже в комментарии её меняет | вернуть файл байт-в-байт (`git checkout <commit> -- bpmn-engine/migrations/000N_*.sql`) и оформить изменение **новой** миграцией; для локальной БД без данных допустим `DROP DATABASE` |
 | `CrashLoopBackOff` движка, в логе `must be owner of table execution_history` (SQLSTATE 42501) | `execution_history` создал initdb от `postgres`, а миграции идут от `bpmn_user`: `ALTER TABLE` требует владения, `GRANT` даёт только DML | `./deploy.sh` (шаг 5b передаёт владение) или разово: `kubectl exec -i bpmn-db-1 -c postgres -- psql -U postgres -d bpmn_db -c 'ALTER TABLE execution_history OWNER TO bpmn_user;'`, затем `kubectl rollout restart deployment/bpmn-engine-deployment` |
 | То же, но `must be owner of table tokens` (миграция `0006`, M8) | `tokens` — таблица initdb, а `0006` делает `ALTER TABLE`: владение нужно передать и ей | `kubectl exec -i bpmn-db-1 -c postgres -- psql -U postgres -d bpmn_db -c 'ALTER TABLE tokens OWNER TO bpmn_user;'`, затем `kubectl rollout restart deployment/bpmn-engine-deployment`. В initdb это уже делает [`db-init-configmap.yaml`](db-init-configmap.yaml) |
 | Шаг двигается любой ролью, `403` не приходит | образ `http-cluster` старше M6: в `/health` нет `auth_subject`, роль не проверяется до публикации | пересобрать шлюз (`./deploy.sh` целиком) или вручную: `docker build -t http-cluster-service:latest ./bpmn-gateways/http-cluster && kind load docker-image http-cluster-service:latest --name erp && kubectl rollout restart deployment/http-cluster-deployment` |
@@ -1505,6 +1506,7 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
 | `NATS_URL` | движок, шлюзы | `nats://nats-service:4222` | брокер |
 | `SLA_CHECK_INTERVAL_SECS` | движок | `3` | период сканирования «зависших» токенов |
 | `SLA_TIMEOUT_MINUTES` | движок | `30` | после какого простоя токен уходит в `TIMED_OUT` + команда в `mes.out.v1.cmd.erp` |
+| `TOKEN_GC_INTERVAL_SECS` | движок | `60` | период уборки проходных токенов завершённых экземпляров (M8); `0` — выключить |
 | `PORT` | шлюзы | `8080` | порт шлюза внутри пода |
 | `JSON_BODY_LIMIT` | http-cluster | `10mb` | лимит тела (BPMN-схема приезжает в `output_data.bpmn_xml`) |
 | `AUTH_API_SUBJECT` | http-cluster | `mes.in.v1.api.auth` | subject проверки прав (M6); должен совпадать с подпиской движка |
@@ -1527,8 +1529,12 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
    коннектора ERP/MES в репозитории нет: контракт описан в §3 и M2
    [дорожной карты](erp-simulator/docs/dairy-plant-roadmap.md).
 2. **Проходные токены (`startEvent`, шлюзы) остаются в вендорной таблице
-   `token`.** В `Waiting` они копятся и не проецируются в шаги кабинета;
-   уборка/GC пока не сделана — таблица растёт вместе с числом прогонов.
+   `token`.** В `Waiting` они копятся и не проецируются в шаги кабинета. С M8
+   движок чистит токены **завершённых** экземпляров раз в
+   `TOKEN_GC_INTERVAL_SECS` (`db::purge_finished_tokens`): на демо-схеме завода
+   это 4 строки на прогон. У живых экземпляров проходные токены остаются до
+   финиша — иначе рантайм потерял бы шаг; истории это не касается
+   (`history_event` и legacy-проекция остаются).
 3. **`event_name` не участвует в маршрутизации** (движок его не читает), а
    литерал `erp` в subject HTTP-шлюза (`mes.in.v1.event.erp.<event_name>`)
    зашит в код шлюза.

@@ -13,14 +13,6 @@
 --
 -- Колонка аддитивная и nullable: старые строки остаются валидными, а бэкфилл
 -- ниже делает их эквивалентными прежнему поведению.
---
--- Владение: `tokens` создаёт initdb от `postgres`, а `ALTER TABLE` требует
--- владения. На чистой БД его передаёт `db-init-configmap.yaml`; на уже
--- развёрнутой — разово:
---   kubectl exec -i bpmn-db-1 -c postgres -- \
---     psql -U postgres -d bpmn_db -c 'ALTER TABLE tokens OWNER TO bpmn_user;'
--- (симптом без этого — `CrashLoopBackOff` движка и
--- `must be owner of table tokens`, SQLSTATE 42501).
 ALTER TABLE tokens
     ADD COLUMN IF NOT EXISTS state_changed_at TIMESTAMP WITH TIME ZONE;
 

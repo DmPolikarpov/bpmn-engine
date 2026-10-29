@@ -93,6 +93,31 @@ pub async fn save_token_state(
     Ok(())
 }
 
+/// Удаляет вендорные токены завершённых экземпляров (M8, ограничение 2).
+///
+/// Вендорная таблица `token` хранит и проходные токены (`startEvent`, шлюзы,
+/// throw-события): они остаются `Waiting` навсегда и копятся — на демо-схеме
+/// завода это 4 строки на каждый завершённый прогон. Рантайм читает токены
+/// только по событиям живого экземпляра, поэтому строки завершённых
+/// (`process_instance.state <> 'Running'`) ему не нужны: история остаётся в
+/// `history_event`, а шаги — в legacy-проекции (`tokens`, `execution_history`).
+///
+/// Возвращает число удалённых строк.
+pub async fn purge_finished_tokens(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM token
+         WHERE instance_id IN (
+             SELECT id FROM process_instance WHERE state <> 'Running'
+         )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
 /// Статус legacy-инстанса (`process_instances.status`) по проекции движка.
 pub async fn update_process_instance_status(
     pool: &PgPool,
