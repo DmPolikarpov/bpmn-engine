@@ -157,7 +157,11 @@ pub struct FieldError {
 }
 
 impl FieldError {
-    fn new(field: &str, message: &str) -> Self {
+    /// Ошибка поля: `field` — имя из контракта JSON, `message` — причина.
+    ///
+    /// `pub` — потому что API проектов (`projects.rs`) отдаёт тот же формат
+    /// `details[].field` + `.message`: клиент шлюза разбирает его одной веткой.
+    pub fn new(field: &str, message: &str) -> Self {
         Self {
             field: field.to_string(),
             message: message.to_string(),

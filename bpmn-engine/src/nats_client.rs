@@ -68,6 +68,52 @@ impl NatsAdapter {
         Ok(())
     }
 
+    /// NATS-API проектов (M6): схема проекта живёт в БД движка, а не только в
+    /// `localStorage` браузера. Кабинет спрашивает список и схему, «Задеплоить»
+    /// поднимает версию.
+    ///
+    /// Очередь [`crate::projects::API_QUEUE`] — по той же причине, что и у
+    /// заказов: у реплик общий Postgres, отвечать должна одна.
+    pub async fn serve_projects_api(
+        &self,
+        store: Arc<crate::projects::PgProjectStore>,
+    ) -> Result<(), async_nats::Error> {
+        let mut subscriber = self
+            .client
+            .queue_subscribe(
+                crate::projects::API_SUBJECT,
+                crate::projects::API_QUEUE.to_string(),
+            )
+            .await?;
+        println!(
+            "📐 [Projects] API проектов слушает {}",
+            crate::projects::API_SUBJECT
+        );
+
+        while let Some(message) = subscriber.next().await {
+            let response = crate::projects::handle_bytes(store.as_ref(), &message.payload).await;
+
+            let Some(reply) = message.reply.clone() else {
+                eprintln!(
+                    "⚠️ [Projects] запрос без reply-адреса: {}",
+                    message.subject
+                );
+                continue;
+            };
+
+            match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    if let Err(error) = self.client.publish(reply, body.into()).await {
+                        eprintln!("❌ [Projects] не удалось ответить на запрос: {error}");
+                    }
+                }
+                Err(error) => eprintln!("❌ [Projects] сериализация ответа: {error}"),
+            }
+        }
+
+        Ok(())
+    }
+
     /// NATS-API серверных метрик (M7): кабинет видит инфографику запусков,
     /// которую посчитал движок, а не браузер конкретного пользователя.
     ///

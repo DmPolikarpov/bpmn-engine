@@ -4,6 +4,7 @@ mod events;
 mod metrics;
 mod nats_client;
 mod orders;
+mod projects;
 mod runtime;
 
 use async_nats::jetstream::AckKind;
@@ -63,7 +64,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    // 0.1. API проверки прав (M6): шлюз спрашивает движок перед публикацией
+    // 0.1. API проектов (M6): схема проекта в БД, а не только в браузере.
+    //
+    // Кабинет загружает схему при входе, «Задеплоить» поднимает версию, а
+    // второй браузер видит ту же схему и тот же номер версии. `localStorage`
+    // остаётся кэшем, поэтому F5 в чужой сессии больше не откатывает проект к
+    // демо-схеме SDK.
+    let projects_store = Arc::new(projects::PgProjectStore::new(pool.clone()));
+    let nats_projects = nats_adapter.clone();
+    tokio::spawn(async move {
+        if let Err(error) = nats_projects.serve_projects_api(projects_store).await {
+            eprintln!("❌ [Projects] API проектов остановлено: {error}");
+        }
+    });
+
+    // 0.2. API проверки прав (M6): шлюз спрашивает движок перед публикацией
     // события. Ответ синхронный, поэтому кабинет получает 403, а не «ничего не
     // произошло». Рантайм проверяет те же роли ещё раз — прямой `nats pub`
     // минует шлюз, но не движок.

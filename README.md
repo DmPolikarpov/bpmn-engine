@@ -35,7 +35,7 @@
 - [Роль исполнителя узла (`bpmn:potentialOwner`)](#роль-исполнителя-узла-bpmnpotentialowner)
 - [Кросс-процессный запуск из узла (`trg:processTrigger`)](#кросс-процессный-запуск-из-узла-trgprocesstrigger)
 - [Кнопки участников узла (`act:userAction`)](#кнопки-участников-узла-actuseraction)
-- [Локальный кэш схемы (`localStorage`)](#локальный-кэш-схемы-localstorage)
+- [Проект: кэш в браузере и схема на сервере (M6)](#проект-кэш-в-браузере-и-схема-на-сервере-m6)
 - [Метрики выполненных процессов](#метрики-выполненных-процессов)
 - [Как привязать новый блок к сервису](#как-привязать-новый-блок-к-сервису)
 - [Правила и ограничения идентификаторов](#правила-и-ограничения-идентификаторов)
@@ -366,6 +366,15 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 | `ordersClient.createOrder(payload)` | `POST /api/v1/orders` | заказ **до** `startProcess`: движку нужно, к чему привязать экземпляр |
 | `ordersClient.attachInstance(orderNum, org, instanceId)` | `POST /api/v1/orders/:orderNum/instances` | какой экземпляр относится к стороне заказа |
 
+Схема проекта живёт и на сервере (M6) — [`projectsApi.js`](erp-simulator/src/projectsApi.js):
+
+| Метод клиента | HTTP | Что делает |
+| --- | --- | --- |
+| `projectsClient.listProjects()` | `GET /api/v1/projects` | проекты, уже задеплоенные в движок: версия, размер, автор |
+| `projectsClient.getProject(id, version?)` | `GET /api/v1/projects/:projectId[?version=N]` | схема целиком; `version` — из истории |
+| `projectsClient.deployProject({projectId, name, bpmnXml, actor})` | `PUT /api/v1/projects/:projectId` | деплой: версия +1, роль в `X-Actor-Role` |
+| `projectsClient.listVersions(id)` | `GET /api/v1/projects/:projectId/versions` | история деплоев |
+
 Порядок в `handleProductionCreateOrder`: `nextOrderNum(orders)` → `createOrder` →
 `startProcess` → `attachInstance('CUSTOMER')`. Экземпляр поставщика создаёт движок
 (M3), поэтому к заказу его привязывает подписка на токены — по первому
@@ -522,6 +531,7 @@ node tests/roles-auth.e2e.cjs   # 28 проверок; GATEWAY_URL — если 
 node tests/metrics-api.e2e.cjs   # 37 проверок: сид legacy-таблиц → GET /api/v1/metrics
 node tests/ws-filter.e2e.cjs     # 12 проверок: три WS-клиента, события через NATS из пода
 node tests/dairy-plant.e2e.cjs   # 97 проверок: демо-схема завода целиком (см. «Демо-сценарий»)
+node tests/projects-api.e2e.cjs  # 28 проверок: деплой схемы, версии и история (M6)
 ```
 
 Событие «в обход шлюза» публикует [`tests/nats-publish.cjs`](tests/nats-publish.cjs):
@@ -933,7 +943,7 @@ API SDK: `listActions`, `getElementActions`, `getElementAction`,
 > Демо-схемы SDK кнопки несут; кнопка «Демо-схема» в панели схемы возвращает их,
 > если в браузере осталась копия от прежней версии.
 
-## Проект в браузере (`localStorage`)
+## Проект: кэш в браузере и схема на сервере (M6)
 
 Правки редактора живут в состоянии React, поэтому без сохранения F5 возвращал
 демо-проект SDK. Кнопка «Сохранить схему» пишет проект целиком в `localStorage`
@@ -954,12 +964,14 @@ API SDK: `listActions`, `getElementActions`, `getElementAction`,
 
 Детали:
 
-- **кэш локальный и на браузер**, а не серверный: у каждого пользователя своя
-  копия, и деплой он не заменяет — схема уходит в кластер только кнопкой
-  «Задеплоить BPMN в Оркестратор» (либо в `output_data.bpmn_xml` при старте
-  процесса);
-- **деплой сохраняет проект тоже**, иначе после F5 кабинет показывал бы схему,
-  которой в кластере уже нет;
+- **с M6 схема проекта живёт и на сервере.** `localStorage` остаётся кэшем, а
+  источник истины — таблицы `projects`/`project_versions` движка: кабинет при
+  входе спрашивает `GET /api/v1/projects`, деплой поднимает версию
+  (`PUT /api/v1/projects/:projectId`), а второй браузер получает ту же схему и
+  тот же номер версии. Пока шлюз недоступен, кабинет работает как раньше — на
+  локальной копии;
+- **деплой сохраняет проект и на сервере, и в браузере**, иначе после F5
+  кабинет показывал бы схему, которой в кластере уже нет;
 - **«Демо-схема» меняет только процесс своего контура**: остальные остаются в
   проекте, иначе сброс одной стороны ломал бы связи `startsProcess`/
   `counterpartEvent` другой;
@@ -972,6 +984,31 @@ API SDK: `listActions`, `getElementActions`, `getElementAction`,
   чужой формат считаются отсутствием проекта — подхватится демо-проект;
 - **валидность XML проверяет редактор**, а не кэш: хранилище принимает любую
   непустую строку и намеренно не дублирует проверку схемы.
+
+### Схема на сервере: API (M6)
+
+| Метод | Путь | Что делает |
+| --- | --- | --- |
+| `GET` | `/api/v1/projects` | список проектов: `projectId`, `name`, `version`, `xmlBytes`, `updatedBy`, `updatedAt` |
+| `GET` | `/api/v1/projects/:projectId[?version=N]` | схема целиком; без `version` — последняя версия |
+| `PUT` | `/api/v1/projects/:projectId` | деплой: `{ "name", "bpmnXml" }`, роль — `X-Actor-Role`; версия растёт на 1 |
+| `GET` | `/api/v1/projects/:projectId/versions` | история деплоев: версия, размер, автор, время |
+
+```bash
+curl -s -X PUT localhost:8080/api/v1/projects/project-dairy \
+  -H 'Content-Type: application/json' -H 'X-Actor-Role: DIRECTOR' \
+  --data-binary @<(node -e 'process.stdout.write(JSON.stringify({name:"Молочный завод",bpmnXml:require("fs").readFileSync("docs/edvanced_dairy_plant.bpmn","utf8")}))')
+curl -s 'localhost:8080/api/v1/projects/project-dairy?version=1'   # схема первой версии
+```
+
+Устройство — как у заказов: REST шлюза перекладывается в NATS-запрос
+`mes.in.v1.api.projects` (очередь `projects-api`), отвечает движок
+([`bpmn-engine/src/projects.rs`](bpmn-engine/src/projects.rs)) — у шлюза нет ни
+пула к БД, ни второй копии валидации. Версию считает `UPDATE … version + 1` в
+одной транзакции с записью истории, поэтому две одновременные правки дают `v2`
+и `v3`, а не две записи «v2». Сервер проверяет идентификатор (латиница, цифры,
+`-`, `_`, `.`, `:`), непустое имя и что в `bpmnXml` действительно BPMN; полный
+разбор схемы остаётся за кабинетом (`validateEngineSchema`).
 
 Проверки: [`projectStore.test.js`](erp-simulator/src/projectStore.test.js)
 (CRUD, активный проект, миграция, отказы хранилища) и
@@ -1514,11 +1551,14 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
 | `METRICS_API_SUBJECT` | http-cluster | `mes.in.v1.api.metrics` | subject метрик (M7); должен совпадать с подпиской движка |
 | `METRICS_TIMEOUT_MS` | http-cluster | `5000` | сколько ждать ответ движка по метрикам; таймаут — `503` |
 | `METRICS_DEFECT_END_EVENTS` | движок | — | id конечных узлов «брак» через запятую; если пусто — по имени `endEvent` |
+| `PROJECTS_API_SUBJECT` | http-cluster | `mes.in.v1.api.projects` | subject API проектов (M6); должен совпадать с подпиской движка |
+| `PROJECTS_TIMEOUT_MS` | http-cluster | `5000` | сколько ждать ответ движка по схемам проектов; таймаут — `503` |
 | `BPMN_EVENTS_SUBJECT` | websocket-cluster | `mes.bpmn.v1.event.>` | что слушает WS-шлюз (фильтры — у подписчика) |
 | `CORS_ORIGIN` | http-cluster | `*` | источник(и) для браузера |
 | `REACT_APP_GATEWAY_URL` | клиент | `/api/v1/process/instances` | адрес HTTP-шлюза |
 | `REACT_APP_WS_URL` | клиент | `ws://localhost:8081/ws/status` | адрес WS-шлюза |
 | `REACT_APP_METRICS_API_URL` | клиент | `/api/v1/metrics` | адрес API метрик (M7); в dev — через CRA-прокси, в прод-сборке — адрес шлюза |
+| `REACT_APP_PROJECTS_API_URL` | клиент | `/api/v1/projects` | адрес API проектов (M6): список, схема и деплой с версией |
 
 ## Известные ограничения
 
@@ -1613,6 +1653,14 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
     контуров), поэтому столбик подписывается номером заказа; экземпляр, запущенный
     не из заказа, по-прежнему подписывается id.
 
+14. **У схемы проекта нет владельца и прав на деплой (M6).** `projects` —
+    общая таблица демо-контура: любой, кто дошёл до кнопки «Задеплоить BPMN»,
+    поднимает версию, а последний деплой выигрывает (`version + 1`; история
+    хранит автора по `X-Actor-Role`). Роль в истории — заявленный заголовок, а
+    не аутентификация (огр. 10). Второй браузер получает схему при входе, но
+    проект находит по тому же `projectId`: сервер не подменяет активный проект
+    в `localStorage` и не удаляет локальные копии.
+
 ## Карта исходников
 
 | Файл | Отвечает за |
@@ -1623,6 +1671,7 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
 | [`bpmn-engine/src/runtime/roles.rs`](bpmn-engine/src/runtime/roles.rs) | Роли узла из схемы (`bpmn:potentialOwner`, `act:userAction/@role`) и решение по событию (M6) |
 | [`bpmn-engine/src/auth.rs`](bpmn-engine/src/auth.rs) | NATS-API проверки прав `mes.in.v1.api.auth`: узел из ожидающего токена, ответ шлюзу (M6) |
 | [`bpmn-engine/src/metrics.rs`](bpmn-engine/src/metrics.rs) | NATS-API метрик `mes.in.v1.api.metrics` (M7): снимок таблиц, чистая агрегация (`aggregate`), цикл/шаги/роли/SLA/брак, финиш по `endEvent` определения |
+| [`bpmn-engine/src/projects.rs`](bpmn-engine/src/projects.rs) | NATS-API схем проектов `mes.in.v1.api.projects` (M6): список, схема, деплой с `version + 1`, история `project_versions`, валидация `projectId`/`name`/`bpmnXml` |
 | [`bpmn-engine/src/runtime/pump.rs`](bpmn-engine/src/runtime/pump.rs) | Снимки движка, перехват `MessageSent`, движок доставки сообщений |
 | [`bpmn-engine/src/db.rs`](bpmn-engine/src/db.rs) | `process_definitions`, `process_instances`, `tokens` (id = `instance:element`), аудит шага в `execution_history` (M6) |
 | [`bpmn-engine/src/nats_client.rs`](bpmn-engine/src/nats_client.rs) | Subject'ы: `mes.bpmn.v1.event.<instance>`, `mes.out.v1.cmd.<system>` |
@@ -1644,12 +1693,14 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
 | [`erp-simulator/src/metricsApi.js`](erp-simulator/src/metricsApi.js) | Клиент серверных метрик (M7): `metricsClient.load` → `GET /api/v1/metrics`, `toPanelRuns` (ответ движка → записи панели), кэш ответа `bpmn-process-metrics-cache` (`loadMetricsCache`/`saveMetricsCache`/`clearMetricsCache`) |
 | [`erp-simulator/src/MetricsPanel.jsx`](erp-simulator/src/MetricsPanel.jsx) | Инфографика руководителя: карточка на процесс, плитки времени и серверные разрезы (ожидание шага, SLA, брак), столбики последних запусков, подпись источника и кнопка «Обновить» |
 | [`erp-simulator/src/ordersApi.js`](erp-simulator/src/ordersApi.js) | Заказы в БД движка (M4): `ordersClient.listOrders`/`getOrder`/`createOrder`/`attachInstance`, нормализация серверной карточки (`normalizeOrder`, `mergeOrders`), продолжение нумерации (`nextOrderNum`) и форма заказа (`defaultOrderDraft`, `toOrderPayload`, `formatDueDate`) |
+| [`erp-simulator/src/projectsApi.js`](erp-simulator/src/projectsApi.js) | Схемы проектов на сервере (M6): `projectsClient.listProjects`/`getProject`/`deployProject`/`listVersions`, подписи версии и размера (`versionLabel`, `serverProjectLabel`), запись кэша из ответа (`toProjectRecord`) |
 | [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) | Демо-привязки: роль → кнопка из схемы (`ACTION_ID`) → `sendEvent`; кнопки вне `ACTION_ID` — общим шагом (`schemaStepActions`); сохранение/сброс схемы; подсказки триггера — `getProcessIds` из схемы второй стороны; метрики — `beginRun` на старте, `completeRun` по токену на конечном узле и `refreshMetrics` (`GET /api/v1/metrics`) для панели |
 | [`tests/test_workflow.py`](tests/test_workflow.py) | E2E-проверка привязок через HTTP, БД, NATS и WS |
 | [`tests/orders-api.e2e.cjs`](tests/orders-api.e2e.cjs) | Живой E2E API заказов (M4): HTTP-шлюз → NATS `request/reply` → движок → Postgres, контракт кабинета и уборка следов через `psql` |
 | [`tests/roles-auth.e2e.cjs`](tests/roles-auth.e2e.cjs) | Живой E2E ролей (M6): `403` чужой роли с причиной, отказ движка на событии в обход шлюза, `actor` в `execution_history`; уборка следов через `psql` |
 | [`tests/nats-publish.cjs`](tests/nats-publish.cjs) | Хелпер E2E: publish события прямо в JetStream из пода шлюза — проверяет страховку рантайма, которую шлюз закрывает собой |
 | [`tests/metrics-api.e2e.cjs`](tests/metrics-api.e2e.cjs) | Живой E2E API метрик (M7): сид legacy-таблиц → `GET /api/v1/metrics` через шлюз, цикл запуска, SLA открытого шага, разрезы шага/роли, предупреждение «нет схемы»; уборка следов через `psql` |
+| [`tests/projects-api.e2e.cjs`](tests/projects-api.e2e.cjs) | Живой E2E API проектов (M6): `PUT` поднимает версию, `GET ?version=N` читает историю, список отдаёт размер схемы, невалидный `projectId`/XML — `400`; уборка через `psql` |
 | [`tests/ws-filter.e2e.cjs`](tests/ws-filter.e2e.cjs) | Живой E2E фильтров WS (M7): три клиента (query-фильтр, `subscribe` сообщением, без фильтров), события публикуются в NATS из пода шлюза, проверяется отсечение чужих экземпляров и ролей и сброс `unsubscribe` |
 | [`tests/run-live-e2e.sh`](tests/run-live-e2e.sh) | Раннер живых E2E (заказы M4 + роли M6 + метрики и WS-фильтры M7 + демо-сценарий завода M8) по уже развёрнутому кластеру: без сборки образов и без Job'ов |
 | [`tests/dairy-plant.e2e.cjs`](tests/dairy-plant.e2e.cjs) | Живой E2E демо-сценария (M8): схема берётся из демо-клиента, проход заказа по трём пулам (закупка → сообщение поставщику → `MilkShipped` → техцепочка → отгрузка) и три негативные ветки (брак, авария ПОУ, деградация линии) с `serviceTask` мок-ERP |

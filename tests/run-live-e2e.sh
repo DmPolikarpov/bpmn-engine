@@ -12,6 +12,7 @@ set -e
 #   tests/run-live-e2e.sh ws-filter        # только фильтры WS-подписки (M7)
 #   tests/run-live-e2e.sh roles            # только роли (M6)
 #   tests/run-live-e2e.sh orders           # только заказы (M4)
+#   tests/run-live-e2e.sh projects         # только схемы проектов (M6)
 #   GATEWAY_URL=http://127.0.0.1:8080 tests/run-live-e2e.sh   # шлюз уже проброшен
 #
 # Нужен рабочий kubectl-контекст кластера с загруженными образами (`./deploy.sh`).
@@ -32,7 +33,7 @@ command -v kubectl > /dev/null 2>&1 || {
 
 SUITES=("$@")
 if [ ${#SUITES[@]} -eq 0 ]; then
-    SUITES=(orders roles metrics ws-filter dairy)
+    SUITES=(orders roles metrics ws-filter dairy projects)
 fi
 
 for suite in "${SUITES[@]}"; do
@@ -42,8 +43,9 @@ for suite in "${SUITES[@]}"; do
         metrics|metrics-api) SCRIPT="tests/metrics-api.e2e.cjs" ;;
         ws|ws-filter|filters) SCRIPT="tests/ws-filter.e2e.cjs" ;;
         dairy|dairy-plant) SCRIPT="tests/dairy-plant.e2e.cjs" ;;
+        projects|projects-api) SCRIPT="tests/projects-api.e2e.cjs" ;;
         *)
-            echo "❌ Неизвестный набор: ${suite} (ожидается orders, roles, metrics, ws-filter или dairy)"
+            echo "❌ Неизвестный набор: ${suite} (ожидается orders, roles, metrics, ws-filter, dairy или projects)"
             exit 2
             ;;
     esac

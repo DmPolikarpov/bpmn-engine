@@ -92,6 +92,17 @@ const ACTOR_HEADER = 'x-actor-role';
 const METRICS_SUBJECT = process.env.METRICS_API_SUBJECT || 'mes.in.v1.api.metrics';
 const METRICS_TIMEOUT_MS = Number(process.env.METRICS_TIMEOUT_MS || 5000);
 
+/**
+ * Проекты (M6).
+ *
+ * Схема проекта живёт в БД движка (`bpmn-engine/src/projects.rs`), а не только
+ * в `localStorage` браузера: вторая сессия получает ту же схему, а «Задеплоить»
+ * поднимает версию. Шлюз, как и у заказов, только перекладывает REST в
+ * NATS-запрос: у него нет ни пула к БД, ни второй копии валидации.
+ */
+const PROJECTS_SUBJECT = process.env.PROJECTS_API_SUBJECT || 'mes.in.v1.api.projects';
+const PROJECTS_TIMEOUT_MS = Number(process.env.PROJECTS_TIMEOUT_MS || 5000);
+
 
 let nc;
 let js;
@@ -279,9 +290,10 @@ async function requestOrders(payload) {
 
 /**
  * Переносит ответ движка в HTTP: `status` из тела — это код (400/404/409/500),
- * остальные поля уходят клиенту как есть (`order`, `orders`, `details`).
+ * остальные поля уходят клиенту как есть (`order`, `orders`, `project`,
+ * `projects`, `versions`, `details`).
  */
-function sendOrdersReply(res, body) {
+function sendApiReply(res, body) {
     const status =
         typeof body.status === 'number' ? body.status : body.ok === false ? 500 : 200;
     const { status: _status, ...rest } = body;
@@ -292,7 +304,7 @@ function sendOrdersReply(res, body) {
 /** Общая обёртка маршрутов заказов: таймаут и обрыв NATS — это 503. */
 async function proxyOrders(res, payload, label) {
     try {
-        sendOrdersReply(res, await requestOrders(payload));
+        sendApiReply(res, await requestOrders(payload));
     } catch (error) {
         const timedOut =
             error && (error.code === 'TIMEOUT' || /timeout/i.test(String(error.message)));
@@ -339,6 +351,99 @@ app.post('/api/v1/orders/:orderNum/instances', async (req, res) => {
             instanceId: body.instanceId
         },
         'привязка экземпляра к заказу'
+    );
+});
+
+/**
+ * Запрос к API проектов движка через NATS `request/reply`.
+ *
+ * Движок отвечает на `mes.in.v1.api.projects` (очередь `projects-api`): тело
+ * запроса и ответа описано в `bpmn-engine/src/projects.rs`.
+ */
+async function requestProjects(payload) {
+    if (!nc) {
+        const error = new Error('NATS не подключён: проекты недоступны');
+        error.status = 503;
+        throw error;
+    }
+
+    const message = await nc.request(
+        PROJECTS_SUBJECT,
+        sc.encode(JSON.stringify(payload)),
+        { timeout: PROJECTS_TIMEOUT_MS }
+    );
+
+    return JSON.parse(sc.decode(message.data));
+}
+
+/** Общая обёртка маршрутов проектов: таймаут и обрыв NATS — это 503. */
+async function proxyProjects(res, payload, label) {
+    try {
+        sendApiReply(res, await requestProjects(payload));
+    } catch (error) {
+        const timedOut =
+            error && (error.code === 'TIMEOUT' || /timeout/i.test(String(error.message)));
+        const status = error && error.status ? error.status : 503;
+
+        console.error(`❌ [Gateway] ${label}: ${error && error.message ? error.message : error}`);
+        res.status(status).json({
+            error: timedOut
+                ? 'Оркестратор не ответил на запрос проектов'
+                : 'Не удалось получить проекты из оркестратора',
+            details: error && error.message ? String(error.message) : String(error)
+        });
+    }
+}
+
+/** `GET /api/v1/projects` — проекты в движке (последние 100, свежие сверху). */
+app.get('/api/v1/projects', async (req, res) => {
+    await proxyProjects(res, { action: 'list' }, 'список проектов');
+});
+
+/**
+ * `GET /api/v1/projects/:projectId` — схема проекта.
+ *
+ * `?version=N` отдаёт версию из истории; без параметра — последнюю.
+ */
+app.get('/api/v1/projects/:projectId', async (req, res) => {
+    const payload = { action: 'get', projectId: req.params.projectId };
+    const version = Number(req.query.version);
+
+    if (Number.isInteger(version) && version > 0) payload.version = version;
+
+    await proxyProjects(res, payload, 'схема проекта');
+});
+
+/**
+ * `PUT /api/v1/projects/:projectId` — деплой схемы проекта.
+ *
+ * Тело: `{ name, bpmnXml }`; роль сессии берётся из `X-Actor-Role` (как у
+ * событий), чтобы история версий знала автора. Новый вызов поднимает версию.
+ */
+app.put('/api/v1/projects/:projectId', async (req, res) => {
+    const body = req.body || {};
+
+    await proxyProjects(
+        res,
+        {
+            action: 'deploy',
+            project: {
+                projectId: req.params.projectId,
+                name: body.name,
+                bpmnXml: body.bpmnXml,
+                updatedBy: actorOf(req)
+            }
+        },
+        'деплой проекта'
+    );
+});
+
+/** `GET /api/v1/projects/:projectId/versions` — история деплоев проекта. */
+app.get('/api/v1/projects/:projectId/versions', async (req, res) => {
+    await proxyProjects(
+        res,
+        { action: 'versions', projectId: req.params.projectId },
+        'история версий проекта'
     );
 });
 
@@ -421,6 +526,7 @@ app.get('/health', (req, res) => {
         orders_subject: ORDERS_SUBJECT,
         auth_subject: AUTH_SUBJECT,
         metrics_subject: METRICS_SUBJECT,
+        projects_subject: PROJECTS_SUBJECT,
         actor_header: 'X-Actor-Role'
     });
 });
