@@ -515,17 +515,50 @@ node tests/roles-auth.e2e.cjs   # 28 проверок; GATEWAY_URL — если 
 В Windows, где `bash` оказывается WSL без Node, наборы запускаются напрямую
 (`node tests/roles-auth.e2e.cjs`) или через переменную `NODE_BIN` с путём к `node.exe`.
 
-К ним добавлены живые наборы M7 — контракт метрик и фильтрация WS-подписки:
+К ним добавлены живые наборы M7 — контракт метрик и фильтрация WS-подписки — и
+демо-сценарий M8:
 
 ```bash
 node tests/metrics-api.e2e.cjs   # 37 проверок: сид legacy-таблиц → GET /api/v1/metrics
 node tests/ws-filter.e2e.cjs     # 12 проверок: три WS-клиента, события через NATS из пода
+node tests/dairy-plant.e2e.cjs   # 97 проверок: демо-схема завода целиком (см. «Демо-сценарий»)
 ```
 
 Событие «в обход шлюза» публикует [`tests/nats-publish.cjs`](tests/nats-publish.cjs):
 E2E копирует хелпер в под шлюза (только там есть зависимость `nats`) и пишет в
 JetStream напрямую. Иначе страховку рантайма не увидеть — шлюз отсекает чужую
 роль ещё до публикации, и записи `USER_TASK_DENIED` в аудите не появляется.
+
+### Демо-сценарий завода (M8)
+
+[`tests/dairy-plant.e2e.cjs`](tests/dairy-plant.e2e.cjs) гоняет **демо-схему
+кабинета**, а не синтетическую: XML вырезается из
+[`erp-simulator/src/bpmn-sdk/defaults/dairyPlant.js`](erp-simulator/src/bpmn-sdk/defaults/dairyPlant.js)
+(`DAIRY_PLANT_PROCESS_XML`, `DAIRY_SUPPLIER_PROCESS_XML`), поэтому расходятся не
+только движок и клиент — ловится и расхождение схемы с движком.
+
+| Сценарий | Маршрут | Что подтверждает |
+| --- | --- | --- |
+| `ok` | заказ → развилка ГП (`stockSufficient=false`) → закупка → поставщик → `MilkShipped` → приёмка → лаборатория → техцепочка → отгрузка ГП | корреляция сообщений M3 по `orderNum`, ветка закупки, весь технологический маршрут |
+| `reject` | `labPassed=false` → `Task_ReturnMilk` | брак по ГОСТ: возврат партии, склад сырья не активируется |
+| `crash` | `pasteurizeOk=false` → `Task_ERP_CriticalAlert` | `serviceTask` мок-ERP закрывает аварию, производство не продолжается |
+| `degraded` | `packOutcome=degraded` → `Tech_LogDegradation` → `Task_ERP_HandleDeviation` | деградация линии уходит в ERP, ГП на склад не поступает |
+
+Что видно только на живой проекции (и потому проверяется здесь, а не в Jest):
+
+- в `tokens` попадают только задачи (`bpmn:userTask`, `bpmn:serviceTask`):
+  catch-, throw- и end-события проекция не пишет. Поэтому сценарий проверяет
+  узлы-задачи и итоговый статус экземпляра, а не «финиш на `End_Main`»;
+- экземпляр поставщика создаёт движок (`trg:processTrigger`, префикс
+  `inst-supp-`), а корреляция ответа идёт по `orderNum` (`business_key` в БД
+  остаётся `NULL`) — тест находит поставщика запросом, а не по своему id;
+- `serviceTask` живёт в `ACTIVE` миллисекунды (мок-воркер отвечает сразу),
+  поэтому проверяется след узла, а не состояние ожидания;
+- уборка удаляет только следы прогона (`e2e-dairy-*` и `inst-supp-*`,
+  созданные после старта), определения остаются задеплоенными.
+
+Запуск: `tests/run-live-e2e.sh dairy` или `node tests/dairy-plant.e2e.cjs`
+(97 проверок, около полутора минут на живом кластере).
 
 Границы M6:
 
@@ -1430,7 +1463,7 @@ cd erp-simulator && npm install && npm start
 cd erp-simulator && npm run test:ci    # Jest: App + SDK (в т.ч. привязки sendEvent)
 cd erp-simulator && npm run sdk:refresh # пересборка вендорного бандла SDK (src/vendor)
 ./run-test.sh                          # E2E в кластере: tests/test_workflow.py в Job
-./tests/run-live-e2e.sh                # живые E2E M4+M6+M7 (заказы, роли, метрики, WS-фильтры)
+./tests/run-live-e2e.sh                # живые E2E: заказы, роли, метрики, WS-фильтры, демо-сценарий завода
 ./test_all.sh                          # cargo test + пересборка движка + NATS-сценарии ошибок/SLA
 ```
 
@@ -1601,7 +1634,8 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
 | [`tests/nats-publish.cjs`](tests/nats-publish.cjs) | Хелпер E2E: publish события прямо в JetStream из пода шлюза — проверяет страховку рантайма, которую шлюз закрывает собой |
 | [`tests/metrics-api.e2e.cjs`](tests/metrics-api.e2e.cjs) | Живой E2E API метрик (M7): сид legacy-таблиц → `GET /api/v1/metrics` через шлюз, цикл запуска, SLA открытого шага, разрезы шага/роли, предупреждение «нет схемы»; уборка следов через `psql` |
 | [`tests/ws-filter.e2e.cjs`](tests/ws-filter.e2e.cjs) | Живой E2E фильтров WS (M7): три клиента (query-фильтр, `subscribe` сообщением, без фильтров), события публикуются в NATS из пода шлюза, проверяется отсечение чужих экземпляров и ролей и сброс `unsubscribe` |
-| [`tests/run-live-e2e.sh`](tests/run-live-e2e.sh) | Раннер живых E2E (заказы M4 + роли M6 + метрики и WS-фильтры M7) по уже развёрнутому кластеру: без сборки образов и без Job'ов |
+| [`tests/run-live-e2e.sh`](tests/run-live-e2e.sh) | Раннер живых E2E (заказы M4 + роли M6 + метрики и WS-фильтры M7 + демо-сценарий завода M8) по уже развёрнутому кластеру: без сборки образов и без Job'ов |
+| [`tests/dairy-plant.e2e.cjs`](tests/dairy-plant.e2e.cjs) | Живой E2E демо-сценария (M8): схема берётся из демо-клиента, проход заказа по трём пулам (закупка → сообщение поставщику → `MilkShipped` → техцепочка → отгрузка) и три негативные ветки (брак, авария ПОУ, деградация линии) с `serviceTask` мок-ERP |
 
 | [`schema.sql`](schema.sql), [`db-init-configmap.yaml`](db-init-configmap.yaml) | Таблицы и ограничения по длинам идентификаторов |
 | [`erp-simulator/docs/dairy-plant-roadmap.md`](erp-simulator/docs/dairy-plant-roadmap.md) | Дорожная карта демо-проекта «Молочный завод»: что уже играется в кабинете, какие разрывы (граф, воркеры, межпроцессные сообщения, роли, метрики) и в каком порядке закрываются (M1–M8) |

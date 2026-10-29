@@ -7,6 +7,7 @@ set -e
 # публикуют из пода шлюза.
 #
 #   tests/run-live-e2e.sh                  # все наборы
+#   tests/run-live-e2e.sh dairy            # только демо-сценарий завода (M8)
 #   tests/run-live-e2e.sh metrics          # только API метрик (M7)
 #   tests/run-live-e2e.sh ws-filter        # только фильтры WS-подписки (M7)
 #   tests/run-live-e2e.sh roles            # только роли (M6)
@@ -31,7 +32,7 @@ command -v kubectl > /dev/null 2>&1 || {
 
 SUITES=("$@")
 if [ ${#SUITES[@]} -eq 0 ]; then
-    SUITES=(orders roles metrics ws-filter)
+    SUITES=(orders roles metrics ws-filter dairy)
 fi
 
 for suite in "${SUITES[@]}"; do
@@ -40,8 +41,9 @@ for suite in "${SUITES[@]}"; do
         roles|roles-auth) SCRIPT="tests/roles-auth.e2e.cjs" ;;
         metrics|metrics-api) SCRIPT="tests/metrics-api.e2e.cjs" ;;
         ws|ws-filter|filters) SCRIPT="tests/ws-filter.e2e.cjs" ;;
+        dairy|dairy-plant) SCRIPT="tests/dairy-plant.e2e.cjs" ;;
         *)
-            echo "❌ Неизвестный набор: ${suite} (ожидается orders, roles, metrics или ws-filter)"
+            echo "❌ Неизвестный набор: ${suite} (ожидается orders, roles, metrics, ws-filter или dairy)"
             exit 2
             ;;
     esac
