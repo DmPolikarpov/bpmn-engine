@@ -55,6 +55,11 @@ const MINUTE = 60 * 1000;
 const PROCESS_ID = 'e2e-metrics-proc';
 const INSTANCE_DONE = 'e2e-metrics-done';
 const INSTANCE_OPEN = 'e2e-metrics-open';
+/** Повторно активированный узел (M8): проверка `state_changed_at`. */
+const REOPEN_PROCESS_ID = 'e2e-metrics-reopen';
+const INSTANCE_REOPEN = 'e2e-metrics-rework';
+/** Заказ, привязанный к завершённому запуску (M4/M8). */
+const ORDER_NUM = '№E2E-METRICS';
 
 const results = [];
 
@@ -136,7 +141,8 @@ const seed = `
 DELETE FROM execution_history WHERE instance_id LIKE 'e2e-metrics-%';
 DELETE FROM tokens WHERE instance_id LIKE 'e2e-metrics-%';
 DELETE FROM process_instances WHERE id LIKE 'e2e-metrics-%';
-DELETE FROM process_definitions WHERE id = '${PROCESS_ID}';
+DELETE FROM process_definitions WHERE id IN ('${PROCESS_ID}', '${REOPEN_PROCESS_ID}');
+DELETE FROM orders WHERE order_num = '${ORDER_NUM}';
 
 INSERT INTO process_definitions (id, name, version, bpmn_xml)
 VALUES ('${PROCESS_ID}', 'E2E метрики', 1, '<definitions />');
@@ -149,11 +155,23 @@ VALUES ('${INSTANCE_DONE}:Task_Check', '${INSTANCE_DONE}', 'Task_Check', 'COMPLE
 INSERT INTO execution_history (instance_id, event_type, element_id, actor, created_at)
 VALUES ('${INSTANCE_DONE}', 'USER_TASK_COMPLETED', 'Task_Check', 'operator', NOW() - INTERVAL '2 minutes');
 
+-- Заказ (M4): по нему движок подписывает запуск номером заказа (M8).
+INSERT INTO orders (order_num, nomenclature, volume_liters, fat_content, packaging, due_date, counterparty, customer_instance_id)
+VALUES ('${ORDER_NUM}', 'E2E молоко', 100, 3.2, 'ПЭТ 1 л', CURRENT_DATE + 7, 'E2E', '${INSTANCE_DONE}');
+
 -- Активный запуск: шаг висит 30 минут — при пороге 15 минут это нарушение SLA.
 INSERT INTO process_instances (id, definition_id, status, created_at, updated_at)
 VALUES ('${INSTANCE_OPEN}', '${PROCESS_ID}', 'ACTIVE', NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '30 minutes');
 INSERT INTO tokens (id, instance_id, element_id, state, created_at)
 VALUES ('${INSTANCE_OPEN}:Task_Wait', '${INSTANCE_OPEN}', 'Task_Wait', 'ACTIVE', NOW() - INTERVAL '30 minutes');
+
+-- Повторно активированный узел (M8): строка токена старая, но ждёт он 2 минуты.
+INSERT INTO process_definitions (id, name, version, bpmn_xml)
+VALUES ('${REOPEN_PROCESS_ID}', 'E2E повторная активация', 1, '<definitions />');
+INSERT INTO process_instances (id, definition_id, status, created_at, updated_at)
+VALUES ('${INSTANCE_REOPEN}', '${REOPEN_PROCESS_ID}', 'ACTIVE', NOW() - INTERVAL '3 hours', NOW() - INTERVAL '2 minutes');
+INSERT INTO tokens (id, instance_id, element_id, state, created_at, state_changed_at)
+VALUES ('${INSTANCE_REOPEN}:Task_Rework', '${INSTANCE_REOPEN}', 'Task_Rework', 'ACTIVE', NOW() - INTERVAL '3 hours', NOW() - INTERVAL '2 minutes');
 `;
 async function runChecks() {
     sql(seed, 'сид');
@@ -194,6 +212,7 @@ async function runChecks() {
     check('финиш из проекции', done.finishedBy === 'legacy', done.finishedBy);
     check('статус завершённого', done.status === 'COMPLETED', done.status);
     check('время финиша — ISO', /^\d{4}-\d{2}-\d{2}T/.test(done.finishedAt || ''), done.finishedAt);
+    check('номер заказа в запуске (M8)', done.orderNum === ORDER_NUM, done.orderNum);
 
     const open = runs.find((run) => run.instanceId === INSTANCE_OPEN) || {};
     check('активный запуск без финиша', open.finishedAt === null, open.finishedAt);
@@ -236,6 +255,26 @@ async function runChecks() {
         limited.body.processes && limited.body.processes[0].lastRuns.length
     );
 
+    // M8: ожидание считается от последней активации (`state_changed_at`).
+    const reopen = await call(
+        'GET',
+        `/api/v1/metrics?processId=${REOPEN_PROCESS_ID}&slaMinutes=15&limit=5`
+    );
+    const reopenProcess = (reopen.body.processes || [])[0] || {};
+    const reopenRun = (reopenProcess.lastRuns || [])[0] || {};
+    check(
+        'повторная активация: шаг ждёт от последней записи состояния',
+        reopenRun.slaBreached === false,
+        { breached: reopenRun.slaBreached, steps: reopenRun.breachedSteps }
+    );
+    check('повторная активация не даёт ни одного нарушения', reopenProcess.slaSteps === 0, reopenProcess.slaSteps);
+    const reopenStep = (reopen.body.steps || [])[0] || {};
+    check(
+        'ожидание повторно активированного шага ≈ 2 минуты',
+        near(reopenStep.averageMs, 2 * MINUTE),
+        reopenStep.averageMs
+    );
+
     const clamped = await call('GET', `/api/v1/metrics?processId=${PROCESS_ID}&slaMinutes=0`);
     check('порог SLA прижат к 1 минуте', clamped.body.slaMinutes === 1, clamped.body.slaMinutes);
 
@@ -252,7 +291,8 @@ async function runChecks() {
         DELETE FROM execution_history WHERE instance_id LIKE 'e2e-metrics-%';
         DELETE FROM tokens WHERE instance_id LIKE 'e2e-metrics-%';
         DELETE FROM process_instances WHERE id LIKE 'e2e-metrics-%';
-        DELETE FROM process_definitions WHERE id = '${PROCESS_ID}';
+        DELETE FROM process_definitions WHERE id IN ('${PROCESS_ID}', '${REOPEN_PROCESS_ID}');
+        DELETE FROM orders WHERE order_num = '${ORDER_NUM}';
         `,
         'очистка'
     );

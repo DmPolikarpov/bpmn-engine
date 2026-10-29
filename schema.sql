@@ -24,7 +24,11 @@ CREATE TABLE IF NOT EXISTS tokens (
     instance_id VARCHAR(64) NOT NULL REFERENCES process_instances(id) ON DELETE CASCADE,
     element_id VARCHAR(255) NOT NULL,
     state VARCHAR(32) NOT NULL DEFAULT 'ACTIVE',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    -- Последняя смена состояния узла (миграция 0006): от неё считается ожидание
+    -- шага, потому что `created_at` — первое появление узла и после повторной
+    -- активации (переработка, возврат на шаг) врёт.
+    state_changed_at TIMESTAMP WITH TIME ZONE
 );
 
 -- 4. Таблица истории и аудита (для Exactly-Once)

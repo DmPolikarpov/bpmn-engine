@@ -1074,8 +1074,9 @@ curl -s 'http://localhost:8080/api/v1/metrics?processId=zakaz&defectNodes=End_De
                   "averageStepMs": 61000, "slaRuns": 1, "slaSteps": 2,
                   "defectRuns": 1, "defectShare": 0.111,
                   "outcomes": [{ "nodeId": "End_Ok", "runs": 8 }],
-                  "lastRuns": [{ "instanceId": "inst-cust-1", "status": "COMPLETED",
-                                 "finishedBy": "graph", "slaBreached": false }] }],
+                  "lastRuns": [{ "instanceId": "inst-cust-1", "orderNum": "№1042",
+                                 "status": "COMPLETED", "finishedBy": "graph",
+                                 "slaBreached": false }] }],
   "steps": [{ "elementId": "Task_Accept", "role": "operator", "samples": 9, "averageMs": 61000 }],
   "roles": [{ "role": "operator", "steps": 9, "averageMs": 61000 }],
   "warnings": [] }
@@ -1083,10 +1084,13 @@ curl -s 'http://localhost:8080/api/v1/metrics?processId=zakaz&defectNodes=End_De
 
 Откуда берутся цифры:
 
-- **запуск** — legacy-проекция `process_instances`; **шаг** — активация
-  `tokens.created_at` и завершение `execution_history.created_at` (миллисекунды),
-  а если пары нет — `TokenArrived`/`TokenCompleted` вендорной истории (секунды,
-  отсюда `precisionMs: 1000`);
+- **запуск** — legacy-проекция `process_instances`; **шаг** — последняя активация
+  `tokens` (`state_changed_at`, у старых строк `created_at`) и завершение
+  `execution_history.created_at` (миллисекунды), а если пары нет —
+  `TokenArrived`/`TokenCompleted` вендорной истории (секунды, отсюда
+  `precisionMs: 1000`);
+- **номер заказа** в `lastRuns.orderNum` — из таблицы `orders` (M4): экземпляр
+  завода и поставщика связаны с заказом, экземпляр вне заказа поля не получает;
 - **финиш** — `ProcessCompleted`/`ProcessTerminated`, иначе последний узел
   сверяется с `endEvent` **определения** (`bpmn_xml`), а не с «узлом без
   исходящих связей схемы»; видно источник в `finishedBy` (`event` / `graph` /
@@ -1553,10 +1557,16 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
    Кабинет фильтры не объявляет намеренно: он **обнаруживает** новые
    экземпляры по событиям (движок создаёт вторую сторону сам), поэтому
    служебные `inst-deploy-*`/`inst-def-*` по-прежнему отбрасывает клиент.
-9. **SLA считает таймаут от `created_at`, а не от последней активации.** В
-    `save_token_state` ветка `UPDATE` меняет только `state`, поэтому повторно
-    активированный узел (цикл/возврат) может уйти в `TIMED_OUT` сразу после
-    активации — если строке токена уже больше `SLA_TIMEOUT_MINUTES`.
+9. **SLA и ожидание шага считаются от последней активации узла (M8).** Раньше
+    `save_token_state` в ветке `UPDATE` менял только `state`, поэтому повторно
+    активированный узел (цикл, возврат на шаг после переработки) уходил в
+    `TIMED_OUT` сразу после активации: строке токена уже больше
+    `SLA_TIMEOUT_MINUTES`. Теперь проекция пишет `tokens.state_changed_at`
+    (миграция [`0006`](bpmn-engine/migrations/0006_token_state_changed_at.sql), у
+    старых строк бэкфилл из `created_at`), его читают и SLA-воркер
+    (`main.rs`), и API метрик (`TokenRow::waiting_since`). Для закрытого шага
+    началом остаётся `created_at` — конец берётся из аудита, —
+    поэтому длительность завершённых шагов не меняется.
 10. **Роль узла — авторизация на сервере, но роль сессии не удостоверена.** С M6
     движок разбирает `bpmn:potentialOwner`/`act:userAction/@role` и отклоняет
     событие с чужой ролью (`403` от шлюза, аудит в `execution_history`), но
@@ -1592,9 +1602,9 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
     то же, а истёкший SLA виден в плитках `SLA`/`Ожидание шага`. Метрика браузера
     (`bpmn-process-metrics`) осталась запасным источником, когда шлюз недоступен;
     ответ сервера кэшируется (`bpmn-process-metrics-cache`), чтобы панель не
-    пустела. Ограничение осталось одно: номер заказа на карточке — локальный
-    (`orderNum` в payload), в ответе движка заказ не участвует, поэтому подписью
-    серверного столбика служит id экземпляра.
+    пустела. С M8 в ответе движка есть `orderNum` (связь `orders` ↔ экземпляры
+    контуров), поэтому столбик подписывается номером заказа; экземпляр, запущенный
+    не из заказа, по-прежнему подписывается id.
 
 ## Карта исходников
 

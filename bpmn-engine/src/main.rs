@@ -106,8 +106,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
             interval.tick().await;
 
+            // Простой считается от последней активации токена: `created_at` —
+            // это первое появление узла, и после повторной активации (цикл,
+            // возврат на шаг) он уводил бы токен в `TIMED_OUT` сразу же
+            // (ограничение 9, миграция `0006`).
             let query = format!(
-                "SELECT instance_id, element_id FROM tokens WHERE state = 'ACTIVE' AND created_at < NOW() - INTERVAL '{} minutes'",
+                "SELECT instance_id, element_id FROM tokens \
+                 WHERE state = 'ACTIVE' AND COALESCE(state_changed_at, created_at) < NOW() - INTERVAL '{} minutes'",
                 timeout_minutes
             );
 

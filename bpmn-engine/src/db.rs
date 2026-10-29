@@ -54,11 +54,16 @@ pub async fn save_token_state(
 ) -> Result<(), sqlx::Error> {
     let token_id = format!("{}:{}", instance_id, element_id);
 
-    // 1. Пробуем обновить статус существующего токена
+    // 1. Пробуем обновить статус существующего токена.
+    //
+    // `state_changed_at` обязателен: `created_at` — первое появление узла, и
+    // повторная активация (переработка партии, возврат на шаг) иначе оставляла
+    // ожидание от первого раза, а SLA показывал ложное «просрочено» (M8,
+    // ограничение 9 в README; миграция `0006`).
     let rows_affected = sqlx::query(
         r#"
         UPDATE tokens 
-        SET state = $1 
+        SET state = $1, state_changed_at = NOW() 
         WHERE instance_id = $2 AND element_id = $3;
         "#,
     )
@@ -73,8 +78,8 @@ pub async fn save_token_state(
     if rows_affected == 0 {
         sqlx::query(
             r#"
-            INSERT INTO tokens (id, instance_id, element_id, state, created_at)
-            VALUES ($1, $2, $3, $4, NOW());
+            INSERT INTO tokens (id, instance_id, element_id, state, created_at, state_changed_at)
+            VALUES ($1, $2, $3, $4, NOW(), NOW());
             "#,
         )
         .bind(&token_id)

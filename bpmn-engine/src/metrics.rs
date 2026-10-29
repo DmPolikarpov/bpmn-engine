@@ -236,6 +236,10 @@ pub struct RunMetrics {
     pub sla_breached: bool,
     /// Шаги этого запуска, превысившие SLA (что именно ждало).
     pub breached_steps: Vec<BreachedStep>,
+    /// Номер заказа (`orders`, M4). `None` — экземпляр запущен не из заказа:
+    /// панель подписывает столбик id экземпляра.
+    #[serde(default)]
+    pub order_num: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -297,8 +301,22 @@ pub struct Snapshot {
     pub instances: Vec<LegacyInstance>,
     pub tokens: Vec<TokenRow>,
     pub step_log: Vec<StepLogRow>,
+    /// Заказы: связь бизнес-ключа с экземплярами контуров (`orders`, M4).
+    pub orders: Vec<OrderLink>,
     /// Чтение упало в лимит: цифры неполные, об этом предупреждаем в ответе.
     pub truncated: bool,
+}
+
+/// Связь заказа с экземплярами (`orders`).
+///
+/// Нужна ради подписи: `instance_id` — техническая строка (`inst-cust-…`), а
+/// руководитель ищет заказ по номеру. Номер заказа и есть корреляционный ключ
+/// сообщений M3 (`orderNum`), поэтому одного поля достаточно обоим контурам.
+#[derive(Debug, Clone, Default)]
+pub struct OrderLink {
+    pub order_num: String,
+    pub customer_instance_id: Option<String>,
+    pub supplier_instance_id: Option<String>,
 }
 
 /// Строка вендорной истории (`history_event`).
@@ -336,6 +354,34 @@ pub struct TokenRow {
     pub element_id: String,
     pub state: String,
     pub created_at: DateTime<Utc>,
+    /// Время последней записи состояния (`state_changed_at`, миграция `0006`).
+    /// `None` — строка старше миграции либо колонка не заполнена.
+    pub state_changed_at: Option<DateTime<Utc>>,
+}
+
+impl TokenRow {
+    /// С какого момента узел ждёт **сейчас** — последняя активация.
+    ///
+    /// `created_at` пишется один раз, поэтому у повторно активированного узла
+    /// (переработка партии, возврат на предыдущий шаг) ожидание считалось бы от
+    /// первого раза и SLA показывал ложное «просрочено» (M8, ограничение 9).
+    /// У старых строк `state_changed_at` нет — тогда поведение прежнее.
+    pub fn waiting_since(&self) -> DateTime<Utc> {
+        self.state_changed_at.unwrap_or(self.created_at)
+    }
+
+    /// Начало шага для расчёта длительности.
+    ///
+    /// Открытый шаг ждёт с последней активации (`waiting_since`). У закрытого
+    /// шага `state_changed_at` — это время завершения, поэтому началом остаётся
+    /// `created_at`, а конец берётся из аудита (`execution_history`).
+    pub fn started_at(&self) -> DateTime<Utc> {
+        if self.state == "ACTIVE" {
+            self.waiting_since()
+        } else {
+            self.created_at
+        }
+    }
 }
 
 /// Аудит шага (`execution_history`): кто и когда завершил узел.
@@ -474,7 +520,7 @@ impl MetricsStore for PgMetricsStore {
 
         let token_rows = sqlx::query(
             r#"
-            SELECT instance_id, element_id, state, created_at
+            SELECT instance_id, element_id, state, created_at, state_changed_at
             FROM tokens
             ORDER BY created_at
             LIMIT $1
@@ -491,6 +537,7 @@ impl MetricsStore for PgMetricsStore {
                 element_id: row.get("element_id"),
                 state: row.get("state"),
                 created_at: row.get("created_at"),
+                state_changed_at: row.try_get("state_changed_at").ok().flatten(),
             })
             .collect();
 
@@ -519,12 +566,38 @@ impl MetricsStore for PgMetricsStore {
             })
             .collect();
 
+        // Заказы нужны только для подписи запусков: если таблицы нет (старая
+        // БД без M4), панель просто подпишет столбик id экземпляра.
+        let orders = match sqlx::query(
+            r#"
+            SELECT order_num, customer_instance_id, supplier_instance_id
+            FROM orders
+            ORDER BY created_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limits.rows)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows
+                .iter()
+                .map(|row| OrderLink {
+                    order_num: row.get("order_num"),
+                    customer_instance_id: row.get("customer_instance_id"),
+                    supplier_instance_id: row.get("supplier_instance_id"),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
         Ok(Snapshot {
             history,
             definitions,
             instances,
             tokens,
             step_log,
+            orders,
             truncated,
         })
     }
@@ -742,6 +815,8 @@ pub struct RunFact {
     pub status: String,
     pub finished_by: Option<String>,
     pub last_node: Option<String>,
+    /// Номер заказа, если экземпляр запущен из заказа (`orders`, M4).
+    pub order_num: Option<String>,
     pub steps: Vec<StepFact>,
 }
 
@@ -802,6 +877,20 @@ pub fn build_runs(snapshot: &Snapshot) -> Vec<RunFact> {
             .push(row);
     }
 
+    // Экземпляр → номер заказа: у заказа до двух контуров (M4).
+    let mut order_of: HashMap<&str, &str> = HashMap::new();
+    for link in &snapshot.orders {
+        for instance_id in [
+            link.customer_instance_id.as_deref(),
+            link.supplier_instance_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            order_of.insert(instance_id, link.order_num.as_str());
+        }
+    }
+
     let mut ids: BTreeSet<&str> = BTreeSet::new();
     ids.extend(events.keys().copied());
     ids.extend(legacy.keys().copied());
@@ -816,6 +905,7 @@ pub fn build_runs(snapshot: &Snapshot) -> Vec<RunFact> {
                 tokens.get(instance_id).map(Vec::as_slice).unwrap_or(&[]),
                 step_log.get(instance_id).map(Vec::as_slice).unwrap_or(&[]),
                 &definitions,
+                order_of.get(instance_id).copied(),
             )
         })
         .collect();
@@ -839,6 +929,7 @@ fn build_run(
     tokens: &[&TokenRow],
     step_log: &[&StepLogRow],
     definitions: &DefinitionIndex,
+    order_num: Option<&str>,
 ) -> RunFact {
     let mut process_raw = legacy.map(|instance| instance.definition_id.clone());
     let mut started_ms: Option<i64> = None;
@@ -943,7 +1034,8 @@ fn build_run(
     // legacy-проекции: `tokens.created_at` + `execution_history.created_at`.
     if !has_vendor_tokens {
         for token in tokens {
-            let start = token.created_at.timestamp_millis();
+            // Открытый шаг ждёт с последней активации (`state_changed_at`).
+            let start = token.started_at().timestamp_millis();
             let finished = step_log
                 .iter()
                 .filter(|row| row.element_id == token.element_id)
@@ -980,7 +1072,7 @@ fn build_run(
             .iter()
             .filter(|token| token.element_id == step.element_id)
             .find_map(|token| {
-                let start = token.created_at.timestamp_millis();
+                let start = token.started_at().timestamp_millis();
                 let finish = step_log
                     .iter()
                     .filter(|row| row.element_id == step.element_id)
@@ -1000,7 +1092,7 @@ fn build_run(
                     .iter()
                     .find(|token| token.element_id == step.element_id && token.state == "ACTIVE")
                 {
-                    step.started_ms = token.created_at.timestamp_millis();
+                    step.started_ms = token.started_at().timestamp_millis();
                 }
             }
             None => {}
@@ -1054,6 +1146,10 @@ fn build_run(
         status,
         finished_by,
         last_node: last_node.map(|(_, node)| node),
+        order_num: order_num
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
         steps,
     }
 }
@@ -1293,6 +1389,7 @@ fn process_metrics(
             finished_by: run.finished_by.clone(),
             sla_breached,
             breached_steps: breached,
+            order_num: run.order_num.clone(),
         });
     }
 
@@ -1466,6 +1563,25 @@ mod tests {
             element_id: element.to_string(),
             state: state.to_string(),
             created_at: at(at_ms),
+            state_changed_at: None,
+        }
+    }
+
+    /// Токен с историей состояний: `created_ms` — первое появление узла,
+    /// `changed_ms` — последняя активация (колонка `state_changed_at`).
+    fn token_reactivated(
+        instance: &str,
+        element: &str,
+        state: &str,
+        created_ms: i64,
+        changed_ms: i64,
+    ) -> TokenRow {
+        TokenRow {
+            instance_id: instance.to_string(),
+            element_id: element.to_string(),
+            state: state.to_string(),
+            created_at: at(created_ms),
+            state_changed_at: Some(at(changed_ms)),
         }
     }
 
@@ -1490,6 +1606,7 @@ mod tests {
             instances,
             tokens,
             step_log,
+            orders: Vec::new(),
             truncated: false,
         }
     }
@@ -1777,6 +1894,7 @@ mod tests {
                 step_log("L", "Task_Start", "operator", T0 + 30_000),
                 step_log("L", "Task_Check", "technologist", T0 + 90_000),
             ],
+            orders: Vec::new(),
             truncated: false,
         };
 
@@ -1813,6 +1931,120 @@ mod tests {
         assert_eq!(run.finished_by.as_deref(), Some("legacy"));
         assert_eq!(run.finished_at, iso(Some(T0 + 90_000)));
         assert_eq!(run.last_node, None);
+    }
+
+    #[test]
+    fn last_runs_carry_order_number_from_orders_table() {
+        // Заказ связывает два контура: у завода `inst-cust-1`, у поставщика
+        // `inst-supp-1`. Панель подписывает оба столбика номером заказа.
+        let mut linked = snapshot(
+            vec![
+                started("inst-cust-1", T0),
+                arrived("inst-cust-1", "Task_Accept", T0 + 10_000),
+            ],
+            vec![
+                legacy("inst-cust-1", "ACTIVE", T0, T0 + 10_000),
+                legacy("inst-supp-1", "ACTIVE", T0, T0 + 10_000),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        linked.orders = vec![OrderLink {
+            order_num: "№1042".to_string(),
+            customer_instance_id: Some("inst-cust-1".to_string()),
+            supplier_instance_id: Some("inst-supp-1".to_string()),
+        }];
+        let reply = aggregate(
+            &linked,
+            &ask(serde_json::json!({})),
+            &Options::default(),
+            T0 + 60_000,
+        );
+
+        let order_of = |instance: &str| {
+            reply
+                .processes
+                .iter()
+                .flat_map(|process| process.last_runs.iter())
+                .find(|run| run.instance_id == instance)
+                .and_then(|run| run.order_num.clone())
+        };
+
+        assert_eq!(order_of("inst-cust-1").as_deref(), Some("№1042"));
+        assert_eq!(order_of("inst-supp-1").as_deref(), Some("№1042"));
+
+        // Экземпляр вне заказа: подписи нет, панель покажет id (поведение до M8).
+        let mut without = snapshot(
+            Vec::new(),
+            vec![legacy("inst-cust-2", "ACTIVE", T0, T0)],
+            Vec::new(),
+            Vec::new(),
+        );
+        without.orders = Vec::new();
+        let reply = aggregate(
+            &without,
+            &ask(serde_json::json!({})),
+            &Options::default(),
+            T0 + 60_000,
+        );
+        assert_eq!(reply.processes[0].last_runs[0].order_num, None);
+    }
+
+    #[test]
+    fn sla_counts_waiting_from_last_activation_of_token() {
+        // Узел впервые появился в T0 и был закрыт, а за 5 минут до «сейчас»
+        // активирован снова — так выглядит возврат на шаг (переработка партии).
+        let now = T0 + 200 * MINUTE;
+        let reactivated = snapshot(
+            Vec::new(),
+            vec![legacy("R", "ACTIVE", T0, now)],
+            vec![token_reactivated(
+                "R",
+                "Task_Accept",
+                "ACTIVE",
+                T0,
+                now - 5 * MINUTE,
+            )],
+            Vec::new(),
+        );
+
+        let reply = aggregate(
+            &reactivated,
+            &ask(serde_json::json!({ "slaMinutes": 30 })),
+            &Options::default(),
+            now,
+        );
+
+        let process = &reply.processes[0];
+        assert_eq!(process.open_steps, 1);
+        assert_eq!(process.sla_runs, 0, "5 минут ожидания при SLA 30 — не просрочка");
+        assert_eq!(process.sla_steps, 0);
+
+        let run = &process.last_runs[0];
+        assert!(!run.sla_breached);
+        assert!(run.breached_steps.is_empty());
+        assert_eq!(find_step(&reply, "Task_Accept").average_ms, 5 * MINUTE);
+
+        // Строка без `state_changed_at` (до миграции 0006): поведение прежнее —
+        // ожидание от первого появления узла, поэтому SLA видит просрочку.
+        let stale = snapshot(
+            Vec::new(),
+            vec![legacy("R", "ACTIVE", T0, now)],
+            vec![token("R", "Task_Accept", "ACTIVE", T0)],
+            Vec::new(),
+        );
+        let stale_reply = aggregate(
+            &stale,
+            &ask(serde_json::json!({ "slaMinutes": 30 })),
+            &Options::default(),
+            now,
+        );
+
+        assert_eq!(stale_reply.processes[0].sla_runs, 1);
+        assert_eq!(
+            find_step(&stale_reply, "Task_Accept").average_ms,
+            200 * MINUTE
+        );
     }
 
 

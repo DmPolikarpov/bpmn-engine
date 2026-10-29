@@ -34,7 +34,10 @@ data:
         instance_id VARCHAR(64) NOT NULL REFERENCES process_instances(id) ON DELETE CASCADE,
         element_id VARCHAR(255) NOT NULL,
         state VARCHAR(32) NOT NULL DEFAULT 'ACTIVE',
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        -- Последняя смена состояния узла (миграция 0006): от неё считается
+        -- ожидание шага, а не от первого появления узла.
+        state_changed_at TIMESTAMP WITH TIME ZONE
     );
 
     -- История и аудит
