@@ -107,3 +107,8 @@ data:
     -- Правило для новых таблиц контура: если её структуру двигают миграции,
     -- владельцем должен быть bpmn_user, а не superuser из initdb.
     ALTER TABLE execution_history OWNER TO bpmn_user;
+
+    -- То же для `tokens`: миграция 0006 добавляет `state_changed_at` (M8).
+    -- На уже развёрнутой БД владение передаётся вручную —
+    -- `ALTER TABLE tokens OWNER TO bpmn_user;` (см. README, «Известные грабли»).
+    ALTER TABLE tokens OWNER TO bpmn_user;
