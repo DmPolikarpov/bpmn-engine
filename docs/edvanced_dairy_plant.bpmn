@@ -1,0 +1,1003 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions
+  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+  id="Definitions_MultiPool"
+  targetNamespace="http://bpmn.io/schema/bpmn">
+
+  <!-- === СООБЩЕНИЯ (контракты между пулами) === -->
+  <bpmn:message id="Msg_ClientOrder" name="Заказ клиента"/>
+  <bpmn:message id="Msg_OrderConfirmed" name="Подтверждение заказа клиенту"/>
+  <bpmn:message id="Msg_POToSupplier" name="Заказ на сырьё"/>
+  <bpmn:message id="Msg_POConfirmed" name="Подтверждение заказа поставщиком"/>
+  <bpmn:message id="Msg_MilkShipped" name="Партия молока с ТТН"/>
+  <bpmn:message id="Msg_GoodsToClient" name="Готовая продукция клиенту"/>
+
+  <!-- === ЭСКАЛАЦИИ И ОШИБКИ (L2/L3 MES -> L4 ERP) === -->
+  <bpmn:escalation id="Esc_EquipmentDegradation" name="Деградация оборудования (Speed Loss)" escalationCode="ESC_SPEED_LOSS"/>
+  <bpmn:error id="Err_CriticalFailure" name="Глобальная авария оборудования (Line Stop)" errorCode="ERR_LINE_STOP"/>
+
+  <bpmn:collaboration id="Collab_1">
+    <bpmn:participant id="Part_Client"   name="Клиент"            processRef="Process_Client"/>
+    <bpmn:participant id="Part_Dairy"    name="Молочный завод"    processRef="Process_Dairy"/>
+    <bpmn:participant id="Part_Supplier" name="Поставщик сырья"   processRef="Process_Supplier"/>
+  </bpmn:collaboration>
+
+  <!-- ==================== ПУЛ 1: КЛИЕНТ ==================== -->
+  <bpmn:process id="Process_Client" isExecutable="false">
+    <bpmn:startEvent id="Start_Client" name="Начало">
+      <bpmn:outgoing>SF_C1</bpmn:outgoing>
+    </bpmn:startEvent>
+
+    <bpmn:sendTask id="Task_SendOrder" name="Отправить заказ">
+      <bpmn:documentation>СОП-К-01: Оформление заказа через портал / менеджера. Проверка номенклатуры и сроков.</bpmn:documentation>
+      <bpmn:incoming>SF_C1</bpmn:incoming>
+      <bpmn:outgoing>SF_C2</bpmn:outgoing>
+    </bpmn:sendTask>
+
+    <bpmn:intermediateCatchEvent id="Event_OrderConfirmed" name="Заказ подтверждён">
+      <bpmn:incoming>SF_C2</bpmn:incoming>
+      <bpmn:outgoing>SF_C3</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MsgDef_OrderConfirmed" messageRef="Msg_OrderConfirmed"/>
+    </bpmn:intermediateCatchEvent>
+
+    <bpmn:intermediateCatchEvent id="Event_GoodsReceived" name="Товар получен">
+      <bpmn:incoming>SF_C3</bpmn:incoming>
+      <bpmn:outgoing>SF_C4</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MsgDef_GoodsReceived" messageRef="Msg_GoodsToClient"/>
+    </bpmn:intermediateCatchEvent>
+
+    <bpmn:endEvent id="End_Client" name="Конец">
+      <bpmn:incoming>SF_C4</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <bpmn:sequenceFlow id="SF_C1" sourceRef="Start_Client" targetRef="Task_SendOrder"/>
+    <bpmn:sequenceFlow id="SF_C2" sourceRef="Task_SendOrder" targetRef="Event_OrderConfirmed"/>
+    <bpmn:sequenceFlow id="SF_C3" sourceRef="Event_OrderConfirmed" targetRef="Event_GoodsReceived"/>
+    <bpmn:sequenceFlow id="SF_C4" sourceRef="Event_GoodsReceived" targetRef="End_Client"/>
+  </bpmn:process>
+
+  <!-- ==================== ПУЛ 2: МОЛОЧНЫЙ ЗАВОД ==================== -->
+  <bpmn:process id="Process_Dairy" isExecutable="false">
+
+    <bpmn:laneSet id="LaneSet_Dairy">
+      <bpmn:lane id="Lane_Sales" name="Менеджер по продажам">
+        <bpmn:documentation>ДИ-МЕН-ПР-01: Должностная инструкция менеджера по продажам. Право принимать заказы, резервировать ГП.</bpmn:documentation>
+        <bpmn:flowNodeRef>Start_Dairy</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_ReceiveOrder</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_ProcessOrder</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_CheckStock</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Gateway_Stock</bpmn:flowNodeRef>
+      </bpmn:lane>
+
+      <bpmn:lane id="Lane_Purchase" name="Менеджер по закупкам">
+        <bpmn:documentation>ДИ-МЕН-ЗАК-01: Должностная инструкция менеджера по закупкам. Лимиты закупки, работа с поставщиками.</bpmn:documentation>
+        <bpmn:flowNodeRef>Task_CreatePO</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_ApprovePO</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_SendPO</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Event_POConfirmed</bpmn:flowNodeRef>
+      </bpmn:lane>
+
+      <bpmn:lane id="Lane_QC" name="Приёмка и лаборатория">
+        <bpmn:documentation>ДИ-ПРИЁМ-01 / ДИ-ЛАБ-01: Приёмщик молочного сырья, лаборант. Право отказа партии по ГОСТ.</bpmn:documentation>
+        <bpmn:flowNodeRef>Task_ReceiveMilk</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_AcceptMilk</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_AnalyzeMilk</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Gateway_Quality</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_ReturnMilk</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>End_Reject</bpmn:flowNodeRef>
+      </bpmn:lane>
+
+      <bpmn:lane id="Lane_Warehouse" name="Склад сырья и ГП">
+        <bpmn:documentation>ДИ-КЛАД-01: Кладовщик. Материальная ответственность, учёт партий сырья в танках хранения и приёмка паллет готовой продукции в холодильную камеру в 1С:ERP / WMS.</bpmn:documentation>
+        <bpmn:flowNodeRef>Task_StoreMilk</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_StoreFG</bpmn:flowNodeRef>
+      </bpmn:lane>
+
+      <bpmn:lane id="Lane_Prod" name="Производство (Цех / MES)">
+        <bpmn:documentation>ДИ-ОПЕР-01 / ДИ-ТЕХН-01: Оператор линии, технолог цеха. Управление технологическим процессом в MES/SCADA, эскалация деградаций и глобальных аварий в ERP.</bpmn:documentation>
+        <bpmn:flowNodeRef>SubProcess_TechProd</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Boundary_SubProcEscalation</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Boundary_SubProcError</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_ERP_HandleDeviation</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>End_ERP_DeviationLogged</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_ERP_CriticalAlert</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>End_ERP_Aborted</bpmn:flowNodeRef>
+      </bpmn:lane>
+
+      <bpmn:lane id="Lane_Logistics" name="Логистика">
+        <bpmn:documentation>ДИ-ЛОГ-01: Логист. Контроль холодовой цепи, оформление УПД и ТТН.</bpmn:documentation>
+        <bpmn:flowNodeRef>Task_Ship</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>End_Main</bpmn:flowNodeRef>
+      </bpmn:lane>
+    </bpmn:laneSet>
+
+    <!-- Продажи -->
+    <bpmn:startEvent id="Start_Dairy" name="Заказ получен">
+      <bpmn:outgoing>SF1</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MsgDef_DairyStart" messageRef="Msg_ClientOrder"/>
+    </bpmn:startEvent>
+
+    <bpmn:userTask id="Task_ReceiveOrder" name="Принять заказ клиента">
+      <bpmn:documentation>СОП-01: Регистрация заказа в 1С:УТ. Проверка реквизитов и номенклатуры.</bpmn:documentation>
+      <bpmn:incoming>SF1</bpmn:incoming>
+      <bpmn:outgoing>SF2</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:userTask id="Task_ProcessOrder" name="Обработать заказ">
+      <bpmn:documentation>СОП-02: Проверка кредитного лимита, цен, скидок. Подтверждение сроков.</bpmn:documentation>
+      <bpmn:incoming>SF2</bpmn:incoming>
+      <bpmn:outgoing>SF3</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:userTask id="Task_CheckStock" name="Проверить остатки ГП">
+      <bpmn:documentation>СОП-03: Запрос остатков готовой продукции в 1С:ERP. Оценка покрытия заказа.</bpmn:documentation>
+      <bpmn:incoming>SF3</bpmn:incoming>
+      <bpmn:outgoing>SF4</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:exclusiveGateway id="Gateway_Stock" name="Хватает ГП?">
+      <bpmn:incoming>SF4</bpmn:incoming>
+      <bpmn:outgoing>SF5</bpmn:outgoing>
+      <bpmn:outgoing>SF6</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <!-- Закупки -->
+    <bpmn:userTask id="Task_CreatePO" name="Создать заказ сырья">
+      <bpmn:documentation>СОП-04: Расчёт потребности в сырье, выбор поставщика, черновик заказа.</bpmn:documentation>
+      <bpmn:incoming>SF5</bpmn:incoming>
+      <bpmn:outgoing>SF7</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:userTask id="Task_ApprovePO" name="Согласовать закупку">
+      <bpmn:documentation>СОП-05: Проверка лимита, цены, условий. ДИ-РУК-01: право подписи.</bpmn:documentation>
+      <bpmn:incoming>SF7</bpmn:incoming>
+      <bpmn:outgoing>SF8</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:sendTask id="Task_SendPO" name="Отправить заказ поставщику">
+      <bpmn:documentation>СОП-06: Отправка через EDI / e-mail. Фиксация времени отправки.</bpmn:documentation>
+      <bpmn:incoming>SF8</bpmn:incoming>
+      <bpmn:outgoing>SF9</bpmn:outgoing>
+    </bpmn:sendTask>
+
+    <bpmn:intermediateCatchEvent id="Event_POConfirmed" name="Заказ подтверждён">
+      <bpmn:incoming>SF9</bpmn:incoming>
+      <bpmn:outgoing>SF10</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MsgDef_POConfirmed" messageRef="Msg_POConfirmed"/>
+    </bpmn:intermediateCatchEvent>
+
+    <!-- Приёмка и лаборатория -->
+    <bpmn:receiveTask id="Task_ReceiveMilk" name="Принять партию молока">
+      <bpmn:documentation>СОП-07: Приём машины с сырьём. Проверка ТТН, пломб, t°.</bpmn:documentation>
+      <bpmn:incoming>SF10</bpmn:incoming>
+      <bpmn:outgoing>SF11</bpmn:outgoing>
+    </bpmn:receiveTask>
+
+    <bpmn:userTask id="Task_AcceptMilk" name="Взвесить и отобрать пробы">
+      <bpmn:documentation>СОП-08: Взвешивание, отбор проб по ГОСТ 26809. Регистрация в журнале.</bpmn:documentation>
+      <bpmn:incoming>SF11</bpmn:incoming>
+      <bpmn:outgoing>SF12</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:userTask id="Task_AnalyzeMilk" name="Лабораторный анализ">
+      <bpmn:documentation>СОП-09: Жирность, белок, кислотность, антибиотики, КМАФАнМ.</bpmn:documentation>
+      <bpmn:incoming>SF12</bpmn:incoming>
+      <bpmn:outgoing>SF13</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:exclusiveGateway id="Gateway_Quality" name="ГОСТ ОК?">
+      <bpmn:incoming>SF13</bpmn:incoming>
+      <bpmn:outgoing>SF14</bpmn:outgoing>
+      <bpmn:outgoing>SF15</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:userTask id="Task_ReturnMilk" name="Оформить возврат">
+      <bpmn:documentation>СОП-10: Акт несоответствия, возврат партии, уведомление закупок.</bpmn:documentation>
+      <bpmn:incoming>SF15</bpmn:incoming>
+      <bpmn:outgoing>SF16</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:endEvent id="End_Reject" name="Партия отклонена">
+      <bpmn:incoming>SF16</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <!-- ДОРОЖКА: СКЛАД СЫРЬЯ И ГП (Вход) -->
+    <bpmn:userTask id="Task_StoreMilk" name="Оприходовать сырьё на склад">
+      <bpmn:documentation>СОП-11: Присвоение номера партии в 1С:ERP, размещение в танке сырого молока и передача лимита в цех.</bpmn:documentation>
+      <bpmn:incoming>SF14</bpmn:incoming>
+      <bpmn:outgoing>SF17</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <!-- ДОРОЖКА: ПРОИЗВОДСТВО (СОСТАВНОЙ ПРОЦЕСС) -->
+    <bpmn:subProcess id="SubProcess_TechProd" name="Технологический процесс производства">
+      <bpmn:documentation>ТИ-01: Полный технологический цикл переработки молока-сырья и выпуска готовой молочной продукции (MES / SCADA контур).</bpmn:documentation>
+      <bpmn:incoming>SF17</bpmn:incoming>
+      <bpmn:outgoing>SF18_ToWarehouse</bpmn:outgoing>
+
+      <bpmn:startEvent id="Start_Tech" name="Сырьё подано в цех">
+        <bpmn:outgoing>SF_T1</bpmn:outgoing>
+      </bpmn:startEvent>
+
+      <bpmn:userTask id="Tech_CleanCool" name="Очистка и охлаждение">
+        <bpmn:documentation>ТИ-01.1: Центробежная очистка от механических примесей, бактофугирование, охлаждение в потоке до 4±2 °C.</bpmn:documentation>
+        <bpmn:incoming>SF_T1</bpmn:incoming>
+        <bpmn:outgoing>SF_T2</bpmn:outgoing>
+      </bpmn:userTask>
+
+      <bpmn:userTask id="Tech_Normalize" name="Сепарирование и нормализация">
+        <bpmn:documentation>ТИ-01.2: Разделение на сливки и обезжиренное молоко. Нормализация смеси в потоке по массовой доле жира (МДЖ) и белка.</bpmn:documentation>
+        <bpmn:incoming>SF_T2</bpmn:incoming>
+        <bpmn:outgoing>SF_T3</bpmn:outgoing>
+      </bpmn:userTask>
+
+      <bpmn:userTask id="Tech_Homogenize" name="Гомогенизация смеси">
+        <bpmn:documentation>ТИ-01.3: Дробление жировых шариков в плунжерном гомогенизаторе при P = 15–20 МПа и t = 60–65 °C для предотвращения отстаивания сливок.</bpmn:documentation>
+        <bpmn:incoming>SF_T3</bpmn:incoming>
+        <bpmn:outgoing>SF_T4</bpmn:outgoing>
+      </bpmn:userTask>
+
+      <bpmn:userTask id="Tech_Pasteurize" name="Пастеризация и охлаждение">
+        <bpmn:documentation>СОП-12 / ТИ-01.4: Термическая обработка в ПОУ при 72–76 °C (выдержка 20 сек), уничтожение патогенной микрофлоры, охлаждение до температуры заквашивания (30–42 °C).</bpmn:documentation>
+        <bpmn:incoming>SF_T4</bpmn:incoming>
+        <bpmn:outgoing>SF_T5</bpmn:outgoing>
+      </bpmn:userTask>
+
+      <!-- ГЛОБАЛЬНАЯ АВАРИЯ НА ПАСТЕРИЗАТОРЕ (ПРЕРЫВАЮЩЕЕ СОБЫТИЕ) -->
+      <bpmn:boundaryEvent id="Boundary_PasteurizeCrash" name="Авария ПОУ (срыв пастеризации)" attachedToRef="Tech_Pasteurize" cancelActivity="true">
+        <bpmn:documentation>Критическая авария L1/L2: отказ парогенератора, пробой пластин рекуператора или падение температуры ниже порога безопасности с возвратом на перепастеризацию/слив.</bpmn:documentation>
+        <bpmn:outgoing>SF_T_Err1</bpmn:outgoing>
+        <bpmn:errorEventDefinition id="ErrDef_PasteurizeCrash" errorRef="Err_CriticalFailure"/>
+      </bpmn:boundaryEvent>
+
+      <bpmn:userTask id="Tech_Ferment" name="Заквашивание и сквашивание">
+        <bpmn:documentation>ТИ-01.5: Внесение чистых культур молочнокислых бактерий, перемешивание и термостатирование в ферментационных танках до достижения целевого pH и кислотности (°Т).</bpmn:documentation>
+        <bpmn:incoming>SF_T5</bpmn:incoming>
+        <bpmn:outgoing>SF_T6</bpmn:outgoing>
+      </bpmn:userTask>
+
+      <bpmn:userTask id="Tech_CoolCheck" name="Охлаждение сгустка и контроль ОТК">
+        <bpmn:documentation>ТИ-01.6: Перемешивание и охлаждение сгустка до 14–18 °C. Отбор пробы цеховой лабораторией (кислотность, вязкость, органолептика).</bpmn:documentation>
+        <bpmn:incoming>SF_T6</bpmn:incoming>
+        <bpmn:outgoing>SF_T7</bpmn:outgoing>
+      </bpmn:userTask>
+
+      <bpmn:exclusiveGateway id="Gateway_TechQC" name="Параметры в норме?">
+        <bpmn:incoming>SF_T7</bpmn:incoming>
+        <bpmn:outgoing>SF_T8_Yes</bpmn:outgoing>
+        <bpmn:outgoing>SF_T8_No</bpmn:outgoing>
+      </bpmn:exclusiveGateway>
+
+      <bpmn:userTask id="Tech_Rework" name="Технологическая коррекция / Брак">
+        <bpmn:documentation>ТИ-01.9: Изоляция несоответствующей партии в буферном танке, составление технологического акта, направление на промпереработку или утилизацию.</bpmn:documentation>
+        <bpmn:incoming>SF_T8_No</bpmn:incoming>
+        <bpmn:outgoing>SF_T9_Reject</bpmn:outgoing>
+      </bpmn:userTask>
+
+      <bpmn:endEvent id="End_TechDefect" name="Партия забракована в цехе">
+        <bpmn:incoming>SF_T9_Reject</bpmn:incoming>
+      </bpmn:endEvent>
+
+      <bpmn:userTask id="Tech_Pack" name="Фасовка, розлив и маркировка">
+        <bpmn:documentation>СОП-13 / ТИ-01.7: Дозированный асептический розлив, укупорка, нанесение кодов DataMatrix (Честный ЗНАК), групповая упаковка и паллетирование.</bpmn:documentation>
+        <bpmn:incoming>SF_T8_Yes</bpmn:incoming>
+        <bpmn:outgoing>SF_T10</bpmn:outgoing>
+      </bpmn:userTask>
+
+      <!-- 1. ЧАСТИЧНАЯ ДЕГРАДАЦИЯ (НЕПРЕРЫВАЮЩАЯ ЭСКАЛАЦИЯ — ОТКЛЮЧЕНИЕ ФОРСУНКИ) -->
+      <bpmn:boundaryEvent id="Boundary_NozzleDegrad" name="Деградация линии (откл. форсунки)" attachedToRef="Tech_Pack" cancelActivity="false">
+        <bpmn:documentation>Триггер L2->L3: Срабатывает при отключении форсунки в ПЛК (Valve_Enable_Mask) или падении фактической скорости розлива (Speed Loss > 5%).</bpmn:documentation>
+        <bpmn:outgoing>SF_T_Esc1</bpmn:outgoing>
+        <bpmn:escalationEventDefinition id="EscDef_NozzleTrigger" escalationRef="Esc_EquipmentDegradation"/>
+      </bpmn:boundaryEvent>
+
+      <!-- 2. ГЛОБАЛЬНАЯ АВАРИЯ ЛИНИИ РОЗЛИВА (ПРЕРЫВАЮЩАЯ ОШИБКА) -->
+      <bpmn:boundaryEvent id="Boundary_PackCrash" name="Аварийный клин / стоп линии" attachedToRef="Tech_Pack" cancelActivity="true">
+        <bpmn:documentation>Полный аварийный останов автомата розлива (обрыв привода, разгерметизация асептической камеры, отказ контроллера).</bpmn:documentation>
+        <bpmn:outgoing>SF_T_Err2</bpmn:outgoing>
+        <bpmn:errorEventDefinition id="ErrDef_PackCrash" errorRef="Err_CriticalFailure"/>
+      </bpmn:boundaryEvent>
+
+      <bpmn:userTask id="Tech_LogDegradation" name="Классифицировать причину в MES (Poka-Yoke)">
+        <bpmn:documentation>ТИ-01.10: Обязательный выбор причины деградации из дерева простоев (Reason Tree: Узел дозирования -> Форсунка №X). Без заполнения MES блокирует закрытие партии.</bpmn:documentation>
+        <bpmn:incoming>SF_T_Esc1</bpmn:incoming>
+        <bpmn:outgoing>SF_T_Esc2</bpmn:outgoing>
+      </bpmn:userTask>
+
+      <bpmn:intermediateThrowEvent id="Event_ThrowDegrad" name="Эскалация в ERP / ТОиР">
+        <bpmn:documentation>Генерация B2MML сообщений: ProductionCapability (снижение мощности), MaintenanceRequest (заявка на ремонт форсунки) и флага отклонения в ProductionPerformance.</bpmn:documentation>
+        <bpmn:incoming>SF_T_Esc2</bpmn:incoming>
+        <bpmn:outgoing>SF_T_Esc3</bpmn:outgoing>
+        <bpmn:escalationEventDefinition id="EscDef_ThrowToERP" escalationRef="Esc_EquipmentDegradation"/>
+      </bpmn:intermediateThrowEvent>
+
+      <bpmn:endEvent id="End_TechDegradLogged" name="Отклонение передано в ERP">
+        <bpmn:incoming>SF_T_Esc3</bpmn:incoming>
+      </bpmn:endEvent>
+
+      <!-- КОНЕЧНОЕ СОБЫТИЕ ГЛОБАЛЬНОЙ АВАРИИ ВНУТРИ ПОДПРОЦЕССА (ПРОБРОС НАВЕРХ) -->
+      <bpmn:endEvent id="End_TechCriticalError" name="Аварийный останов цеха (проброс в ERP)">
+        <bpmn:incoming>SF_T_Err1</bpmn:incoming>
+        <bpmn:incoming>SF_T_Err2</bpmn:incoming>
+        <bpmn:errorEventDefinition id="ErrDef_ThrowCritical" errorRef="Err_CriticalFailure"/>
+      </bpmn:endEvent>
+
+      <bpmn:endEvent id="End_Tech" name="Выпуск в цехе завершён">
+        <bpmn:incoming>SF_T10</bpmn:incoming>
+      </bpmn:endEvent>
+
+      <!-- Потоки управления внутри подпроцесса -->
+      <bpmn:sequenceFlow id="SF_T1"        sourceRef="Start_Tech"              targetRef="Tech_CleanCool"/>
+      <bpmn:sequenceFlow id="SF_T2"        sourceRef="Tech_CleanCool"          targetRef="Tech_Normalize"/>
+      <bpmn:sequenceFlow id="SF_T3"        sourceRef="Tech_Normalize"          targetRef="Tech_Homogenize"/>
+      <bpmn:sequenceFlow id="SF_T4"        sourceRef="Tech_Homogenize"         targetRef="Tech_Pasteurize"/>
+      <bpmn:sequenceFlow id="SF_T5"        sourceRef="Tech_Pasteurize"         targetRef="Tech_Ferment"/>
+      <bpmn:sequenceFlow id="SF_T6"        sourceRef="Tech_Ferment"            targetRef="Tech_CoolCheck"/>
+      <bpmn:sequenceFlow id="SF_T7"        sourceRef="Tech_CoolCheck"          targetRef="Gateway_TechQC"/>
+      <bpmn:sequenceFlow id="SF_T8_Yes"    name="Да"  sourceRef="Gateway_TechQC" targetRef="Tech_Pack"/>
+      <bpmn:sequenceFlow id="SF_T8_No"     name="Нет" sourceRef="Gateway_TechQC" targetRef="Tech_Rework"/>
+      <bpmn:sequenceFlow id="SF_T9_Reject" sourceRef="Tech_Rework"             targetRef="End_TechDefect"/>
+      <bpmn:sequenceFlow id="SF_T10"       sourceRef="Tech_Pack"               targetRef="End_Tech"/>
+      <bpmn:sequenceFlow id="SF_T_Esc1"    sourceRef="Boundary_NozzleDegrad"   targetRef="Tech_LogDegradation"/>
+      <bpmn:sequenceFlow id="SF_T_Esc2"    sourceRef="Tech_LogDegradation"     targetRef="Event_ThrowDegrad"/>
+      <bpmn:sequenceFlow id="SF_T_Esc3"    sourceRef="Event_ThrowDegrad"       targetRef="End_TechDegradLogged"/>
+      <bpmn:sequenceFlow id="SF_T_Err1"    sourceRef="Boundary_PasteurizeCrash" targetRef="End_TechCriticalError"/>
+      <bpmn:sequenceFlow id="SF_T_Err2"    sourceRef="Boundary_PackCrash"       targetRef="End_TechCriticalError"/>
+    </bpmn:subProcess>
+
+    <!-- 1. ПЕРЕХВАТ ЧАСТИЧНОЙ ДЕГРАДАЦИИ НА УРОВНЕ ОСНОВНОГО ПРОЦЕССА (НЕПРЕРЫВАЮЩИЙ) -->
+    <bpmn:boundaryEvent id="Boundary_SubProcEscalation" name="Сигнал MES: Деградация мощности" attachedToRef="SubProcess_TechProd" cancelActivity="false">
+      <bpmn:documentation>Перехват эскалации от MES на уровне завода (L3 -> L4 по ISA-95) без остановки выпуска текущей партии.</bpmn:documentation>
+      <bpmn:outgoing>SF_Esc_Main1</bpmn:outgoing>
+      <bpmn:escalationEventDefinition id="EscDef_CatchMain" escalationRef="Esc_EquipmentDegradation"/>
+    </bpmn:boundaryEvent>
+
+    <bpmn:serviceTask id="Task_ERP_HandleDeviation" name="Скорректировать мощность и создать заявку ТОиР в ERP">
+      <bpmn:documentation>ISA-95 L4: 1) Снижение ProductionCapability линии (для APS-планирования), 2) Создание MaintenanceRequest на ремонт форсунки, 3) Учёт повышенных косвенных затрат в себестоимости партии.</bpmn:documentation>
+      <bpmn:incoming>SF_Esc_Main1</bpmn:incoming>
+      <bpmn:outgoing>SF_Esc_Main2</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:endEvent id="End_ERP_DeviationLogged" name="Мощность пересчитана, ремонт запланирован">
+      <bpmn:incoming>SF_Esc_Main2</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <!-- 2. ПЕРЕХВАТ ГЛОБАЛЬНОЙ АВАРИИ НА УРОВНЕ ОСНОВНОГО ПРОЦЕССА (ПРЕРЫВАЮЩИЙ) -->
+    <bpmn:boundaryEvent id="Boundary_SubProcError" name="Глобальная авария линии (Stop)" attachedToRef="SubProcess_TechProd" cancelActivity="true">
+      <bpmn:documentation>Прерывающий перехват критической аварии из MES. Выполнение производственного заказа останавливается и немедленно эскалируется в ERP.</bpmn:documentation>
+      <bpmn:outgoing>SF_Err_Main1</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrDef_CatchMain" errorRef="Err_CriticalFailure"/>
+    </bpmn:boundaryEvent>
+
+    <bpmn:serviceTask id="Task_ERP_CriticalAlert" name="Эскалировать глобальную аварию в ERP (Статус ЧП)">
+      <bpmn:documentation>ISA-95 L4: 1) Перевод ProductionCapability линии в 0% (Unavailable), 2) Экстренный аварийный наряд в ТОиР (P1), 3) Блокировка/перепланирование клиентских заказов в ERP и оповещение коммерческой службы.</bpmn:documentation>
+      <bpmn:incoming>SF_Err_Main1</bpmn:incoming>
+      <bpmn:outgoing>SF_Err_Main2</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:endEvent id="End_ERP_Aborted" name="Производство остановлено по аварии">
+      <bpmn:incoming>SF_Err_Main2</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <!-- ДОРОЖКА: СКЛАД СЫРЬЯ И ГП (Выход из цеха на склад ГП) -->
+    <bpmn:userTask id="Task_StoreFG" name="Принять ГП в хладокамеру (дозревание)">
+      <bpmn:documentation>ТИ-01.8 / СОП-13.2: Приёмка паллет из цеха на склад ГП, выдержка в холодильной камере (4±2 °C), перевод партии в статус «Допущено к отгрузке» в 1С:ERP.</bpmn:documentation>
+      <bpmn:incoming>SF18_ToWarehouse</bpmn:incoming>
+      <bpmn:outgoing>SF19</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <!-- Логистика -->
+    <bpmn:sendTask id="Task_Ship" name="Отгрузить по заказу">
+      <bpmn:documentation>СОП-14: Комплектация, УПД, ТТН, холодовая цепь.</bpmn:documentation>
+      <bpmn:incoming>SF6</bpmn:incoming>
+      <bpmn:incoming>SF19</bpmn:incoming>
+      <bpmn:outgoing>SF20</bpmn:outgoing>
+    </bpmn:sendTask>
+
+    <bpmn:endEvent id="End_Main" name="Заказ выполнен">
+      <bpmn:incoming>SF20</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <!-- Sequence flows основного процесса -->
+    <bpmn:sequenceFlow id="SF1"              sourceRef="Start_Dairy"                targetRef="Task_ReceiveOrder"/>
+    <bpmn:sequenceFlow id="SF2"              sourceRef="Task_ReceiveOrder"          targetRef="Task_ProcessOrder"/>
+    <bpmn:sequenceFlow id="SF3"              sourceRef="Task_ProcessOrder"          targetRef="Task_CheckStock"/>
+    <bpmn:sequenceFlow id="SF4"              sourceRef="Task_CheckStock"            targetRef="Gateway_Stock"/>
+    <bpmn:sequenceFlow id="SF5"              name="Нет" sourceRef="Gateway_Stock"   targetRef="Task_CreatePO"/>
+    <bpmn:sequenceFlow id="SF6"              name="Да"  sourceRef="Gateway_Stock"   targetRef="Task_Ship"/>
+    <bpmn:sequenceFlow id="SF7"              sourceRef="Task_CreatePO"              targetRef="Task_ApprovePO"/>
+    <bpmn:sequenceFlow id="SF8"              sourceRef="Task_ApprovePO"             targetRef="Task_SendPO"/>
+    <bpmn:sequenceFlow id="SF9"              sourceRef="Task_SendPO"                targetRef="Event_POConfirmed"/>
+    <bpmn:sequenceFlow id="SF10"             sourceRef="Event_POConfirmed"          targetRef="Task_ReceiveMilk"/>
+    <bpmn:sequenceFlow id="SF11"             sourceRef="Task_ReceiveMilk"           targetRef="Task_AcceptMilk"/>
+    <bpmn:sequenceFlow id="SF12"             sourceRef="Task_AcceptMilk"            targetRef="Task_AnalyzeMilk"/>
+    <bpmn:sequenceFlow id="SF13"             sourceRef="Task_AnalyzeMilk"           targetRef="Gateway_Quality"/>
+    <bpmn:sequenceFlow id="SF14"             name="Да"  sourceRef="Gateway_Quality" targetRef="Task_StoreMilk"/>
+    <bpmn:sequenceFlow id="SF15"             name="Нет" sourceRef="Gateway_Quality" targetRef="Task_ReturnMilk"/>
+    <bpmn:sequenceFlow id="SF16"             sourceRef="Task_ReturnMilk"            targetRef="End_Reject"/>
+    <bpmn:sequenceFlow id="SF17"             sourceRef="Task_StoreMilk"             targetRef="SubProcess_TechProd"/>
+    <bpmn:sequenceFlow id="SF18_ToWarehouse" sourceRef="SubProcess_TechProd"        targetRef="Task_StoreFG"/>
+    <bpmn:sequenceFlow id="SF19"             sourceRef="Task_StoreFG"               targetRef="Task_Ship"/>
+    <bpmn:sequenceFlow id="SF20"             sourceRef="Task_Ship"                  targetRef="End_Main"/>
+    <bpmn:sequenceFlow id="SF_Esc_Main1"     sourceRef="Boundary_SubProcEscalation" targetRef="Task_ERP_HandleDeviation"/>
+    <bpmn:sequenceFlow id="SF_Esc_Main2"     sourceRef="Task_ERP_HandleDeviation"   targetRef="End_ERP_DeviationLogged"/>
+    <bpmn:sequenceFlow id="SF_Err_Main1"     sourceRef="Boundary_SubProcError"      targetRef="Task_ERP_CriticalAlert"/>
+    <bpmn:sequenceFlow id="SF_Err_Main2"     sourceRef="Task_ERP_CriticalAlert"     targetRef="End_ERP_Aborted"/>
+  </bpmn:process>
+
+  <!-- ==================== ПУЛ 3: ПОСТАВЩИК СЫРЬЯ ==================== -->
+  <bpmn:process id="Process_Supplier" isExecutable="false">
+    <bpmn:startEvent id="Start_Supplier" name="Заказ получен">
+      <bpmn:outgoing>SF_S1</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MsgDef_SupplierStart" messageRef="Msg_POToSupplier"/>
+    </bpmn:startEvent>
+
+    <bpmn:userTask id="Task_ConfirmPO" name="Проверить и подтвердить заказ">
+      <bpmn:documentation>СОП-П-01: Сверка объёмов, сроков, цены. Отправка подтверждения.</bpmn:documentation>
+      <bpmn:incoming>SF_S1</bpmn:incoming>
+      <bpmn:outgoing>SF_S2</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:sendTask id="Task_ShipMilk" name="Отгрузить молоко">
+      <bpmn:documentation>СОП-П-02: Подготовка партии, оформление ТТН, отправка машины.</bpmn:documentation>
+      <bpmn:incoming>SF_S2</bpmn:incoming>
+      <bpmn:outgoing>SF_S3</bpmn:outgoing>
+    </bpmn:sendTask>
+
+    <bpmn:endEvent id="End_Supplier" name="Конец">
+      <bpmn:incoming>SF_S3</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <bpmn:sequenceFlow id="SF_S1" sourceRef="Start_Supplier"  targetRef="Task_ConfirmPO"/>
+    <bpmn:sequenceFlow id="SF_S2" sourceRef="Task_ConfirmPO"  targetRef="Task_ShipMilk"/>
+    <bpmn:sequenceFlow id="SF_S3" sourceRef="Task_ShipMilk"   targetRef="End_Supplier"/>
+  </bpmn:process>
+
+  <!-- ==================== MESSAGE FLOWS (межпуловые) ==================== -->
+  <bpmn:messageFlow id="MF1" name="Заказ клиента"
+    sourceRef="Task_SendOrder" targetRef="Start_Dairy"/>
+  <bpmn:messageFlow id="MF2" name="Подтверждение заказа"
+    sourceRef="Task_ProcessOrder" targetRef="Event_OrderConfirmed"/>
+  <bpmn:messageFlow id="MF3" name="Заказ на сырьё"
+    sourceRef="Task_SendPO" targetRef="Start_Supplier"/>
+  <bpmn:messageFlow id="MF4" name="Подтверждение"
+    sourceRef="Task_ConfirmPO" targetRef="Event_POConfirmed"/>
+  <bpmn:messageFlow id="MF5" name="Партия молока"
+    sourceRef="Task_ShipMilk" targetRef="Task_ReceiveMilk"/>
+  <bpmn:messageFlow id="MF6" name="Готовая продукция"
+    sourceRef="Task_Ship" targetRef="Event_GoodsReceived"/>
+
+  <!-- ==================== ДИАГРАММА 1: ОСНОВНОЙ ПРОЦЕСС ==================== -->
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1" name="Общая схема производства">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Collab_1">
+
+      <!-- Pool: Client -->
+      <bpmndi:BPMNShape id="Part_Client_di" bpmnElement="Part_Client" isHorizontal="true">
+        <dc:Bounds x="150" y="80" width="2750" height="160"/>
+      </bpmndi:BPMNShape>
+
+      <!-- Pool: Dairy (разделены дорожки Склада и Производства) -->
+      <bpmndi:BPMNShape id="Part_Dairy_di" bpmnElement="Part_Dairy" isHorizontal="true">
+        <dc:Bounds x="150" y="320" width="2750" height="1200"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Sales_di" bpmnElement="Lane_Sales" isHorizontal="true">
+        <dc:Bounds x="180" y="320" width="2720" height="170"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Purchase_di" bpmnElement="Lane_Purchase" isHorizontal="true">
+        <dc:Bounds x="180" y="490" width="2720" height="170"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_QC_di" bpmnElement="Lane_QC" isHorizontal="true">
+        <dc:Bounds x="180" y="660" width="2720" height="170"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Warehouse_di" bpmnElement="Lane_Warehouse" isHorizontal="true">
+        <dc:Bounds x="180" y="830" width="2720" height="170"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Prod_di" bpmnElement="Lane_Prod" isHorizontal="true">
+        <dc:Bounds x="180" y="1000" width="2720" height="350"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Logistics_di" bpmnElement="Lane_Logistics" isHorizontal="true">
+        <dc:Bounds x="180" y="1350" width="2720" height="170"/>
+      </bpmndi:BPMNShape>
+
+      <!-- Pool: Supplier -->
+      <bpmndi:BPMNShape id="Part_Supplier_di" bpmnElement="Part_Supplier" isHorizontal="true">
+        <dc:Bounds x="150" y="1600" width="2750" height="160"/>
+      </bpmndi:BPMNShape>
+
+      <!-- ===== Узлы CLIENT ===== -->
+      <bpmndi:BPMNShape id="Start_Client_di" bpmnElement="Start_Client">
+        <dc:Bounds x="250" y="142" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SendOrder_di" bpmnElement="Task_SendOrder">
+        <dc:Bounds x="340" y="120" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_OrderConfirmed_di" bpmnElement="Event_OrderConfirmed">
+        <dc:Bounds x="500" y="142" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_GoodsReceived_di" bpmnElement="Event_GoodsReceived">
+        <dc:Bounds x="600" y="142" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Client_di" bpmnElement="End_Client">
+        <dc:Bounds x="700" y="142" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <!-- ===== Узлы DAIRY ===== -->
+      <bpmndi:BPMNShape id="Start_Dairy_di" bpmnElement="Start_Dairy">
+        <dc:Bounds x="250" y="387" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ReceiveOrder_di" bpmnElement="Task_ReceiveOrder">
+        <dc:Bounds x="330" y="365" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ProcessOrder_di" bpmnElement="Task_ProcessOrder">
+        <dc:Bounds x="490" y="365" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_CheckStock_di" bpmnElement="Task_CheckStock">
+        <dc:Bounds x="650" y="365" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_Stock_di" bpmnElement="Gateway_Stock" isMarkerVisible="true">
+        <dc:Bounds x="810" y="385" width="40" height="40"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Task_CreatePO_di" bpmnElement="Task_CreatePO">
+        <dc:Bounds x="900" y="535" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ApprovePO_di" bpmnElement="Task_ApprovePO">
+        <dc:Bounds x="1060" y="535" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SendPO_di" bpmnElement="Task_SendPO">
+        <dc:Bounds x="1220" y="535" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_POConfirmed_di" bpmnElement="Event_POConfirmed">
+        <dc:Bounds x="1380" y="557" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Task_ReceiveMilk_di" bpmnElement="Task_ReceiveMilk">
+        <dc:Bounds x="1460" y="705" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_AcceptMilk_di" bpmnElement="Task_AcceptMilk">
+        <dc:Bounds x="1620" y="705" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_AnalyzeMilk_di" bpmnElement="Task_AnalyzeMilk">
+        <dc:Bounds x="1780" y="705" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_Quality_di" bpmnElement="Gateway_Quality" isMarkerVisible="true">
+        <dc:Bounds x="1940" y="725" width="40" height="40"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ReturnMilk_di" bpmnElement="Task_ReturnMilk">
+        <dc:Bounds x="2030" y="705" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Reject_di" bpmnElement="End_Reject">
+        <dc:Bounds x="2200" y="727" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <!-- Узлы в дорожке СКЛАД -->
+      <bpmndi:BPMNShape id="Task_StoreMilk_di" bpmnElement="Task_StoreMilk">
+        <dc:Bounds x="1940" y="875" width="120" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_StoreFG_di" bpmnElement="Task_StoreFG">
+        <dc:Bounds x="2350" y="875" width="140" height="80"/>
+      </bpmndi:BPMNShape>
+
+      <!-- Узлы в дорожке ПРОИЗВОДСТВО -->
+      <bpmndi:BPMNShape id="SubProcess_TechProd_di" bpmnElement="SubProcess_TechProd" isExpanded="false">
+        <dc:Bounds x="2100" y="1030" width="200" height="90"/>
+      </bpmndi:BPMNShape>
+
+      <!-- Граничное событие 1: Деградация мощности (непрерывающее) -->
+      <bpmndi:BPMNShape id="Boundary_SubProcEscalation_di" bpmnElement="Boundary_SubProcEscalation">
+        <dc:Bounds x="2142" y="1102" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Task_ERP_HandleDeviation_di" bpmnElement="Task_ERP_HandleDeviation">
+        <dc:Bounds x="2350" y="1140" width="180" height="80"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="End_ERP_DeviationLogged_di" bpmnElement="End_ERP_DeviationLogged">
+        <dc:Bounds x="2580" y="1162" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <!-- Граничное событие 2: Глобальная авария (прерывающее) -->
+      <bpmndi:BPMNShape id="Boundary_SubProcError_di" bpmnElement="Boundary_SubProcError">
+        <dc:Bounds x="2232" y="1102" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Task_ERP_CriticalAlert_di" bpmnElement="Task_ERP_CriticalAlert">
+        <dc:Bounds x="2350" y="1245" width="180" height="80"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="End_ERP_Aborted_di" bpmnElement="End_ERP_Aborted">
+        <dc:Bounds x="2580" y="1267" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <!-- Узлы в дорожке ЛОГИСТИКА -->
+      <bpmndi:BPMNShape id="Task_Ship_di" bpmnElement="Task_Ship">
+        <dc:Bounds x="2540" y="1395" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Main_di" bpmnElement="End_Main">
+        <dc:Bounds x="2700" y="1417" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <!-- ===== Узлы SUPPLIER ===== -->
+      <bpmndi:BPMNShape id="Start_Supplier_di" bpmnElement="Start_Supplier">
+        <dc:Bounds x="250" y="1662" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ConfirmPO_di" bpmnElement="Task_ConfirmPO">
+        <dc:Bounds x="340" y="1640" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ShipMilk_di" bpmnElement="Task_ShipMilk">
+        <dc:Bounds x="500" y="1640" width="110" height="80"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Supplier_di" bpmnElement="End_Supplier">
+        <dc:Bounds x="660" y="1662" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <!-- ===== Sequence flows CLIENT ===== -->
+      <bpmndi:BPMNEdge id="SF_C1_di" bpmnElement="SF_C1">
+        <di:waypoint x="286" y="160"/>
+        <di:waypoint x="340" y="160"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF_C2_di" bpmnElement="SF_C2">
+        <di:waypoint x="450" y="160"/>
+        <di:waypoint x="500" y="160"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF_C3_di" bpmnElement="SF_C3">
+        <di:waypoint x="536" y="160"/>
+        <di:waypoint x="600" y="160"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF_C4_di" bpmnElement="SF_C4">
+        <di:waypoint x="636" y="160"/>
+        <di:waypoint x="700" y="160"/>
+      </bpmndi:BPMNEdge>
+
+      <!-- ===== Sequence flows DAIRY ===== -->
+      <bpmndi:BPMNEdge id="SF1_di" bpmnElement="SF1">
+        <di:waypoint x="286" y="405"/>
+        <di:waypoint x="330" y="405"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF2_di" bpmnElement="SF2">
+        <di:waypoint x="440" y="405"/>
+        <di:waypoint x="490" y="405"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF3_di" bpmnElement="SF3">
+        <di:waypoint x="600" y="405"/>
+        <di:waypoint x="650" y="405"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF4_di" bpmnElement="SF4">
+        <di:waypoint x="760" y="405"/>
+        <di:waypoint x="810" y="405"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF5_di" bpmnElement="SF5">
+        <di:waypoint x="830" y="425"/>
+        <di:waypoint x="830" y="575"/>
+        <di:waypoint x="900" y="575"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF6_di" bpmnElement="SF6">
+        <di:waypoint x="850" y="405"/>
+        <di:waypoint x="850" y="1435"/>
+        <di:waypoint x="2540" y="1435"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF7_di" bpmnElement="SF7">
+        <di:waypoint x="1010" y="575"/>
+        <di:waypoint x="1060" y="575"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF8_di" bpmnElement="SF8">
+        <di:waypoint x="1170" y="575"/>
+        <di:waypoint x="1220" y="575"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF9_di" bpmnElement="SF9">
+        <di:waypoint x="1330" y="575"/>
+        <di:waypoint x="1380" y="575"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF10_di" bpmnElement="SF10">
+        <di:waypoint x="1398" y="593"/>
+        <di:waypoint x="1398" y="745"/>
+        <di:waypoint x="1460" y="745"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF11_di" bpmnElement="SF11">
+        <di:waypoint x="1570" y="745"/>
+        <di:waypoint x="1620" y="745"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF12_di" bpmnElement="SF12">
+        <di:waypoint x="1730" y="745"/>
+        <di:waypoint x="1780" y="745"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF13_di" bpmnElement="SF13">
+        <di:waypoint x="1890" y="745"/>
+        <di:waypoint x="1940" y="745"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF14_di" bpmnElement="SF14">
+        <di:waypoint x="1960" y="765"/>
+        <di:waypoint x="1960" y="875"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF15_di" bpmnElement="SF15">
+        <di:waypoint x="1980" y="745"/>
+        <di:waypoint x="2030" y="745"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF16_di" bpmnElement="SF16">
+        <di:waypoint x="2140" y="745"/>
+        <di:waypoint x="2200" y="745"/>
+      </bpmndi:BPMNEdge>
+
+      <!-- Переход Склад сырья -> Производство -->
+      <bpmndi:BPMNEdge id="SF17_di" bpmnElement="SF17">
+        <di:waypoint x="2000" y="955"/>
+        <di:waypoint x="2000" y="1075"/>
+        <di:waypoint x="2100" y="1075"/>
+      </bpmndi:BPMNEdge>
+
+      <!-- Переход Производство -> Склад ГП -->
+      <bpmndi:BPMNEdge id="SF18_ToWarehouse_di" bpmnElement="SF18_ToWarehouse">
+        <di:waypoint x="2300" y="1075"/>
+        <di:waypoint x="2325" y="1075"/>
+        <di:waypoint x="2325" y="915"/>
+        <di:waypoint x="2350" y="915"/>
+      </bpmndi:BPMNEdge>
+
+      <!-- Переход Склад ГП -> Логистика -->
+      <bpmndi:BPMNEdge id="SF19_di" bpmnElement="SF19">
+        <di:waypoint x="2490" y="915"/>
+        <di:waypoint x="2515" y="915"/>
+        <di:waypoint x="2515" y="1435"/>
+        <di:waypoint x="2540" y="1435"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF20_di" bpmnElement="SF20">
+        <di:waypoint x="2650" y="1435"/>
+        <di:waypoint x="2700" y="1435"/>
+      </bpmndi:BPMNEdge>
+
+      <!-- Рёбра 1: Частичная деградация (эскалация) -->
+      <bpmndi:BPMNEdge id="SF_Esc_Main1_di" bpmnElement="SF_Esc_Main1">
+        <di:waypoint x="2160" y="1138"/>
+        <di:waypoint x="2160" y="1180"/>
+        <di:waypoint x="2350" y="1180"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF_Esc_Main2_di" bpmnElement="SF_Esc_Main2">
+        <di:waypoint x="2530" y="1180"/>
+        <di:waypoint x="2580" y="1180"/>
+      </bpmndi:BPMNEdge>
+
+      <!-- Рёбра 2: Глобальная авария (ошибка) -->
+      <bpmndi:BPMNEdge id="SF_Err_Main1_di" bpmnElement="SF_Err_Main1">
+        <di:waypoint x="2250" y="1138"/>
+        <di:waypoint x="2250" y="1285"/>
+        <di:waypoint x="2350" y="1285"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF_Err_Main2_di" bpmnElement="SF_Err_Main2">
+        <di:waypoint x="2530" y="1285"/>
+        <di:waypoint x="2580" y="1285"/>
+      </bpmndi:BPMNEdge>
+
+      <!-- ===== Sequence flows SUPPLIER ===== -->
+      <bpmndi:BPMNEdge id="SF_S1_di" bpmnElement="SF_S1">
+        <di:waypoint x="286" y="1680"/>
+        <di:waypoint x="340" y="1680"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF_S2_di" bpmnElement="SF_S2">
+        <di:waypoint x="450" y="1680"/>
+        <di:waypoint x="500" y="1680"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SF_S3_di" bpmnElement="SF_S3">
+        <di:waypoint x="610" y="1680"/>
+        <di:waypoint x="660" y="1680"/>
+      </bpmndi:BPMNEdge>
+
+      <!-- ===== MESSAGE FLOWS ===== -->
+      <bpmndi:BPMNEdge id="MF1_di" bpmnElement="MF1">
+        <di:waypoint x="395" y="200"/>
+        <di:waypoint x="395" y="280"/>
+        <di:waypoint x="268" y="280"/>
+        <di:waypoint x="268" y="387"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="MF2_di" bpmnElement="MF2">
+        <di:waypoint x="545" y="365"/>
+        <di:waypoint x="545" y="290"/>
+        <di:waypoint x="518" y="290"/>
+        <di:waypoint x="518" y="178"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="MF3_di" bpmnElement="MF3">
+        <di:waypoint x="1275" y="615"/>
+        <di:waypoint x="1275" y="1560"/>
+        <di:waypoint x="268" y="1560"/>
+        <di:waypoint x="268" y="1662"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="MF4_di" bpmnElement="MF4">
+        <di:waypoint x="395" y="1640"/>
+        <di:waypoint x="395" y="1570"/>
+        <di:waypoint x="1398" y="1570"/>
+        <di:waypoint x="1398" y="593"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="MF5_di" bpmnElement="MF5">
+        <di:waypoint x="555" y="1640"/>
+        <di:waypoint x="555" y="1585"/>
+        <di:waypoint x="1515" y="1585"/>
+        <di:waypoint x="1515" y="785"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="MF6_di" bpmnElement="MF6">
+        <di:waypoint x="2595" y="1395"/>
+        <di:waypoint x="2595" y="270"/>
+        <di:waypoint x="618" y="270"/>
+        <di:waypoint x="618" y="178"/>
+      </bpmndi:BPMNEdge>
+
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+
+  <!-- ==================== ДИАГРАММА 2: РАЗВЁРНУТЫЙ ТЕХНОЛОГИЧЕСКИЙ ПОДПРОЦЕСС ==================== -->
+  <bpmndi:BPMNDiagram id="BPMNDiagram_TechProd" name="Технологический процесс производства (детализация)">
+    <bpmndi:BPMNPlane id="BPMNPlane_TechProd" bpmnElement="SubProcess_TechProd">
+
+      <bpmndi:BPMNShape id="Start_Tech_di" bpmnElement="Start_Tech">
+        <dc:Bounds x="120" y="162" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Tech_CleanCool_di" bpmnElement="Tech_CleanCool">
+        <dc:Bounds x="210" y="140" width="130" height="80"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Tech_Normalize_di" bpmnElement="Tech_Normalize">
+        <dc:Bounds x="390" y="140" width="130" height="80"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Tech_Homogenize_di" bpmnElement="Tech_Homogenize">
+        <dc:Bounds x="570" y="140" width="130" height="80"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Tech_Pasteurize_di" bpmnElement="Tech_Pasteurize">
+        <dc:Bounds x="750" y="140" width="130" height="80"/>
+      </bpmndi:BPMNShape>
+
+      <!-- Граничное событие глобальной аварии на Пастеризации -->
+      <bpmndi:BPMNShape id="Boundary_PasteurizeCrash_di" bpmnElement="Boundary_PasteurizeCrash">
+        <dc:Bounds x="797" y="202" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Tech_Ferment_di" bpmnElement="Tech_Ferment">
+        <dc:Bounds x="930" y="140" width="130" height="80"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Tech_CoolCheck_di" bpmnElement="Tech_CoolCheck">
+        <dc:Bounds x="1110" y="140" width="130" height="80"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Gateway_TechQC_di" bpmnElement="Gateway_TechQC" isMarkerVisible="true">
+        <dc:Bounds x="1295" y="155" width="50" height="50"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Tech_Rework_di" bpmnElement="Tech_Rework">
+        <dc:Bounds x="1400" y="340" width="140" height="80"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="End_TechDefect_di" bpmnElement="End_TechDefect">
+        <dc:Bounds x="1600" y="362" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Tech_Pack_di" bpmnElement="Tech_Pack">
+        <dc:Bounds x="1400" y="140" width="140" height="80"/>
+      </bpmndi:BPMNShape>
+
+      <!-- 1. Непрерывающее граничное событие деградации на Фасовке -->
+      <bpmndi:BPMNShape id="Boundary_NozzleDegrad_di" bpmnElement="Boundary_NozzleDegrad">
+        <dc:Bounds x="1422" y="202" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <!-- 2. Прерывающее граничное событие глобальной аварии на Фасовке -->
+      <bpmndi:BPMNShape id="Boundary_PackCrash_di" bpmnElement="Boundary_PackCrash">
+        <dc:Bounds x="1482" y="202" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <!-- Ветка фиксации и эскалации деградации в MES -->
+      <bpmndi:BPMNShape id="Tech_LogDegradation_di" bpmnElement="Tech_LogDegradation">
+        <dc:Bounds x="1530" y="250" width="160" height="80"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="Event_ThrowDegrad_di" bpmnElement="Event_ThrowDegrad">
+        <dc:Bounds x="1740" y="272" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="End_TechDegradLogged_di" bpmnElement="End_TechDegradLogged">
+        <dc:Bounds x="1830" y="272" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <!-- Конечное событие глобальной аварии (Error End Event) -->
+      <bpmndi:BPMNShape id="End_TechCriticalError_di" bpmnElement="End_TechCriticalError">
+        <dc:Bounds x="1830" y="442" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNShape id="End_Tech_di" bpmnElement="End_Tech">
+        <dc:Bounds x="1630" y="162" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+
+      <!-- Рёбра внутри технологического процесса -->
+      <bpmndi:BPMNEdge id="SF_T1_di" bpmnElement="SF_T1">
+        <di:waypoint x="156" y="180"/>
+        <di:waypoint x="210" y="180"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T2_di" bpmnElement="SF_T2">
+        <di:waypoint x="340" y="180"/>
+        <di:waypoint x="390" y="180"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T3_di" bpmnElement="SF_T3">
+        <di:waypoint x="520" y="180"/>
+        <di:waypoint x="570" y="180"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T4_di" bpmnElement="SF_T4">
+        <di:waypoint x="700" y="180"/>
+        <di:waypoint x="750" y="180"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T5_di" bpmnElement="SF_T5">
+        <di:waypoint x="880" y="180"/>
+        <di:waypoint x="930" y="180"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T6_di" bpmnElement="SF_T6">
+        <di:waypoint x="1060" y="180"/>
+        <di:waypoint x="1110" y="180"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T7_di" bpmnElement="SF_T7">
+        <di:waypoint x="1240" y="180"/>
+        <di:waypoint x="1295" y="180"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T8_Yes_di" bpmnElement="SF_T8_Yes">
+        <di:waypoint x="1345" y="180"/>
+        <di:waypoint x="1400" y="180"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T8_No_di" bpmnElement="SF_T8_No">
+        <di:waypoint x="1320" y="205"/>
+        <di:waypoint x="1320" y="380"/>
+        <di:waypoint x="1400" y="380"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T9_Reject_di" bpmnElement="SF_T9_Reject">
+        <di:waypoint x="1540" y="380"/>
+        <di:waypoint x="1600" y="380"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T10_di" bpmnElement="SF_T10">
+        <di:waypoint x="1540" y="180"/>
+        <di:waypoint x="1630" y="180"/>
+      </bpmndi:BPMNEdge>
+
+      <!-- Рёбра эскалации деградации внутри подпроцесса -->
+      <bpmndi:BPMNEdge id="SF_T_Esc1_di" bpmnElement="SF_T_Esc1">
+        <di:waypoint x="1440" y="238"/>
+        <di:waypoint x="1440" y="290"/>
+        <di:waypoint x="1530" y="290"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T_Esc2_di" bpmnElement="SF_T_Esc2">
+        <di:waypoint x="1690" y="290"/>
+        <di:waypoint x="1740" y="290"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T_Esc3_di" bpmnElement="SF_T_Esc3">
+        <di:waypoint x="1776" y="290"/>
+        <di:waypoint x="1830" y="290"/>
+      </bpmndi:BPMNEdge>
+
+      <!-- Рёбра глобальных аварий внутри подпроцесса -->
+      <bpmndi:BPMNEdge id="SF_T_Err1_di" bpmnElement="SF_T_Err1">
+        <di:waypoint x="815" y="238"/>
+        <di:waypoint x="815" y="460"/>
+        <di:waypoint x="1830" y="460"/>
+      </bpmndi:BPMNEdge>
+
+      <bpmndi:BPMNEdge id="SF_T_Err2_di" bpmnElement="SF_T_Err2">
+        <di:waypoint x="1500" y="238"/>
+        <di:waypoint x="1500" y="460"/>
+        <di:waypoint x="1830" y="460"/>
+      </bpmndi:BPMNEdge>
+
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+
+</bpmn:definitions>
