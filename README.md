@@ -580,7 +580,12 @@ JetStream напрямую. Иначе страховку рантайма не 
   заполняет всегда, поэтому из интерфейса мимо проверки шаг не провести;
 - **узел без роли — общая очередь**: схема без `potentialOwner` и кнопок с
   ролью отыгрывается любой сессией (как и до M6);
-- `role:catalog` в проверке не участвует: это титулы для интерфейса, а не права.
+- `role:catalog` в проверке не участвует: это титулы для интерфейса, а не права;
+- **на параллельных ветвях узел берётся по `token_id`**: у экземпляра там два
+  `ACTIVE`-токена, и «первый по `created_at`» из `tokens` — не тот, который
+  нажимают. Кабинет присылает `output_data.token_id` вместе с событием, а
+  `auth.rs` ищет узел в движковой таблице `token`; без подсказки (старые
+  клиенты, скрипты) остаётся прежний путь — первый ожидающий токен.
 
 Настройки: `AUTH_API_SUBJECT` (по умолчанию `mes.in.v1.api.auth`) и
 `AUTH_TIMEOUT_MS` (3000) — у HTTP-шлюза; subject и очередь `auth-api` заданы в
@@ -588,6 +593,10 @@ JetStream напрямую. Иначе страховку рантайма не 
 иначе недоступный движок открывал бы шаг любой роли.
 
 Роли узлов в демо-схемах (`DEFAULT_CUSTOMER_BPMN_XML` / `DEFAULT_SUPPLIER_BPMN_XML`):
+
+`Task_SecurityCheck` и `Task_QualityControl` стоят на параллельных ветвях после
+`Gateway_PassAndQuality` и сходятся в `Gateway_PassAndQualityJoin`: охрана КПП и
+ОТК работают одновременно, а экземпляр закрывается, когда закрыты обе задачи.
 
 | Узел | Роль | Кто ведёт шаг |
 | --- | --- | --- |
@@ -1632,13 +1641,22 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
     (`mergeTokens` в `App.jsx`), поэтому параллельные ветви
     `parallelGateway`/`inclusiveGateway` горят одновременно, а не «последняя
     победила»; маркеры навешивает `BpmnViewer.jsx`, неизвестные схеме узлы
-    пропускаются. Покрыто тестами `src/App.test.js` («параллельные ветви
-    подсвечиваются одновременно», «токены контуров складываются в одну
-    подсветку») и `src/bpmn-sdk/components/BpmnViewer.test.js`. Остались два
-    ограничения: подсвечивается выбранный заказ, а не все экземпляры проекта, и
-    в демо-схеме нет `parallelGateway` — набор из двух горящих узлов видно
-    только на схеме со шлюзом. «Текущий шаг» (`activeElementId`, от него зависят
-    кнопки и карточка) по-прежнему один: последний активированный узел.
+    пропускаются. Демо-схема заказчика содержит такую вилку: после выписки
+    пропуска охрана КПП (`Task_SecurityCheck`) и ОТК (`Task_QualityControl`)
+    работают одновременно, а `Gateway_PassAndQualityJoin` ждёт обе задачи.
+    Кнопки участников тоже берутся из набора активных узлов, поэтому обе ветви
+    играются, не дожидаясь друг друга (`isStepActive` в `App.jsx`).
+    Вместе с набором клиент хранит `token_id` узла (`tokenIdFor` в
+    `useProcessTokens`): движок закрывает шаг по `output_data.token_id`
+    (`runtime::pump::host_step`), потому что `element_id` называет узел, а не
+    токен, и на двух ожидающих задачах неоднозначен. Покрыто тестами
+    `src/App.test.js` («параллельные ветви подсвечиваются одновременно», «на
+    параллельных ветвях кнопки охраны и ОТК доступны одновременно», «нажатие на
+    параллельной ветви несёт `token_id` своего токена»), `src/bpmn-sdk/tokens.test.js`
+    и `src/bpmn-sdk/components/BpmnViewer.test.js`. Осталось одно ограничение:
+    подсвечивается выбранный заказ, а не все экземпляры проекта. «Текущий шаг»
+    (`activeElementId`, от него зависят карточка и журнал) по-прежнему один:
+    последний активированный узел.
 12. **Межпроцессные сообщения работают одним шагом (M3).** Движок читает
     `trg:processTrigger` и `bpmn:message`, создаёт экземпляр второй стороны и
     доставляет catch-событию по `orderNum` (раздел
@@ -1677,7 +1695,7 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
 | [`bpmn-engine/src/runtime/mod.rs`](bpmn-engine/src/runtime/mod.rs) | `GraphRuntime`: деплой схемы, старт, завершение шага, ответ ERP, запуск второй стороны по триггеру и доставка сообщений; проверка роли на событии и аудит шага (M6) |
 | [`bpmn-engine/src/runtime/messages.rs`](bpmn-engine/src/runtime/messages.rs) | Разбор `trg:processTrigger` / `bpmn:messageFlow`, `payloadKeys`, корреляция по `orderNum` |
 | [`bpmn-engine/src/runtime/roles.rs`](bpmn-engine/src/runtime/roles.rs) | Роли узла из схемы (`bpmn:potentialOwner`, `act:userAction/@role`) и решение по событию (M6) |
-| [`bpmn-engine/src/auth.rs`](bpmn-engine/src/auth.rs) | NATS-API проверки прав `mes.in.v1.api.auth`: узел из ожидающего токена, ответ шлюзу (M6) |
+| [`bpmn-engine/src/auth.rs`](bpmn-engine/src/auth.rs) | NATS-API проверки прав `mes.in.v1.api.auth`: узел по `token_id` события (иначе первый ожидающий токен), ответ шлюзу (M6) |
 | [`bpmn-engine/src/metrics.rs`](bpmn-engine/src/metrics.rs) | NATS-API метрик `mes.in.v1.api.metrics` (M7): снимок таблиц, чистая агрегация (`aggregate`), цикл/шаги/роли/SLA/брак, финиш по `endEvent` определения |
 | [`bpmn-engine/src/projects.rs`](bpmn-engine/src/projects.rs) | NATS-API схем проектов `mes.in.v1.api.projects` (M6): список, схема, деплой с `version + 1`, история `project_versions`, валидация `projectId`/`name`/`bpmnXml` |
 | [`bpmn-engine/src/runtime/pump.rs`](bpmn-engine/src/runtime/pump.rs) | Снимки движка, перехват `MessageSent`, движок доставки сообщений |

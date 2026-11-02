@@ -902,10 +902,12 @@ DDL дополнительно сериализуется advisory-блокир�
    остаются для разметки кнопки и для `element_id` (телеметрия расхождения),
    но клиент не должен «додумывать» ветку: если движок выбрал другой узел,
    подсветка приходит из `token_updated`.
-5. **`token_id` (необязательно, для параллели).** Если в `token_updated` есть
-   `token_id`, клиент может вернуть его в `output_data.token_id` при
-   завершении шага. Без этого параллельные ветки, стоящие на разных узлах,
-   работают, а на одном узле — нет (12, п. 6).
+5. **`token_id` (реализовано в M1.1).** В `token_updated` есть `token_id`, и
+   клиент возвращает его в `output_data.token_id` при завершении шага: движок
+   выбирает ожидающий токен по нему (`host_step`). Без подсказки параллельные
+   ветки, стоящие на разных узлах, работают, а на одном узле — нет (12, п. 6).
+   Тем же полем пользуется проверка прав (`auth.rs`): узел берётся по токену, а
+   не «первый активный» из legacy `tokens`.
 
 ### 10.3 Изменения демо-схемы (один коммит)
 
@@ -1070,9 +1072,9 @@ main::retry loop (ERP_RETRY_POLL_SECS, 2 с)
 | Rust unit | кэш определений: сто `load` → одна компиляция, изменение XML → перекомпиляция, предел 64 записи | `runtime/store.rs` (реализовано) |
 | Rust unit | `default` без условия (патч 3): `parse_and_compile` даёт `Some(Default)` на default-связи и `Some(Expression)` на остальных | `bpmn-engine/tests/vendor_patches.rs` |
 | Rust unit | `UserTaskCompleted` (патч): переменные попали в инстанс, удалён только один `Waiting`-токен, `parallel_group_id` сохранён | `bpmn-engine/tests/vendor_patches.rs` |
-| Rust integration | пять шлюзов демо-схемы, обе/три ветки; `stockSufficient=true/false` доходит до `Task_Ship`/`Task_CreatePO` | `bpmn-engine/tests/dairy_routing.rs` (Postgres из `DATABASE_URL`, скип без него) |
-| Rust integration | `parallelGateway`: две ветки живут одновременно, слияние ждёт обе | `bpmn-engine/tests/parallel.rs` |
-| Rust integration | повторный `event_id` не двигает токен; повторный `UserTaskCompleted` без `Waiting`-токена — no-op | `bpmn-engine/tests/idempotency.rs` |
+| Rust integration | пять шлюзов демо-схемы, обе/три ветки; `stockSufficient=true/false` доходит до `Task_Ship`/`Task_CreatePO` | `tests/dairy-plant.e2e.cjs` (живой стенд). Файла `bpmn-engine/tests/dairy_routing.rs`, который здесь назывался раньше, нет — маршрут проверяется e2e-скриптом |
+| Rust unit | `parallelGateway`: вилка даёт `ParallelFork`, слияние — `ParallelJoin { expected: 2 }`; завершение шага сохраняет `parallel_group_id` | `vendor/bpm-engine/crates/bpmn/src/lib.rs` (`compile_parallel_gateway_bpmn`), `bpmn-engine/tests/vendor_patches.rs` |
+| Rust integration | повторный `event_id` не двигает токен; повторный `UserTaskCompleted` без `Waiting`-токена — no-op | `runtime/mod.rs` возвращает пустое `Outcome`; отдельного `tests/idempotency.rs` нет |
 | Rust unit | `serviceTask`: тема воркера из `camunda:topic`, `retries`, `timeout_secs` | `runtime/pump.rs` (реализовано) |
 | Rust unit | активация `serviceTask` даёт команду (`payload` = переменные, ключ `<instance>:<element>:<token>`, `deadline` RFC 3339); `userTask` команду не даёт | `runtime/mod.rs` (реализовано) |
 | Rust unit | неуспешный ответ: `failure_plan` (retryable → ретрай, исчерпание/`retries = 0` → компенсация), backoff `base·2^n` с потолком, ключ ретрая из команды | `runtime/mod.rs` (реализовано) |
@@ -1097,17 +1099,18 @@ main::retry loop (ERP_RETRY_POLL_SECS, 2 с)
 | 3 | Нет optimistic locking в `process_store.save` | advisory-блокировка по экземпляру (9.3) | патч вендора (кандидат в апстрим) |
 | 4 | Нет транзакции «состояние + `consumed_event`» | повтор гасится отсутствием `Waiting`-токена (9.5) | outbox/патч сторов, M5/M7 |
 | 5 | EL без скобок, `not`, арифметики; ошибки глушатся | грамматика 7.2 + валидатор 7.4 | M4, если появятся сложные условия |
-| 6 | Два токена на одном узле не выразить в legacy `tokens`; завершение шага без `token_id` неоднозначно | параллельные ветки — на разных узлах; Rust-тест на две `ACTIVE` | M1.1: `token_id` в клиенте + PK по токену |
+| 6 | Два токена на одном узле не выразить в legacy `tokens` *(M1.1: клиент передаёт `token_id`, так что завершение однозначно; PK по токену остаётся за движком)* | параллельные ветки — на разных узлах | M1.1: `token_id` в клиенте (сделано) + PK по токену |
 | 7 | Первый `endEvent` помечает весь экземпляр `Completed`, даже если живы другие ветки | в демо один конец на ветку | M3 (семантика завершения) |
 | 8 | Проходные токены (`startEvent`, шлюзы) остаются `Waiting` и копятся в `token` | не проецируются в шаги; объём мал | уборка/GC в M5 |
 | 9 | SLA-воркер работает по legacy `tokens` и не двигает движок | как сегодня: `TIMED_OUT` в read-model | M6 (таймеры/эскалации) |
-| 10 | Клиент остаётся «одноактивным»; параллельные ветки в кабинете не подсвечиваются *(закрыто в M1.1: подсветка набора узлов, карта `elementId → state`)* | в демо-схеме нет `parallelGateway` — набор видно только на схеме со шлюзом | M1.1 (подсветка набора узлов) |
+| 10 | Клиент «одноактивен» только в карточке *(закрыто в M1.1: подсветка набора узлов, кнопки по набору активных узлов, `token_id` в `output_data`)* | демо-схема заказчика содержит `parallelGateway`: охрана КПП и ОТК работают одновременно | M1.1 (сделано); остаток — подсветка всех экземпляров проекта, а не выбранного заказа |
 | 11 | Ошибки процесса не уходят клиенту, DLQ нет | логи пода | M6/M7 |
 | 12 | Деплой определения — upsert по `def.id`, без версий | переименование `@id` при изменении графа (10.1) | M4 |
-| 13 | `PostgresParallelJoinRepo` несовместим со своей схемой: `ensure_group` вставляет `id`, `try_join` без строки считает ветку слившейся | репозиторий не подключается, слияние — in-memory в `TokenArrivedHandler` (9.2); в демо нет `parallelGateway` | патч вендора (кандидат в апстрим) или своя реализация `ParallelJoinRepo` |
+| 13 | `PostgresParallelJoinRepo` несовместим со своей схемой: `ensure_group` вставляет `id`, `try_join` без строки считает ветку слившейся | репозиторий не подключается, слияние — in-memory в `TokenArrivedHandler` (9.2); демо-схема заказчика теперь содержит `parallelGateway`, поэтому состояние слияния живёт в памяти пода: перезапуск посреди вилки теряет «сколько ветвей пришло» | патч вендора (кандидат в апстрим) или своя реализация `ParallelJoinRepo` |
 
 Маршрут после M1: M1.1 — `token_id` в контракте и подсветка набора активных
-узлов; M2 — живые `serviceTask` (воркеры, ретраи, идемпотентность ответов);
+узлов (сделано: клиент передаёт `token_id`, демо-схема содержит вилку); M2 —
+живые `serviceTask` (воркеры, ретраи, идемпотентность ответов);
 M3 — сообщения между процессами вместо `startsProcess`; далее — M4–M8 по
 дорожной карте. Пункты 2–4 имеют смысл как отдельный апстрим-патч вендора,
 чтобы не тащить их в каждом обновлении.
