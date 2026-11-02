@@ -69,10 +69,14 @@ const ORDERS_TIMEOUT_MS = Number(process.env.ORDERS_TIMEOUT_MS || 5000);
  * Проверка прав (M6).
  *
  * Шлюз не знает BPMN-схемы, поэтому перед публикацией события спрашивает
- * движок: `nc.request(AUTH_SUBJECT, { actor, instanceId, elementId, bpmnXml })`.
- * Ответ — `{ allowed, reason, required, elementId }` (`bpmn-engine/src/auth.rs`).
- * Синхронный запрос нужен ради **403 с причиной**: без него кабинет видел бы
- * «ничего не произошло», хотя событие отклонили.
+ * движок: `nc.request(AUTH_SUBJECT, { actor, instanceId, elementId, bpmnXml,
+ * tokenId })`. Ответ — `{ allowed, reason, required, elementId }`
+ * (`bpmn-engine/src/auth.rs`). Синхронный запрос нужен ради **403 с причиной**:
+ * без него кабинет видел бы «ничего не произошло», хотя событие отклонили.
+ *
+ * `tokenId` (`output_data.token_id`) передаётся, когда клиент его прислал: на
+ * параллельных ветвях у экземпляра несколько ожидающих задач, и узел для
+ * проверки роли берётся по конкретному токену, а не «первый активный».
  *
  * Роль сессии приходит заголовком `X-Actor-Role` (кабинет) или полем `actor`
  * (скрипты). Это заявленная роль, а не аутентификация: IdP в демо нет.
@@ -142,7 +146,7 @@ function actorOf(req) {
  * `bpmnXml` нужен только старту и деплою: у существующего экземпляра движок
  * берёт схему из `process_definition` сам.
  */
-async function authorizeEvent({ actor, instanceId, elementId, bpmnXml }) {
+async function authorizeEvent({ actor, instanceId, elementId, bpmnXml, tokenId }) {
     if (!nc) {
         const error = new Error('NATS не подключён: проверка прав недоступна');
         error.status = 503;
@@ -151,7 +155,7 @@ async function authorizeEvent({ actor, instanceId, elementId, bpmnXml }) {
 
     const message = await nc.request(
         AUTH_SUBJECT,
-        sc.encode(JSON.stringify({ actor, instanceId, elementId, bpmnXml })),
+        sc.encode(JSON.stringify({ actor, instanceId, elementId, bpmnXml, tokenId })),
         { timeout: AUTH_TIMEOUT_MS }
     );
 
@@ -213,7 +217,10 @@ app.post('/api/v1/process/instances/:id/events', async (req, res) => {
             actor,
             instanceId,
             elementId: element_id || '',
-            bpmnXml: output_data && output_data.bpmn_xml
+            bpmnXml: output_data && output_data.bpmn_xml,
+            // M1.1: на параллельных ветвях у экземпляра два ожидающих шага —
+            // движок проверяет роль того, который нажали (`output_data.token_id`).
+            tokenId: output_data && output_data.token_id
         });
     } catch (error) {
         console.error('❌ [Gateway] Проверка прав недоступна:', error && error.message);

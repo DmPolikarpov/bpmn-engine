@@ -12,9 +12,10 @@
 //! Откуда берётся узел:
 //!
 //! - старт — из `bpmnXml` самого события (экземпляра ещё нет);
-//! - завершение шага — из проекции движка: единственный `ACTIVE`-токен
-//!   экземпляра (`tokens`). Параллельных веток в демо нет (ограничение 11),
-//!   поэтому уточнять токен не требуется.
+//! - завершение шага — из `element_id` события: кабинет называет узел-хост
+//!   кнопки, а какой именно токен закрывать, движок решает по
+//!   `output_data.token_id` (демо-схема заказчика содержит `parallelGateway`,
+//!   так что `ACTIVE`-токенов у экземпляра может быть два).
 //!
 //! `actor` — **заявленная** роль сессии: в демо нет IdP, кабинет передаёт её
 //! заголовком `X-Actor-Role`. Это ограничение M6, а не недосмотр: проверка
@@ -49,6 +50,15 @@ pub struct AuthRequest {
     /// Схема из события: есть только у деплоя и старта.
     #[serde(default, alias = "bpmn_xml")]
     pub bpmn_xml: Option<String>,
+    /// Движковый `token_id` завершаемого шага (`output_data.token_id`).
+    ///
+    /// На параллельных ветвях (`parallelGateway`) у экземпляра несколько
+    /// `ACTIVE`-токенов, и «первый по `created_at`» из legacy `tokens` — не тот,
+    /// который нажимают: роль сверялась бы с чужой ветвью. Кабинет присылает
+    /// идентификатор токена вместе с событием (M1.1), и проверка идёт по его
+    /// узлу. Пусто — прежний путь: клиенты и скрипты без подсказки.
+    #[serde(default, alias = "token_id")]
+    pub token_id: Option<String>,
 }
 
 /// Ответ движка: можно ли двигать шаг и что сказать при отказе.
@@ -135,8 +145,10 @@ pub async fn decide(
         ));
     }
 
-    // Завершение шага: узел — из проекции движка (legacy `tokens`).
-    let Some((node_id, definition_id)) = waiting_step(legacy, request.instance_id.trim()).await?
+    // Завершение шага: узел — по `token_id` из события (M1.1), иначе первый
+    // `ACTIVE`-токен legacy-проекции.
+    let Some((node_id, definition_id)) =
+        waiting_step(legacy, request.instance_id.trim(), request.token_id.as_deref()).await?
     else {
         return Ok(AuthReply::allow(""));
     };
@@ -157,14 +169,41 @@ pub async fn decide(
     ))
 }
 
-/// Ожидающий шаг экземпляра и его определение: первый `ACTIVE`-токен.
+/// Ожидающий шаг экземпляра и его определение.
 ///
-/// Источник — legacy-проекция, а не вендорные таблицы: её же читает кабинет, и
-/// отдельная схема токенов движка шлюзу не нужна.
+/// Адрес берётся так:
+/// 1. `token_id` из события — движковый токен знает свой узел (`token.node_id`).
+///    Это единственный точный путь на параллельных ветвях: в legacy `tokens`
+///    там несколько `ACTIVE`-строк, и «первая по `created_at`» может оказаться
+///    чужой ветвью (M1.1, демо-схема заказчика);
+/// 2. иначе первый `ACTIVE`-токен legacy-проекции: её же читает кабинет, и
+///    отдельная схема токенов движка шлюзу не нужна. Так ходят клиенты и
+///    E2E-скрипты, которые подсказку не передают.
 async fn waiting_step(
     pool: &PgPool,
     instance_id: &str,
+    token_id: Option<&str>,
 ) -> Result<Option<(String, String)>, sqlx::Error> {
+    if let Some(token_id) = token_id.map(str::trim).filter(|id| !id.is_empty()) {
+        let row = sqlx::query(
+            r#"
+            SELECT t.node_id, i.process_def_id AS definition_id
+            FROM token t
+            JOIN process_instance i ON i.id = t.instance_id
+            WHERE t.id = $1 AND t.instance_id = $2 AND t.status = 'Waiting'
+            LIMIT 1
+            "#,
+        )
+        .bind(token_id)
+        .bind(instance_id)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(row) = row {
+            return Ok(Some((row.get("node_id"), row.get("definition_id"))));
+        }
+    }
+
     let row = sqlx::query(
         r#"
         SELECT t.element_id, i.definition_id
@@ -207,6 +246,27 @@ mod tests {
         // Пустой запрос не падает: шлюз может прислать только роль.
         let empty: AuthRequest = serde_json::from_str(r#"{"actor":"SALES"}"#).expect("только роль");
         assert_eq!(empty.instance_id, "");
+    }
+
+    #[test]
+    fn request_accepts_token_id() {
+        // M1.1: на параллельных ветвях узел берётся по движковому токену.
+        let camel: AuthRequest = serde_json::from_str(
+            r#"{"instanceId":"inst-cust-1","elementId":"Gateway_PassAndQualityJoin","actor":"QUALITY","tokenId":"token-7"}"#,
+        )
+        .expect("camelCase");
+        assert_eq!(camel.token_id.as_deref(), Some("token-7"));
+
+        let snake: AuthRequest = serde_json::from_str(
+            r#"{"instance_id":"inst-cust-1","element_id":"Task_QualityControl","actor":"QUALITY","token_id":"token-8"}"#,
+        )
+        .expect("snake_case");
+        assert_eq!(snake.token_id.as_deref(), Some("token-8"));
+
+        // Старые клиенты подсказку не шлют — поле остаётся пустым.
+        let legacy: AuthRequest =
+            serde_json::from_str(r#"{"instanceId":"inst-cust-1","actor":"QUALITY"}"#).expect("legacy");
+        assert!(legacy.token_id.is_none());
     }
 
     #[test]
