@@ -1476,7 +1476,6 @@ kubectl logs deploy/websocket-cluster-deployment -f
 | `CrashLoopBackOff` движка, в логе `must be owner of table execution_history` (SQLSTATE 42501) | `execution_history` создал initdb от `postgres`, а миграции идут от `bpmn_user`: `ALTER TABLE` требует владения, `GRANT` даёт только DML | `./deploy.sh` (шаг 5b передаёт владение) или разово: `kubectl exec -i bpmn-db-1 -c postgres -- psql -U postgres -d bpmn_db -c 'ALTER TABLE execution_history OWNER TO bpmn_user;'`, затем `kubectl rollout restart deployment/bpmn-engine-deployment` |
 | То же, но `must be owner of table tokens` (миграция `0006`, M8) | `tokens` — таблица initdb, а `0006` делает `ALTER TABLE`: владение нужно передать и ей | `kubectl exec -i bpmn-db-1 -c postgres -- psql -U postgres -d bpmn_db -c 'ALTER TABLE tokens OWNER TO bpmn_user;'`, затем `kubectl rollout restart deployment/bpmn-engine-deployment`. В initdb это уже делает [`db-init-configmap.yaml`](db-init-configmap.yaml) |
 | Шаг двигается любой ролью, `403` не приходит | образ `http-cluster` старше M6: в `/health` нет `auth_subject`, роль не проверяется до публикации | пересобрать шлюз (`./deploy.sh` целиком) или вручную: `docker build -t http-cluster-service:latest ./bpmn-gateways/http-cluster && kind load docker-image http-cluster-service:latest --name erp && kubectl rollout restart deployment/http-cluster-deployment` |
-
 | `413 request entity too large` | `bpmn_xml` больше лимита | поднять `JSON_BODY_LIMIT` у http-cluster |
 | `503` «JetStream is not connected» | нет стрима `INBOUND_EVENTS` или NATS недоступен | `kubectl apply -f nats-init-streams-job.yaml`, проверить `nats stream ls` |
 | `500` / «Ошибка сети» в UI | нет проброса портов (CRA-прокси не может достучаться до 8080) | `./translate_ports.sh` (перезапускает `kubectl port-forward`) |
@@ -1486,6 +1485,7 @@ kubectl logs deploy/websocket-cluster-deployment -f
 | Процесс не доходит до `COMPLETED` | у узла нет исходящего `sequenceFlow` (или сработал не тот `default`), либо ответ ERP не пришёл | проверить связи/условия схемы и ответ в `mes.in.v1.erp.response`; см. `runtime`-логи пода |
 | WS-подсветки нет вообще | не подключён WS-шлюз (`ws://localhost:8081/ws/status`) или движок не публикует `mes.bpmn.v1.event.>` | проверить логи `websocket-cluster` и `bpmn-engine` |
 | В UI «Заказ» появился, но действий нет | WS-событие не сопоставилось с заказом (`instanceId`/`orderNum`) | проверить формат `payload.orderNum` в событии |
+| `npm start` падает с `options.allowedHosts[0] should be a non-empty string` | `react-scripts@5.0.1` при включённом `proxy` берёт `allowedHosts` из приватного IPv4 машины; если первый не-internal адрес — публичный (Radmin VPN, туннель, внешний адаптер), `lanUrlForConfig` пуст и dev-сервер не стартует | запустить кабинет с обходом проверки хоста: `set DANGEROUSLY_DISABLE_HOST_CHECK=true && npm start` (только локальная разработка); либо отключить адаптер с публичным адресом |
 
 ## Развёртывание и разработка
 
@@ -1506,7 +1506,7 @@ cd erp-simulator && npm install && npm start
 cd erp-simulator && npm run test:ci    # Jest: App + SDK (в т.ч. привязки sendEvent)
 cd erp-simulator && npm run sdk:refresh # пересборка вендорного бандла SDK (src/vendor)
 ./run-test.sh                          # E2E в кластере: tests/test_workflow.py в Job
-./tests/run-live-e2e.sh                # живые E2E: заказы, роли, метрики, WS-фильтры, демо-сценарий завода
+./tests/run-live-e2e.sh                # живые E2E: заказы, роли, схемы проектов, метрики, WS-фильтры, демо-сценарий завода
 ./test_all.sh                          # cargo test + пересборка движка + NATS-сценарии ошибок/SLA
 ```
 
@@ -1674,6 +1674,7 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
 | [`bpmn-engine/src/projects.rs`](bpmn-engine/src/projects.rs) | NATS-API схем проектов `mes.in.v1.api.projects` (M6): список, схема, деплой с `version + 1`, история `project_versions`, валидация `projectId`/`name`/`bpmnXml` |
 | [`bpmn-engine/src/runtime/pump.rs`](bpmn-engine/src/runtime/pump.rs) | Снимки движка, перехват `MessageSent`, движок доставки сообщений |
 | [`bpmn-engine/src/db.rs`](bpmn-engine/src/db.rs) | `process_definitions`, `process_instances`, `tokens` (id = `instance:element`), аудит шага в `execution_history` (M6) |
+| [`schema.sql`](schema.sql), [`db-init-configmap.yaml`](db-init-configmap.yaml) | Таблицы и ограничения по длинам идентификаторов |
 | [`bpmn-engine/src/nats_client.rs`](bpmn-engine/src/nats_client.rs) | Subject'ы: `mes.bpmn.v1.event.<instance>`, `mes.out.v1.cmd.<system>` |
 | [`bpmn-engine/src/events.rs`](bpmn-engine/src/events.rs) | Контракты `InboundEvent`, `ErpResponseEvent`, `ActionRequiredEvent` |
 | [`bpmn-gateways/http-cluster/index.js`](bpmn-gateways/http-cluster/index.js) | Валидация, subject `mes.in.v1.event.erp.<event_name>`, CORS, лимиты, прокси `GET /api/v1/metrics` в NATS (M7) |
@@ -1702,8 +1703,6 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
 | [`tests/metrics-api.e2e.cjs`](tests/metrics-api.e2e.cjs) | Живой E2E API метрик (M7): сид legacy-таблиц → `GET /api/v1/metrics` через шлюз, цикл запуска, SLA открытого шага, разрезы шага/роли, предупреждение «нет схемы»; уборка следов через `psql` |
 | [`tests/projects-api.e2e.cjs`](tests/projects-api.e2e.cjs) | Живой E2E API проектов (M6): `PUT` поднимает версию, `GET ?version=N` читает историю, список отдаёт размер схемы, невалидный `projectId`/XML — `400`; уборка через `psql` |
 | [`tests/ws-filter.e2e.cjs`](tests/ws-filter.e2e.cjs) | Живой E2E фильтров WS (M7): три клиента (query-фильтр, `subscribe` сообщением, без фильтров), события публикуются в NATS из пода шлюза, проверяется отсечение чужих экземпляров и ролей и сброс `unsubscribe` |
-| [`tests/run-live-e2e.sh`](tests/run-live-e2e.sh) | Раннер живых E2E (заказы M4 + роли M6 + метрики и WS-фильтры M7 + демо-сценарий завода M8) по уже развёрнутому кластеру: без сборки образов и без Job'ов |
+| [`tests/run-live-e2e.sh`](tests/run-live-e2e.sh) | Раннер живых E2E (заказы M4 + роли и схемы проектов M6 + метрики и WS-фильтры M7 + демо-сценарий завода M8) по уже развёрнутому кластеру: без сборки образов и без Job'ов |
 | [`tests/dairy-plant.e2e.cjs`](tests/dairy-plant.e2e.cjs) | Живой E2E демо-сценария (M8): схема берётся из демо-клиента, проход заказа по трём пулам (закупка → сообщение поставщику → `MilkShipped` → техцепочка → отгрузка) и три негативные ветки (брак, авария ПОУ, деградация линии) с `serviceTask` мок-ERP |
-
-| [`schema.sql`](schema.sql), [`db-init-configmap.yaml`](db-init-configmap.yaml) | Таблицы и ограничения по длинам идентификаторов |
 | [`erp-simulator/docs/dairy-plant-roadmap.md`](erp-simulator/docs/dairy-plant-roadmap.md) | Дорожная карта демо-проекта «Молочный завод»: что уже играется в кабинете, какие разрывы (граф, воркеры, межпроцессные сообщения, роли, метрики) и в каком порядке закрываются (M1–M8) |
