@@ -915,7 +915,10 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
 - **кнопка запуска процесса** — та, что объявлена на стартовом событии
   (`getStartAction`): её `role` — роль инициатора, а `event`/`elementId` (если они
   записаны) — первый шаг; у старта связь одна, поэтому пару обычно выводит схема
-  (движок переводит токен двумя событиями, см. «A.» выше);
+  (движок переводит токен двумя событиями, см. «A.» выше). У процесса без кнопки
+  старта роль инициатора не нужна: завод объявляет `Start_Dairy` стартовым
+  событием-сообщением `ClientOrder` (`getStartMessageWait`), и экземпляр создаёт
+  триггер отправителя — заказ завести руками нельзя;
 - **обработчики в `App.jsx` остались**: они собирают payload, которого в схеме нет
   (номера УПД/ТТН, метки времени, идентификатор нового экземпляра), и пишут в
   журнал события процесса. Поимённо кабинет разбирает только эти шаги — их ключи
@@ -931,8 +934,9 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
   «в никуда» ничего бы не сдвинуло.
 
 API SDK: `listActions`, `getElementActions`, `getElementAction`,
-`getActionAssignments`, `getStartAction`, `setElementActions`, `normalizeAction`,
-`isValidAction`, `isActionHostType`, `parseActionVariables`, `ACTION_FIELDS`,
+`getActionAssignments`, `getStartAction`, `getStartMessageWait`, `setElementActions`,
+`normalizeAction`, `isValidAction`, `isActionHostType`, `parseActionVariables`,
+`ACTION_FIELDS`,
 `EMPTY_ACTION`, `ACTION_TYPE`, `ACTION_NAMESPACE`, `ACTION_MODELE_EXTENSIONS`, а
 для вывода адреса кнопки из связей — `resolveAction`, `resolveActionEvent`,
 `resolveActionTarget`, `getNextElementId`, `getOutgoingTargetIds`,
@@ -1270,8 +1274,9 @@ socket.unsubscribe(); // снова все экземпляры
 
 Поэтому проверку повторяет клиент (`validateEngineSchema` из SDK) и делает отказ
 видимым: панель схемы показывает причину до деплоя, деплой несовместимой схемы не
-отправляется, а «Принять заказ клиента» не заводит заказ — иначе в списке
-остался бы «заказ-призрак» без экземпляра процесса. Проверка зеркалит правила
+отправляется, а кнопка инициатора (`createOrder`, «Запуск по схеме») заказ не
+заводит — иначе в списке остался бы «заказ-призрак» без экземпляра процесса.
+Проверка зеркалит правила
 компилятора и лежит в SDK рядом с остальной логикой XML (см.
 [README SDK](erp-simulator/src/bpmn-sdk/README.md#совместимость-схемы-с-движком)).
 
