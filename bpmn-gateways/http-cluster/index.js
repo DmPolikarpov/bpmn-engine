@@ -344,7 +344,7 @@ app.post('/api/v1/orders', async (req, res) => {
 
 /**
  * `POST /api/v1/orders/:orderNum/instances` — привязка экземпляра процесса к
- * стороне заказа: `{ org: 'CUSTOMER' | 'SUPPLIER', instanceId }`.
+ * стороне заказа: `{ org: 'CUSTOMER' | 'SUPPLIER' | 'CLIENT', instanceId }`.
  */
 app.post('/api/v1/orders/:orderNum/instances', async (req, res) => {
     const body = req.body || {};
@@ -359,6 +359,17 @@ app.post('/api/v1/orders/:orderNum/instances', async (req, res) => {
         },
         'привязка экземпляра к заказу'
     );
+});
+
+/**
+ * `DELETE /api/v1/orders` — очистка всех заказов демо-контура (M8).
+ *
+ * Кнопка «Очистить все заказы» в кабинете: заказы удаляются из БД движка, а
+ * экземпляры процессов остаются историей прогона (их не откатывает и не
+ * останавливает). Ответ: `{ ok: true, deleted: N }`.
+ */
+app.delete('/api/v1/orders', async (req, res) => {
+    await proxyOrders(res, { action: 'clear' }, 'очистка заказов');
 });
 
 /**
@@ -574,6 +585,11 @@ app.get('/', (req, res) => {
                 method: 'POST',
                 path: '/api/v1/orders/:orderNum/instances',
                 description: 'Привязка экземпляра процесса к стороне заказа: { org, instanceId }'
+            },
+            {
+                method: 'DELETE',
+                path: '/api/v1/orders',
+                description: 'Очистка всех заказов демо-контура: удаляет карточки из БД, экземпляры процессов остаются'
             },
             {
                 method: 'GET',

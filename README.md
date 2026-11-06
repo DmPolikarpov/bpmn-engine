@@ -365,6 +365,7 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 | `ordersClient.getOrder(orderNum)` | `GET /api/v1/orders/:orderNum` | карточка: предметные поля и текущие шаги всех трёх контуров |
 | `ordersClient.createOrder(payload)` | `POST /api/v1/orders` | заказ **до** `startProcess`: движку нужно, к чему привязать экземпляр |
 | `ordersClient.attachInstance(orderNum, org, instanceId)` | `POST /api/v1/orders/:orderNum/instances` | какой экземпляр относится к стороне заказа |
+| `ordersClient.clearOrders()` | `DELETE /api/v1/orders` | очистка всех заказов демо-контура: кнопка «Очистить все заказы» (M8) |
 
 Схема проекта живёт и на сервере (M6) — [`projectsApi.js`](erp-simulator/src/projectsApi.js):
 
@@ -399,14 +400,22 @@ initiator, bpmn_xml })` — и то, что второго события на �
 шага (умолчание `CompleteBlock` не отправляется вовсе) схема выводит по исходящей
 связи стартового события.
 
+Перед новым показом список сбрасывается кнопкой **«Очистить все заказы»** (бар
+«Внутренние заказы» и панель «Приём заказов»): `DELETE /api/v1/orders` →
+`action: "clear"` → `DELETE FROM orders` (`deleted` в ответе — сколько карточек
+удалено). Чистится только карточка заказа: экземпляры процессов и `tokens`
+остаются историей прогона, поэтому «Очистить» не отменяет уже идущий процесс.
+Подтверждение спрашивается в браузере (`window.confirm`); без шлюза кнопка
+чистит список вкладки и пишет об этом в журнал.
+
 Живой прогон всего контура (шлюз → NATS `request/reply` → движок → Postgres) —
 [`tests/orders-api.e2e.cjs`](tests/orders-api.e2e.cjs): коды `200/400/404/409`,
-camelCase, `IDLE`/`ACTIVE` контуров и текущий шаг из `tokens`. Скрипт сам
-открывает `kubectl port-forward`, заводит экземпляр и токен через
-`kubectl exec … psql` и убирает за собой:
+camelCase, `IDLE`/`ACTIVE` контуров и текущий шаг из `tokens`, очистка списка
+последней проверкой. Скрипт сам открывает `kubectl port-forward`, заводит
+экземпляр и токен через `kubectl exec … psql` и убирает за собой:
 
 ```bash
-node tests/orders-api.e2e.cjs   # 29 проверок; GATEWAY_URL — если шлюз уже доступен
+node tests/orders-api.e2e.cjs   # 32 проверки; GATEWAY_URL — если шлюз уже доступен
 ```
 
 ### B. Сервисные задачи в движке (ответ ERP)
@@ -1731,7 +1740,7 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
 | [`erp-simulator/src/metricsStore.js`](erp-simulator/src/metricsStore.js) | Метрики запусков в браузере (запасной источник, когда API недоступен): `beginRun`/`completeRun`/`loadRuns`/`clearRuns`, ключ `bpmn-process-metrics`, агрегаты инфографики (`summarizeRuns`, `groupRunsByProcess`) |
 | [`erp-simulator/src/metricsApi.js`](erp-simulator/src/metricsApi.js) | Клиент серверных метрик (M7): `metricsClient.load` → `GET /api/v1/metrics`, `toPanelRuns` (ответ движка → записи панели), кэш ответа `bpmn-process-metrics-cache` (`loadMetricsCache`/`saveMetricsCache`/`clearMetricsCache`) |
 | [`erp-simulator/src/MetricsPanel.jsx`](erp-simulator/src/MetricsPanel.jsx) | Инфографика руководителя: карточка на процесс, плитки времени и серверные разрезы (ожидание шага, SLA, брак), столбики последних запусков, подпись источника и кнопка «Обновить» |
-| [`erp-simulator/src/ordersApi.js`](erp-simulator/src/ordersApi.js) | Заказы в БД движка (M4): `ordersClient.listOrders`/`getOrder`/`createOrder`/`attachInstance`, нормализация серверной карточки (`normalizeOrder`, `mergeOrders`), продолжение нумерации (`nextOrderNum`) и форма заказа (`defaultOrderDraft`, `toOrderPayload`, `formatDueDate`) |
+| [`erp-simulator/src/ordersApi.js`](erp-simulator/src/ordersApi.js) | Заказы в БД движка (M4): `ordersClient.listOrders`/`getOrder`/`createOrder`/`attachInstance`/`clearOrders` (очистка списка, M8), нормализация серверной карточки (`normalizeOrder`, `mergeOrders`), продолжение нумерации (`nextOrderNum`) и форма заказа (`defaultOrderDraft`, `toOrderPayload`, `formatDueDate`) |
 | [`erp-simulator/src/projectsApi.js`](erp-simulator/src/projectsApi.js) | Схемы проектов на сервере (M6): `projectsClient.listProjects`/`getProject`/`deployProject`/`listVersions`, подписи версии и размера (`versionLabel`, `serverProjectLabel`), запись кэша из ответа (`toProjectRecord`) |
 | [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) | Демо-привязки: роль → кнопка из схемы (`ACTION_ID`) → `sendEvent`; кнопки вне `ACTION_ID` — общим шагом (`schemaStepActions`); сохранение/сброс схемы; подсказки триггера — `getProcessIds` из схемы второй стороны; метрики — `beginRun` на старте, `completeRun` по токену на конечном узле и `refreshMetrics` (`GET /api/v1/metrics`) для панели |
 | [`tests/test_workflow.py`](tests/test_workflow.py) | E2E-проверка привязок через HTTP, БД, NATS и WS |

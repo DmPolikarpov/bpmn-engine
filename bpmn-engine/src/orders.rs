@@ -290,6 +290,10 @@ pub struct Response {
     pub order: Option<Order>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orders: Option<Vec<Order>>,
+    /// Сколько заказов удалила очистка (`action: "clear"`, M8): кабинет
+    /// показывает это число в журнале, чтобы кнопка не «молчала».
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,6 +313,15 @@ impl Response {
         Self {
             ok: true,
             orders: Some(orders),
+            ..Default::default()
+        }
+    }
+
+    /// Ответ очистки: сколько заказов удалено (пустой список — тоже `ok`).
+    pub fn with_deleted(deleted: u64) -> Self {
+        Self {
+            ok: true,
+            deleted: Some(deleted),
             ..Default::default()
         }
     }
@@ -355,6 +368,12 @@ pub trait OrderStore: Send + Sync {
         org: Org,
         instance_id: &str,
     ) -> anyhow::Result<Option<Order>>;
+    /// Удаляет все заказы (кнопка «Очистить все заказы», M8).
+    ///
+    /// Возвращает число удалённых записей. Экземпляры процессов в движке не
+    /// трогаются: заказ — карточка демо-контура, а `process_instances`/`tokens`
+    /// остаются историей прогона.
+    async fn clear(&self) -> anyhow::Result<u64>;
 }
 
 /// Обработчик запроса: единственное место, где решается, что вернуть.
@@ -415,6 +434,12 @@ pub async fn handle(store: &dyn OrderStore, request: Request, today: NaiveDate) 
                 Err(error) => internal(error),
             }
         }
+        // Очистка демо-контура (M8): кабинет сбрасывает список перед показом.
+        // Экземпляры процессов остаются в движке — удаляется только карточка.
+        "clear" => match store.clear().await {
+            Ok(deleted) => Response::with_deleted(deleted),
+            Err(error) => internal(error),
+        },
         other => Response::failure(400, format!("неизвестное действие: {other}")),
     }
 }
@@ -622,6 +647,17 @@ impl OrderStore for PgOrderStore {
 
         self.fetch(order_num).await
     }
+
+    /// `DELETE FROM orders` без условий: чистится весь демо-контур (M8).
+    ///
+    /// Таблица заказов ни на что не ссылается по внешнему ключу (остальные
+    /// таблицы хранят `order_num` в `business_key`), поэтому удаление одним
+    /// запросом безопасно и не требует каскадов.
+    async fn clear(&self) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM orders").execute(&self.pool).await?;
+
+        Ok(result.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -819,6 +855,14 @@ mod tests {
 
             Ok(Some(order.clone()))
         }
+
+        async fn clear(&self) -> anyhow::Result<u64> {
+            let mut orders = self.orders.lock().expect("мьютекс");
+            let deleted = orders.len() as u64;
+            orders.clear();
+
+            Ok(deleted)
+        }
     }
 
     async fn request(store: &MemoryStore, body: serde_json::Value) -> Response {
@@ -1012,6 +1056,33 @@ mod tests {
         assert_eq!(response.orders.expect("список").len(), 2);
     }
 
+    /// Кнопка «Очистить все заказы» (M8): удаляется весь список, повтор — ноль.
+    #[tokio::test]
+    async fn clear_removes_all_orders() {
+        let store = MemoryStore::default();
+        store.seed(Order::from_new(valid_order(), now()));
+        let mut second = valid_order();
+        second.order_num = "№102".to_string();
+        store.seed(Order::from_new(second, now()));
+
+        let response = request(&store, json!({ "action": "clear" })).await;
+
+        assert!(response.ok);
+        assert_eq!(response.status, None, "очистка — не ошибка");
+        assert_eq!(response.deleted, Some(2));
+        assert!(response.orders.is_none(), "список в ответе очистки не нужен");
+        assert!(
+            response.order.is_none(),
+            "карточка в ответе очистки не нужна"
+        );
+
+        let empty = request(&store, json!({ "action": "list" })).await;
+        assert_eq!(empty.orders.expect("список").len(), 0, "список пуст");
+
+        let again = request(&store, json!({ "action": "clear" })).await;
+        assert_eq!(again.deleted, Some(0), "повторная очистка — ноль удалённых");
+    }
+
     #[tokio::test]
     async fn unknown_action_and_broken_json_return_400() {
         let store = MemoryStore::default();
@@ -1043,5 +1114,11 @@ mod tests {
         let failure = serde_json::to_value(Response::failure(409, "дубль")).expect("сериализация");
         assert_eq!(failure["status"], json!(409));
         assert!(failure.get("details").is_none(), "нет пустых полей");
+
+        // Ответ очистки (M8): число удалённых в camelCase, пустых полей нет.
+        let cleared = serde_json::to_value(Response::with_deleted(3)).expect("сериализация");
+        assert_eq!(cleared["deleted"], json!(3));
+        assert_eq!(cleared["ok"], json!(true));
+        assert!(cleared.get("orders").is_none(), "нет пустых полей");
     }
 }
