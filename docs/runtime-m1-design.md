@@ -350,15 +350,18 @@ bpmn-engine/
 - **до** пумпы: токены и их `status` (нужны также для поиска хоста);
 - **после** пумпы: токены, `variables`, `state` экземпляра;
 - активный шаг — `Waiting`-токен на узле `userTask` или `externalTask`
-  (проходные `startEvent`/шлюзы тоже остаются `Waiting`, но шагом не
-  являются — см. 4.5);
+  (проходные `startEvent`/шлюзы завершаются сразу — `Completed` — и шагами
+  не являются, см. 4.5);
 - токен, который был активным шагом и исчез или перестал быть `Waiting`,
-  закрывается как `COMPLETED`.
+  закрывается как `COMPLETED`;
+- проходные узлы (`startEvent`, шлюзы, `endEvent`) публикуются в WS как
+  подсветка (`ACTIVE`/`COMPLETED`), но в legacy-таблицу `tokens` не пишутся.
 
 | Что в снимке | В NATS `mes.bpmn.v1.event.<instance>` | В legacy read-model |
 | --- | --- | --- |
 | новый активный шаг | `{event: "token_updated", state: "ACTIVE", token_id, element_id, payload}` | `tokens` upsert `ACTIVE` |
 | шаг перестал быть активным | `{event: "token_updated", state: "COMPLETED", token_id, element_id}` | `tokens.state = COMPLETED` |
+| проходной узел появился/закрылся (шлюз, `startEvent`, `endEvent`) | `{event: "token_updated", state: "ACTIVE"|"COMPLETED", token_id?, element_id}` | — (только подсветка) |
 | `process_instance.state = Completed` | `{event: "process_completed", instance_id}` | `process_instances.status = COMPLETED` |
 | `state = Terminated` (M3+) | `{event: "process_terminated", instance_id}` | `process_instances.status = TERMINATED` |
 | ошибка обработки (ядро вернуло `TokenFailed`) | `{event: "token_updated", state: "FAILED", error_message}` | `tokens.state = FAILED` |
@@ -694,11 +697,13 @@ fn engine() -> BpmEngine {
   `timer_store`, `outbox`, `compensation` не включаются — их время придёт в
   M2/M3/M5; обработчик `ExternalTaskCompleted` их и не требует
   (`external_task_completed_handler.rs:32-42`). **`PostgresParallelJoinRepo`
-  тоже не подключается**: его `ensure_group` вставляет колонку `id`, которой
+  не подключается**: его `ensure_group` вставляет колонку `id`, которой
   нет в таблице `parallel_join` (`migrate`, `adapters/postgres/src/lib.rs`), а
   `try_join` без строки возвращает `true` — ветка «слилась» бы сразу, не
-  дождавшись второй. Слияние держится на in-memory состоянии
-  `TokenArrivedHandler` (ограничение 13);
+  дождавшись второй. Вместо него в контекст ставится своя
+  `PgParallelJoinRepo` ([`runtime/join_repo.rs`](../bpmn-engine/src/runtime/join_repo.rs))
+  поверх той же таблицы, поэтому счётчик ветвей живёт в Postgres, а не в
+  памяти пода (бывшее ограничение 13);
 - пул: адаптер принимает `deadpool_postgres::Pool` (`create_pool`,
   `adapters/postgres/src/lib.rs:62-80`), а приложение уже использует `sqlx`.
   В M1 живут **два пула к одной БД**: `deadpool` — для движка, `sqlx` — для
@@ -891,12 +896,13 @@ DDL дополнительно сериализуется advisory-блокир�
    `{...payload, ...parseActionVariables(action.variables)}` в `output_data`
    каждого действия (8.1); неразобранный JSON `variables` — ошибка шага, а не
    «пустые значения».
-3. **Финиш процесса.** Обработать `{event: "process_completed"}`: закрыть
-   запуск (`completeRun`) и перевести заказ в `COMPLETED`. Сейчас клиент знает
-   только `token_updated` (`constants.js:102`, разбор — `tokens.js:52-70`), и
-   `parseTokenMessage` отбросит сообщение без `element_id`, так что нужна
-   отдельная ветка. События `ACTIVE` на `endEvent` больше не будет, а
-   `isProcessFinished` (App.jsx:323) остаётся только для старых экземпляров и
+3. **Финиш процесса.** *(реализовано)* Обработать `{event: "process_completed"}`
+   (и `process_terminated`): закрыть запуск (`completeRun`), перевести контур
+   заказа в `COMPLETED`/`TERMINATED` и снять активный узел. Сообщение приходит
+   без `element_id`, поэтому разбор токенов (`parseTokenMessage`) его
+   отбрасывает — обработка идёт отдельной подпиской на `SOCKET_EVENTS.MESSAGE`
+   в [`App.jsx`](../erp-simulator/src/App.jsx). События `ACTIVE` на `endEvent`
+   больше нет, а `isProcessFinished` остаётся только для старых экземпляров и
    для схемы «клиент закрывает сам».
 4. **Никакой арифметики маршрута.** `resolveActionTarget`/`getNextElementId`
    остаются для разметки кнопки и для `element_id` (телеметрия расхождения),
@@ -1106,7 +1112,7 @@ main::retry loop (ERP_RETRY_POLL_SECS, 2 с)
 | 10 | Клиент «одноактивен» только в карточке *(закрыто в M1.1: подсветка набора узлов, кнопки по набору активных узлов, `token_id` в `output_data`)* | демо-схема заказчика содержит `parallelGateway`: охрана КПП и ОТК работают одновременно | M1.1 (сделано); остаток — подсветка всех экземпляров проекта, а не выбранного заказа |
 | 11 | Ошибки процесса не уходят клиенту, DLQ нет | логи пода | M6/M7 |
 | 12 | Деплой определения — upsert по `def.id`, без версий | переименование `@id` при изменении графа (10.1) | M4 |
-| 13 | `PostgresParallelJoinRepo` несовместим со своей схемой: `ensure_group` вставляет `id`, `try_join` без строки считает ветку слившейся | репозиторий не подключается, слияние — in-memory в `TokenArrivedHandler` (9.2); демо-схема заказчика теперь содержит `parallelGateway`, поэтому состояние слияния живёт в памяти пода: перезапуск посреди вилки теряет «сколько ветвей пришло» | патч вендора (кандидат в апстрим) или своя реализация `ParallelJoinRepo` |
+| 13 | `PostgresParallelJoinRepo` несовместим со своей схемой: `ensure_group` вставляет `id`, `try_join` без строки считает ветку слившейся | своя `PgParallelJoinRepo` (`runtime/join_repo.rs`) поверх таблицы `parallel_join`, подключается в `GraphStores::context`; счётчик ветвей живёт в Postgres и переживает рестарт пода и обработку ветвей разными подами | вендорный репозиторий не подключается; при обновлении вендора его не возвращать |
 
 Маршрут после M1: M1.1 — `token_id` в контракте и подсветка набора активных
 узлов (сделано: клиент передаёт `token_id`, демо-схема содержит вилку); M2 —

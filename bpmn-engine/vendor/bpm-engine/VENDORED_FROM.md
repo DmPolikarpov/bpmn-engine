@@ -34,7 +34,7 @@ codeload-тарболла нет `.git`, поэтому при обновлен�
 `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `SECURITY.md`, `README_zh.md` —
 сборке не нужны, наших тестов не касаются.
 
-## Локальные патчи (6)
+## Локальные патчи (7)
 
 Патчи 1–3, 5 и 6 зафиксированы тестами
 [`tests/vendor_patches.rs`](../../tests/vendor_patches.rs); патч 4 без живой
@@ -90,6 +90,15 @@ codeload-тарболла нет `.git`, поэтому при обновлен�
    Так ответ поставщика находит экземпляр завода по `orderNum`, а не по
    `instance_id`. Проверка —
    `tests/vendor_patches.rs::message_delivery_respects_correlation`.
+7. **Проходные узлы завершаются сразу** — `crates/runtime/src/token_arrived_handler.rs`:
+   `Start`, синхронный `ServiceTask`, `ExclusiveGateway`, `ParallelFork`,
+   `MessageIntermediateThrow` и `SignalIntermediateThrow` ставят токену
+   `TokenStatus::Completed`, а не `Waiting`. Upstream оставляет их `Waiting`
+   навсегда, поэтому подсветка схемы не могла отличить «пройдено» от
+   «активно» и шлюзы/события не проецировались в WS. Проекция
+   (`runtime/project.rs`) использует `Completed`, чтобы публиковать
+   `token_updated` для проходных узлов; `endEvent` подсвечивается по факту
+   `process_completed`.
 
 Хелпер `move_token_preserving_group` — upstream-код
 (`crates/runtime/src/transition.rs`), это не патч.

@@ -84,7 +84,10 @@ impl EventHandler for TokenArrivedHandler {
 
         match &node.node_type {
             NodeType::Start => {
-                instance.tokens[token_idx].status = TokenStatus::Waiting;
+                // M1 patch: проходной узел завершается сразу после перехода,
+                // иначе он навсегда остаётся `Waiting` и подсветка схемы не
+                // отличает его от активного шага.
+                instance.tokens[token_idx].status = TokenStatus::Completed;
                 let new_tokens = move_token(node);
                 for t in &new_tokens {
                     out.push(EngineEvent::TokenArrived(payloads::TokenArrived {
@@ -97,7 +100,8 @@ impl EventHandler for TokenArrivedHandler {
             }
             NodeType::ServiceTask(service) => {
                 service(&mut instance);
-                instance.tokens[token_idx].status = TokenStatus::Waiting;
+                // M1 patch: синхронный serviceTask — проходной узел.
+                instance.tokens[token_idx].status = TokenStatus::Completed;
                 let new_tokens = move_token_preserving_group(node, parallel_group_id.clone());
                 for t in &new_tokens {
                     out.push(EngineEvent::TokenArrived(payloads::TokenArrived {
@@ -188,7 +192,8 @@ impl EventHandler for TokenArrivedHandler {
                 }
             }
             NodeType::ExclusiveGateway => {
-                instance.tokens[token_idx].status = TokenStatus::Waiting;
+                // M1 patch: шлюз выбора — проходной узел.
+                instance.tokens[token_idx].status = TokenStatus::Completed;
                 if let Some(t) = evaluate_exclusive_gateway(node, &instance.variables) {
                     out.push(EngineEvent::TokenArrived(payloads::TokenArrived {
                         instance_id: e.instance_id.clone(),
@@ -212,7 +217,8 @@ impl EventHandler for TokenArrivedHandler {
                     let expected = node.outgoing_edges.len() as u32;
                     let _ = join_repo.ensure_group(&group_id, expected).await;
                 }
-                instance.tokens[token_idx].status = TokenStatus::Waiting;
+                // M1 patch: вилка — проходной узел; ждут только её ветви.
+                instance.tokens[token_idx].status = TokenStatus::Completed;
                 let new_tokens = move_token_with_group(node, group_id.clone());
                 for t in &new_tokens {
                     out.push(EngineEvent::TokenArrived(payloads::TokenArrived {
@@ -328,7 +334,7 @@ impl EventHandler for TokenArrivedHandler {
                     correlation: None,
                     payload: None,
                 }));
-                instance.tokens[token_idx].status = TokenStatus::Waiting;
+                instance.tokens[token_idx].status = TokenStatus::Completed;
                 let new_tokens = move_token(node);
                 for t in &new_tokens {
                     out.push(EngineEvent::TokenArrived(payloads::TokenArrived {
@@ -345,7 +351,7 @@ impl EventHandler for TokenArrivedHandler {
                     instance_id: e.instance_id.clone(),
                     signal_name: signal_name.clone(),
                 }));
-                instance.tokens[token_idx].status = TokenStatus::Waiting;
+                instance.tokens[token_idx].status = TokenStatus::Completed;
                 let new_tokens = move_token(node);
                 for t in &new_tokens {
                     out.push(EngineEvent::TokenArrived(payloads::TokenArrived {

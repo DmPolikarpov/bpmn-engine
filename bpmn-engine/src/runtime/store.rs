@@ -21,6 +21,8 @@ use bpm_engine_adapter_postgres::{
 };
 use deadpool_postgres::Pool;
 
+use super::join_repo::PgParallelJoinRepo;
+
 /// Предел кэша определений — защита от неограниченного роста памяти пода.
 pub const MAX_CACHED_DEFINITIONS: usize = 64;
 
@@ -172,10 +174,11 @@ pub struct GraphStores {
 impl GraphStores {
     /// Создаёт сторы поверх `DATABASE_URL`.
     ///
-    /// `parallel_join_repo` намеренно не подключается: вендорный
+    /// Слияние параллельных ветвей держится в Postgres
+    /// ([`PgParallelJoinRepo`]), а не в памяти пода: вендорный
     /// `PostgresParallelJoinRepo` вставляет колонку `id`, которой нет в
-    /// `parallel_join` (`migrate` её не создаёт), поэтому слияние веток
-    /// держится на in-memory состоянии хендлера (дизайн 9.2).
+    /// `parallel_join` (`migrate` её не создаёт), поэтому он не подключается
+    /// (дизайн 9.2, ограничение 13).
     pub fn new(database_url: &str) -> anyhow::Result<Self> {
         let pool = create_pool(database_url)?;
         let def_store = Arc::new(PostgresProcessDefStore::new(pool.clone()));
@@ -202,6 +205,7 @@ impl GraphStores {
             self.cached_def_store.clone(),
         )
         .history_repo(self.history_repo.clone())
+        .parallel_join_repo(Arc::new(PgParallelJoinRepo::new(self.pool.clone())))
         .build()
     }
 

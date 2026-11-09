@@ -7,6 +7,7 @@
 //! Режим один — маршрут считает движок по графу схемы (дизайн 10.1).
 //! Legacy-ветка, где следующий узел называл клиент, удалена шагом 3 (M2).
 
+pub mod join_repo;
 pub mod mapper;
 pub mod messages;
 pub mod project;
@@ -59,6 +60,8 @@ pub struct StepEvent {
 pub struct Outcome {
     /// Изменения шагов.
     pub steps: Vec<StepEvent>,
+    /// Подсветка проходных узлов (шлюзы, события) — только в WS.
+    pub highlights: Vec<StepEvent>,
     /// Имя WS-события завершения процесса: `process_completed` /
     /// `process_terminated`.
     pub process_finished: Option<&'static str>,
@@ -85,6 +88,8 @@ pub struct PeerOutcome {
     pub instance_id: String,
     /// Изменения его шагов.
     pub steps: Vec<StepEvent>,
+    /// Подсветка его проходных узлов — только в WS.
+    pub highlights: Vec<StepEvent>,
     /// `process_completed` / `process_terminated`, если он завершился.
     pub process_finished: Option<&'static str>,
     /// Команды воркерам по его активированным `serviceTask`.
@@ -98,6 +103,7 @@ impl PeerOutcome {
         Self {
             instance_id: instance_id.to_string(),
             steps: outcome.steps,
+            highlights: outcome.highlights,
             process_finished: outcome.process_finished,
             commands: outcome.commands,
             actions: outcome.actions,
@@ -1203,8 +1209,20 @@ fn to_outcome(
         });
     }
 
+    let highlights = projection
+        .highlights
+        .iter()
+        .map(|highlight| StepEvent {
+            token_id: highlight.token_id.clone(),
+            element_id: highlight.element_id.clone(),
+            state: highlight.state,
+            payload: None,
+        })
+        .collect();
+
     Outcome {
         steps,
+        highlights,
         process_finished: projection.finished.and_then(ws_process_event),
         commands,
         actions: Vec::new(),
@@ -1279,6 +1297,7 @@ mod tests {
                 element_id: "Task_Start".to_string(),
             }],
             finished: None,
+            highlights: Vec::new(),
         };
 
         let outcome = to_outcome(&projection, Some(&json!({"order_amount": 10})), Vec::new());
@@ -1306,6 +1325,7 @@ mod tests {
                 element_id: "Task_Ship".to_string(),
             }],
             finished: Some(InstanceState::Completed),
+            highlights: Vec::new(),
         };
 
         let outcome = to_outcome(&projection, None, Vec::new());
@@ -1320,6 +1340,7 @@ mod tests {
             activated: vec![],
             closed: vec![],
             finished: Some(InstanceState::Terminated),
+            highlights: Vec::new(),
         };
 
         let outcome = to_outcome(&projection, None, Vec::new());
@@ -1373,6 +1394,7 @@ mod tests {
             }],
             closed: vec![],
             finished: None,
+            highlights: Vec::new(),
         };
 
         let commands = service_commands("instance-1", &snapshot, &projection);
@@ -1428,6 +1450,7 @@ mod tests {
             ],
             closed: vec![],
             finished: None,
+            highlights: Vec::new(),
         };
 
         assert!(
