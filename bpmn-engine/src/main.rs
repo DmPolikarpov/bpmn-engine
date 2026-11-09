@@ -322,6 +322,7 @@ async fn publish_outcome(nats: &NatsAdapter, instance_id: &str, outcome: &runtim
         nats,
         instance_id,
         &outcome.steps,
+        &outcome.highlights,
         outcome.process_finished,
         &outcome.commands,
         &outcome.actions,
@@ -333,6 +334,7 @@ async fn publish_outcome(nats: &NatsAdapter, instance_id: &str, outcome: &runtim
             nats,
             &peer.instance_id,
             &peer.steps,
+            &peer.highlights,
             peer.process_finished,
             &peer.commands,
             &peer.actions,
@@ -346,6 +348,7 @@ async fn publish_parts(
     nats: &NatsAdapter,
     instance_id: &str,
     steps: &[runtime::StepEvent],
+    highlights: &[runtime::StepEvent],
     process_finished: Option<&'static str>,
     commands: &[ServiceCommand],
     actions: &[ActionRequiredEvent],
@@ -385,6 +388,31 @@ async fn publish_parts(
             eprintln!(
                 "❌ [Graph] Ошибка публикации {} для {}:{}: {}",
                 step.state, instance_id, step.element_id, e
+            );
+        }
+    }
+
+    // Подсветка проходных узлов (шлюзы, события): тот же subject, что и шаги,
+    // но без payload и, для финального endEvent, без token_id.
+    for highlight in highlights {
+        let token_id = if highlight.token_id.is_empty() {
+            None
+        } else {
+            Some(highlight.token_id.as_str())
+        };
+        if let Err(e) = nats
+            .publish_token_event_with_token_id(
+                instance_id,
+                &highlight.element_id,
+                highlight.state,
+                None,
+                token_id,
+            )
+            .await
+        {
+            eprintln!(
+                "❌ [Graph] Ошибка публикации подсветки {} для {}:{}: {}",
+                highlight.state, instance_id, highlight.element_id, e
             );
         }
     }

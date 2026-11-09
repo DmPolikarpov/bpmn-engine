@@ -28,6 +28,7 @@
 
 ## Содержание
 
+- [Быстрый вход: что это и где что лежит](#быстрый-вход-что-это-и-где-что-лежит)
 - [Архитектура и поток данных](#архитектура-и-поток-данных)
 - [Главное правило: блок привязывается к сервису через `element_id`](#главное-правило-блок-привязывается-к-сервису-через-element_id)
 - [Контракты транспорта](#контракты-транспорта)
@@ -43,6 +44,133 @@
 - [Развёртывание и разработка](#развёртывание-и-разработка)
 - [Известные ограничения](#известные-ограничения)
 - [Карта исходников](#карта-исходников)
+
+## Быстрый вход: что это и где что лежит
+
+Раздел для того, кто открыл репозиторий впервые — человек или ИИ-агент. Ниже
+карта: что за система, где код, чем проверять и на чём здесь уже спотыкались.
+Остальной README — детали, каждая ссылка ведёт в нужный раздел.
+
+### Что делает система
+
+Источник правды — BPMN-схема. Узлы, роли исполнителей (`bpmn:potentialOwner`),
+кнопки кабинета (`act:userAction`), запуск второй стороны
+(`trg:processTrigger`) и межпроцессные сообщения (`bpmn:messageFlow`) объявлены
+в XML, а не в коде клиента. Дальше цикл повторяется на каждом шаге:
+
+1. клиент шлёт `POST /api/v1/process/instances/:id/events` с `element_id` шага,
+   payload'ом и ролью сессии (`X-Actor-Role`, M6);
+2. HTTP-шлюз спрашивает движок «вправе ли эта роль выполнить узел» и при отказе
+   отвечает `403` с причиной, иначе публикует событие в NATS JetStream;
+3. движок двигает токены в PostgreSQL, `serviceTask` исполняет через команду
+   `mes.out.v1.cmd.erp` (в демо — мок-воркер), доставляет сообщения второй
+   стороне и публикует изменения токенов;
+4. WS-шлюз раздаёт изменения подписчикам, кабинет подсвечивает шаги; метрики
+   руководителя считает движок (`mes.in.v1.api.metrics`, M7).
+
+### Дерево репозитория
+
+```
+bpmn-engine/                этот git-репозиторий (README здесь)
+├─ bpmn-engine/             Rust-движок: src/ (main, runtime/, auth, metrics,
+│                           projects, orders, db, events), migrations/, tests/
+├─ bpmn-gateways/
+│  ├─ http-cluster/         Express-шлюз :8080 — единственная точка приёма событий
+│  └─ websocket-cluster/    ws-шлюз :8081 — вещание mes.bpmn.v1.event.>
+├─ erp-simulator/           React-кабинет + SDK — git submodule (коммит отдельно)
+│  ├─ src/App.jsx           демо-привязки: роль → кнопка → sendEvent
+│  ├─ src/bpmn-sdk/         SDK: клиент шлюза, работа с XML схемы, компоненты
+│  ├─ src/vendor/bpmn-sdk/  собранный бандл SDK (пересобирается, руками не править)
+│  ├─ scripts/check-bundle.mjs  «npm run build:check»
+│  └─ docs/                 дорожная карта демо и чек-лист показа
+├─ tests/                   живые E2E: *.e2e.cjs + run-live-e2e.sh
+├─ docs/                    BPMN-схемы и дизайн рантайма (runtime-m1-design.md)
+└─ *-deployment.yaml, deploy.sh, schema.sql, db-init-configmap.yaml — кластер (kind)
+```
+
+Каталог `..\wip\` (вне git) — обёртки запуска и зонды этой машины, см.
+[«Ловушки окружения»](#ловушки-окружения-эта-машина).
+
+### Вехи: что уже работает
+
+| Веха | Что закрыто | Где смотреть |
+| --- | --- | --- |
+| M0 | витрина кабинета: схема, деплой, подсветка токенов по WS | [«Архитектура»](#архитектура-и-поток-данных), [`App.jsx`](erp-simulator/src/App.jsx) |
+| M1 | маршрутизация по графу внутри процесса: ветки, шлюзы, `default` | [`runtime/mod.rs`](bpmn-engine/src/runtime/mod.rs), [`runtime-m1-design.md`](docs/runtime-m1-design.md) |
+| M2 | `serviceTask` через воркер ERP: команда в `mes.out.v1.cmd.erp`, ответ, ретраи, SLA | [`runtime/mod.rs`](bpmn-engine/src/runtime/mod.rs), [`erp_mock_worker.rs`](bpmn-engine/src/bin/erp_mock_worker.rs) |
+| M3 | межпроцессные сообщения: `trg:processTrigger`, `bpmn:messageFlow`, корреляция по `orderNum` | [`runtime/messages.rs`](bpmn-engine/src/runtime/messages.rs), [«Межпроцессные сообщения»](#межпроцессные-сообщения-m3) |
+| M4 | заказы в БД движка: `POST/GET/DELETE /api/v1/orders` | [`orders.rs`](bpmn-engine/src/orders.rs), [`ordersApi.js`](erp-simulator/src/ordersApi.js) |
+| M5 | клиент как третий пул демо-схемы: заказ клиента | [`dairyPlant.js`](erp-simulator/src/bpmn-sdk/defaults/dairyPlant.js) |
+| M6 | роль как авторизация: `403` с причиной, аудит `actor`, схемы проектов на сервере | [`auth.rs`](bpmn-engine/src/auth.rs), [`roles.rs`](bpmn-engine/src/runtime/roles.rs), [`projects.rs`](bpmn-engine/src/projects.rs) |
+| M7 | серверные метрики и SLA-разрезы, фильтры WS-подписки | [`metrics.rs`](bpmn-engine/src/metrics.rs), [`metricsApi.js`](erp-simulator/src/metricsApi.js), [`MetricsPanel.jsx`](erp-simulator/src/MetricsPanel.jsx) |
+| M8 | демо-качество: чек-лист показа, очистка заказов и токенов, живые E2E | [`demo-checklist.md`](erp-simulator/docs/demo-checklist.md), [`dairy-plant.e2e.cjs`](tests/dairy-plant.e2e.cjs) |
+
+Разрывы между «рисуется» и «исполняется» и порядок их закрытия —
+[дорожная карта](erp-simulator/docs/dairy-plant-roadmap.md) (разделы 4–6).
+
+### Проверки: что чем запускается
+
+| Что | Команда | Что проверяет |
+| --- | --- | --- |
+| Движок (Rust) | `cd bpmn-engine && cargo test` | юниты модулей и `tests/`; `cargo clippy --all-targets -- -D warnings` — обязателен |
+| Клиент и SDK | `cd erp-simulator && npm run test:ci` | Jest: 23 набора, 517 тестов (из них `App.test` — 60) |
+| Артефакты SDK | `npm run sdk:verify` | `src/vendor/bpmn-sdk` совпадает с `src/bpmn-sdk` |
+| Прод-сборка | `npm run build:verify` | `build` + `build:check`: маркеры демо в бандле, сборка не старше `src/` |
+| WS-фильтры | `cd bpmn-gateways/websocket-cluster && npm test` | `node --test filters.test.js` |
+| Живые E2E | `./tests/run-live-e2e.sh` | по развёрнутому кластеру: заказы, роли, проекты, метрики, WS, демо-сценарий завода |
+| Ручной показ | [чек-лист](erp-simulator/docs/demo-checklist.md) | сценарии A–D с ожидаемым результатом |
+
+### Ловушки окружения (эта машина)
+
+Команды идут через `cmd.exe`, поэтому есть места, где инструмент молчит не
+потому, что «всё хорошо»:
+
+| Ловушка | Симптом | Обход |
+| --- | --- | --- |
+| кавычки в аргументах | `git commit -m "текст"` → `pathspec 'ожидание' did not match`; JSON-тело `curl` до сервера не доходит | сообщение коммита — в файл: `git commit -F wip\commit-msg.txt`; вместо `curl` — зонды `wip\probe-api.cjs`, `wip\probe-event.cjs` |
+| поиск по коду | `git grep` и `rg` дают ложные пропуски, `findstr` молчит на файлах без CRLF, кириллица в шаблоне ломается кодировкой | `node wip\grep-tree.cjs <каталог> <шаблон>`, `node wip\grep-lines.cjs <файл> <шаблон>` |
+| долгие команды | терминал обрывает команду примерно на 30 с | `wip\run-jest.ps1` (Jest), `wip\build-cabinet.cmd` (сборка), ожидание маркера — `node wip\wait-file.cjs`, `node wip\wait-grep.cjs` |
+| отчёты Jest | сводка идёт в stderr: `<LogName>.log` почти пуст, код возврата отвязанного процесса всегда `0` | смотреть `<LogName>.err.log`, верить логу, а не коду возврата |
+| `npm start` (CRA) | `options.allowedHosts[0] should be a non-empty string`: единственный не-internal адрес — Radmin VPN, `lanUrlForConfig` пуст при любом `HOST` | `DANGEROUSLY_DISABLE_HOST_CHECK=true` в `erp-simulator/.env.development.local`, диагностика — `wip\probe-allowed-host.cjs` |
+| `kubectl port-forward` | после `rollout restart` проброс мёртв, кабинет получает `500` от CRA-прокси (движок отвечает `200`) | `taskkill /f /im kubectl.exe` → `wip\port-forward.cmd` → F5 в кабинете |
+
+### Соглашения, которых держится код
+
+- **Язык.** Документация, комментарии и сообщения об ошибках — по-русски;
+  комментарий объясняет **почему** так, а не пересказывает код.
+- **Схема — закон.** Поведение кабинета (кнопки, роли, события, запуск второй
+  стороны) задаётся расширениями схемы, а не константами в коде.
+- **Тесты рядом с кодом.** Клиент — `*.test.js` в том же каталоге
+  (`react-scripts test`, `@testing-library/react`); Rust — `#[cfg(test)] mod` в
+  модуле; живые сценарии — `tests/*.e2e.cjs` (чистый `node`, без фреймворков) и
+  `tests/test_workflow.py` для прогона в кластере.
+- **Зависимости.** Новые ставятся под конкретную задачу: в клиенте нет
+  TypeScript, состояние — `useState`/`localStorage`, HTTP — `fetch`.
+- **SDK — пакет.** Правится `erp-simulator/src/bpmn-sdk/**`, затем
+  `npm run sdk:refresh`: `src/vendor/bpmn-sdk` — сборка, её правят только
+  пересборкой, иначе `sdk:verify` падает.
+
+### Где править типовые вещи
+
+| Задача | Куда идти |
+| --- | --- |
+| кнопка/шаг в кабинете | `act:userAction` в схеме + `ACTION_ID`/`schemaStepActions` в [`App.jsx`](erp-simulator/src/App.jsx) |
+| роль шага | `bpmn:potentialOwner` в схеме; проверка — [`roles.rs`](bpmn-engine/src/runtime/roles.rs), [`auth.rs`](bpmn-engine/src/auth.rs) |
+| связка «блок → внешний сервис» | [«Как привязать новый блок к сервису»](#как-привязать-новый-блок-к-сервису) |
+| сообщение между процессами | `bpmn:messageFlow`/`trg:processTrigger` в схеме + [`runtime/messages.rs`](bpmn-engine/src/runtime/messages.rs) |
+| заказы (M4) | [`orders.rs`](bpmn-engine/src/orders.rs) + [`ordersApi.js`](erp-simulator/src/ordersApi.js) |
+| схемы проектов и версии (M6) | [`projects.rs`](bpmn-engine/src/projects.rs) + [`projectsApi.js`](erp-simulator/src/projectsApi.js) |
+| метрики (M7) | [`metrics.rs`](bpmn-engine/src/metrics.rs) + [`metricsApi.js`](erp-simulator/src/metricsApi.js)/[`MetricsPanel.jsx`](erp-simulator/src/MetricsPanel.jsx) |
+| текст отказа `403` | [`roles.rs`](bpmn-engine/src/runtime/roles.rs) (`decide_action`) и `eventFailure` в [`App.jsx`](erp-simulator/src/App.jsx) |
+| подсказки и валидация схемы | [`xml/bpmnXml.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.js) (`validateEngineSchema`, `resolveAction`) |
+
+### Границы репозиториев и порядок коммитов
+
+`p-bpmn-engine` (рабочий каталог) — не репозиторий. Репозиторий —
+`p-bpmn-engine\bpmn-engine`, а `erp-simulator` внутри него — **подмодуль**.
+Поэтому сначала коммит в подмодуле (`git -C bpmn-engine\erp-simulator …`), затем
+в основном репозитории: указатель подмодуля и правки README. `wip/` вне git —
+там только обёртки этой машины.
 
 ## Архитектура и поток данных
 
@@ -365,6 +493,7 @@ await client.sendEvent(instanceId, 'SecurityPass', 'Task_QualityControl', {
 | `ordersClient.getOrder(orderNum)` | `GET /api/v1/orders/:orderNum` | карточка: предметные поля и текущие шаги всех трёх контуров |
 | `ordersClient.createOrder(payload)` | `POST /api/v1/orders` | заказ **до** `startProcess`: движку нужно, к чему привязать экземпляр |
 | `ordersClient.attachInstance(orderNum, org, instanceId)` | `POST /api/v1/orders/:orderNum/instances` | какой экземпляр относится к стороне заказа |
+| `ordersClient.clearOrders()` | `DELETE /api/v1/orders` | очистка всех заказов демо-контура: кнопка «Очистить все заказы» (M8) |
 
 Схема проекта живёт и на сервере (M6) — [`projectsApi.js`](erp-simulator/src/projectsApi.js):
 
@@ -399,14 +528,22 @@ initiator, bpmn_xml })` — и то, что второго события на �
 шага (умолчание `CompleteBlock` не отправляется вовсе) схема выводит по исходящей
 связи стартового события.
 
+Перед новым показом список сбрасывается кнопкой **«Очистить все заказы»** (бар
+«Внутренние заказы» и панель «Приём заказов»): `DELETE /api/v1/orders` →
+`action: "clear"` → `DELETE FROM orders` (`deleted` в ответе — сколько карточек
+удалено). Чистится только карточка заказа: экземпляры процессов и `tokens`
+остаются историей прогона, поэтому «Очистить» не отменяет уже идущий процесс.
+Подтверждение спрашивается в браузере (`window.confirm`); без шлюза кнопка
+чистит список вкладки и пишет об этом в журнал.
+
 Живой прогон всего контура (шлюз → NATS `request/reply` → движок → Postgres) —
 [`tests/orders-api.e2e.cjs`](tests/orders-api.e2e.cjs): коды `200/400/404/409`,
-camelCase, `IDLE`/`ACTIVE` контуров и текущий шаг из `tokens`. Скрипт сам
-открывает `kubectl port-forward`, заводит экземпляр и токен через
-`kubectl exec … psql` и убирает за собой:
+camelCase, `IDLE`/`ACTIVE` контуров и текущий шаг из `tokens`, очистка списка
+последней проверкой. Скрипт сам открывает `kubectl port-forward`, заводит
+экземпляр и токен через `kubectl exec … psql` и убирает за собой:
 
 ```bash
-node tests/orders-api.e2e.cjs   # 29 проверок; GATEWAY_URL — если шлюз уже доступен
+node tests/orders-api.e2e.cjs   # 32 проверки; GATEWAY_URL — если шлюз уже доступен
 ```
 
 ### B. Сервисные задачи в движке (ответ ERP)
@@ -501,6 +638,29 @@ X-Actor-Role: WAREHOUSE
 `httpClient` кладёт текст `error` из тела ответа в `details` результата
 `sendEvent`, а [`App.jsx`](erp-simulator/src/App.jsx) берёт его в
 `eventFailure`.
+
+Отдельный случай — **сигнал второй стороне** (`counterpartEvent` в
+`act:userAction` старых схем, например `SupplierShippedSignal`). Это не действие
+роли отправителя, а доставка сообщения в чужой экземпляр, поэтому движок сверяет
+`X-Actor-Role` с ожидающим шагом **того** контура, куда приходит событие. Кабинет
+шлёт такой сигнал без роли — пятым аргументом `sendEvent`:
+
+```js
+client.sendEvent(
+  customerInstanceId,
+  'SupplierShippedSignal',
+  'Task_ReceiveDocsAndIssuePass',
+  { shippedAt, orderNum },
+  { actor: '' }        // системная доставка: заголовок и поле actor не шлются
+);
+```
+
+Под ролью сессии поставщика шлюз отвечал `403 «Роль SUPPLIER_MANAGER не может
+завершить шаг Task_WaitForSupplierShipment: нужна роль MANAGER.»`, и приёмка
+документов у Заказчика не открывалась. Пустая роль здесь — ровно то, что движок
+делает сам по `bpmn:messageFlow` (M3): сообщение без исполнителя. `options.actor`
+переопределяет роль только для одного события — `client.actor` сессии не
+меняется.
 
 Живой прогон контура (кабинет → шлюз → NATS → движок → Postgres) —
 [`tests/roles-auth.e2e.cjs`](tests/roles-auth.e2e.cjs). Скрипт сам поднимает схему
@@ -858,8 +1018,13 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
   разбирает каскадом (вложенные триггеры — M3.2);
 - **`firstElementId`** должен совпадать со штатным первым шагом целевого
   процесса; расхождение логируется `message_entry_mismatch`;
-- **catch-событие — не шаг кабинета**: пока процесс ждёт сообщение, подсветка
-  стоит на последнем человеческом шаге;
+- **catch-событие — не шаг кабинета**: кнопок у него нет, команду присылает
+  вторая сторона. Подсветка стоит на самом событии, а панель действий вместо
+  пустоты объясняет ожидание: какое сообщение ждём (`bpmn:message/@name`) и чей
+  процесс его дошлёт (`getMessageWait`/`findMessageThrow` из
+  [`xml/bpmnXml.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.js); тесты `App.test.js`
+  «ожидание сообщения объясняется подсказкой вместо пустых кнопок» и
+  «catch-событие подсвечивается на самом узле ожидания»);
 - **payload — только скаляры** (`HashMap<String, String>` вендора): вложенные
   объекты (`documents`) между процессами не передаются.
 
@@ -910,7 +1075,10 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
 - **кнопка запуска процесса** — та, что объявлена на стартовом событии
   (`getStartAction`): её `role` — роль инициатора, а `event`/`elementId` (если они
   записаны) — первый шаг; у старта связь одна, поэтому пару обычно выводит схема
-  (движок переводит токен двумя событиями, см. «A.» выше);
+  (движок переводит токен двумя событиями, см. «A.» выше). У процесса без кнопки
+  старта роль инициатора не нужна: завод объявляет `Start_Dairy` стартовым
+  событием-сообщением `ClientOrder` (`getStartMessageWait`), и экземпляр создаёт
+  триггер отправителя — заказ завести руками нельзя;
 - **обработчики в `App.jsx` остались**: они собирают payload, которого в схеме нет
   (номера УПД/ТТН, метки времени, идентификатор нового экземпляра), и пишут в
   журнал события процесса. Поимённо кабинет разбирает только эти шаги — их ключи
@@ -926,8 +1094,9 @@ setElementTrigger(xml, 'Task_WaitForSupplierShipment', null); // снять тр
   «в никуда» ничего бы не сдвинуло.
 
 API SDK: `listActions`, `getElementActions`, `getElementAction`,
-`getActionAssignments`, `getStartAction`, `setElementActions`, `normalizeAction`,
-`isValidAction`, `isActionHostType`, `parseActionVariables`, `ACTION_FIELDS`,
+`getActionAssignments`, `getStartAction`, `getStartMessageWait`, `setElementActions`,
+`normalizeAction`, `isValidAction`, `isActionHostType`, `parseActionVariables`,
+`ACTION_FIELDS`,
 `EMPTY_ACTION`, `ACTION_TYPE`, `ACTION_NAMESPACE`, `ACTION_MODELE_EXTENSIONS`, а
 для вывода адреса кнопки из связей — `resolveAction`, `resolveActionEvent`,
 `resolveActionTarget`, `getNextElementId`, `getOutgoingTargetIds`,
@@ -1265,8 +1434,9 @@ socket.unsubscribe(); // снова все экземпляры
 
 Поэтому проверку повторяет клиент (`validateEngineSchema` из SDK) и делает отказ
 видимым: панель схемы показывает причину до деплоя, деплой несовместимой схемы не
-отправляется, а «Принять заказ клиента» не заводит заказ — иначе в списке
-остался бы «заказ-призрак» без экземпляра процесса. Проверка зеркалит правила
+отправляется, а кнопка инициатора (`createOrder`, «Запуск по схеме») заказ не
+заводит — иначе в списке остался бы «заказ-призрак» без экземпляра процесса.
+Проверка зеркалит правила
 компилятора и лежит в SDK рядом с остальной логикой XML (см.
 [README SDK](erp-simulator/src/bpmn-sdk/README.md#совместимость-схемы-с-движком)).
 
@@ -1494,7 +1664,7 @@ kubectl logs deploy/websocket-cluster-deployment -f
 | Процесс не доходит до `COMPLETED` | у узла нет исходящего `sequenceFlow` (или сработал не тот `default`), либо ответ ERP не пришёл | проверить связи/условия схемы и ответ в `mes.in.v1.erp.response`; см. `runtime`-логи пода |
 | WS-подсветки нет вообще | не подключён WS-шлюз (`ws://localhost:8081/ws/status`) или движок не публикует `mes.bpmn.v1.event.>` | проверить логи `websocket-cluster` и `bpmn-engine` |
 | В UI «Заказ» появился, но действий нет | WS-событие не сопоставилось с заказом (`instanceId`/`orderNum`) | проверить формат `payload.orderNum` в событии |
-| `npm start` падает с `options.allowedHosts[0] should be a non-empty string` | `react-scripts@5.0.1` при включённом `proxy` берёт `allowedHosts` из приватного IPv4 машины; если первый не-internal адрес — публичный (Radmin VPN, туннель, внешний адаптер), `lanUrlForConfig` пуст и dev-сервер не стартует | запустить кабинет с обходом проверки хоста: `set DANGEROUSLY_DISABLE_HOST_CHECK=true && npm start` (только локальная разработка); либо отключить адаптер с публичным адресом |
+| `npm start` падает с `options.allowedHosts[0] should be a non-empty string` | `react-scripts@5.0.1` при включённом `proxy` берёт `allowedHosts` из приватного IPv4 машины; если первый не-internal адрес — публичный (Radmin VPN, туннель, внешний адаптер), `lanUrlForConfig` пуст и dev-сервер не стартует | лечится один раз: строка `DANGEROUSLY_DISABLE_HOST_CHECK=true` в `erp-simulator/.env.development.local` (файл в `.gitignore`, читается раньше `.env`), после чего `npm start` работает как обычно. Разовая альтернатива — `set DANGEROUSLY_DISABLE_HOST_CHECK=true && npm start`; отключить адаптер с публичным адресом — тоже вариант. `HOST=localhost` **не помогает**: `lanUrlForConfig` пуст при любом `HOST`. Диагностика: `node wip\probe-allowed-host.cjs` (печатает `address.ip()` и `prepareUrls(...).lanUrlForConfig` для `0.0.0.0` / `::` / `localhost`) |
 
 ## Развёртывание и разработка
 
@@ -1667,7 +1837,9 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
     диагностика (пара «источник → цель» берётся из триггера узла). Триггер
     срабатывает только по **задеплоенному** целевому процессу: `ClientOrder`
     создаёт завод, если его схема уже в кластере, иначе в лог уходит
-    `message_target_not_deployed`.
+    `message_target_not_deployed`. Ожидание сообщения в кабинете подписано:
+    на catch-событии кнопок нет, поэтому панель действий называет сообщение и
+    контур-отправитель (`getMessageWait`/`findMessageThrow`), а не молчит.
 13. **Инфографика кабинета читает серверный API, а не локальную копию.** С M7
     движок отдаёт метрики из Postgres (`GET /api/v1/metrics`, см.
     [«Серверные метрики»](#серверные-метрики-m7)) с разрезами по шагам, ролям и
@@ -1706,7 +1878,7 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
 | [`bpmn-gateways/http-cluster/index.js`](bpmn-gateways/http-cluster/index.js) | Валидация, subject `mes.in.v1.event.erp.<event_name>`, CORS, лимиты, прокси `GET /api/v1/metrics` в NATS (M7) |
 | [`bpmn-gateways/websocket-cluster/index.js`](bpmn-gateways/websocket-cluster/index.js) | Вещание `mes.bpmn.v1.event.>` в `ws://<host>:8081/ws/status` с фильтрами подписчика (M7) |
 | [`bpmn-gateways/websocket-cluster/filters.js`](bpmn-gateways/websocket-cluster/filters.js) | Чистые фильтры WS-подписки: `parseQuery`, `matches`, `applyControl`, `instanceIdOf`, `rolesOf` (+ 8 тестов на `node --test`) |
-| [`erp-simulator/src/bpmn-sdk/client/httpClient.js`](erp-simulator/src/bpmn-sdk/client/httpClient.js) | `sendEvent(instanceId, eventName, elementId, outputData)`, `deploySchema(org, xml)` |
+| [`erp-simulator/src/bpmn-sdk/client/httpClient.js`](erp-simulator/src/bpmn-sdk/client/httpClient.js) | `sendEvent(instanceId, eventName, elementId, outputData, options)` — роль события задаётся `options.actor` (`''` — системная доставка без роли, M8), `deploySchema(org, xml)` |
 | [`erp-simulator/src/bpmn-sdk/constants.js`](erp-simulator/src/bpmn-sdk/constants.js) | `ENGINE_EVENTS`, `ENGINE_ELEMENTS`, `INSTANCE_PREFIX`, `TOKEN_STATES`, `ELEMENT_ID_PATTERN` |
 | [`erp-simulator/src/bpmn-sdk/xml/bpmnXml.js`](erp-simulator/src/bpmn-sdk/xml/bpmnXml.js) | Поиск/переименование узлов (`id`), роли (`bpmn:potentialOwner`), триггер (`trg:processTrigger`) и кнопки участников (`act:userAction`) в XML, вывод адреса кнопки из связей (`resolveAction`, `getNextElementId`), проверка совместимости схемы с движком (`validateEngineSchema`) |
 | [`erp-simulator/src/bpmn-sdk/xml/triggerModdle.js`](erp-simulator/src/bpmn-sdk/xml/triggerModdle.js) | Moddle-пакет `trg`: тип `trg:ProcessTrigger`, поля триггера и `TRIGGER_MODELE_EXTENSIONS` для редактора |
@@ -1719,7 +1891,7 @@ kubectl exec -i $DB_POD -c postgres -- env PGPASSWORD=bpmn_super_secret_password
 | [`erp-simulator/src/metricsStore.js`](erp-simulator/src/metricsStore.js) | Метрики запусков в браузере (запасной источник, когда API недоступен): `beginRun`/`completeRun`/`loadRuns`/`clearRuns`, ключ `bpmn-process-metrics`, агрегаты инфографики (`summarizeRuns`, `groupRunsByProcess`) |
 | [`erp-simulator/src/metricsApi.js`](erp-simulator/src/metricsApi.js) | Клиент серверных метрик (M7): `metricsClient.load` → `GET /api/v1/metrics`, `toPanelRuns` (ответ движка → записи панели), кэш ответа `bpmn-process-metrics-cache` (`loadMetricsCache`/`saveMetricsCache`/`clearMetricsCache`) |
 | [`erp-simulator/src/MetricsPanel.jsx`](erp-simulator/src/MetricsPanel.jsx) | Инфографика руководителя: карточка на процесс, плитки времени и серверные разрезы (ожидание шага, SLA, брак), столбики последних запусков, подпись источника и кнопка «Обновить» |
-| [`erp-simulator/src/ordersApi.js`](erp-simulator/src/ordersApi.js) | Заказы в БД движка (M4): `ordersClient.listOrders`/`getOrder`/`createOrder`/`attachInstance`, нормализация серверной карточки (`normalizeOrder`, `mergeOrders`), продолжение нумерации (`nextOrderNum`) и форма заказа (`defaultOrderDraft`, `toOrderPayload`, `formatDueDate`) |
+| [`erp-simulator/src/ordersApi.js`](erp-simulator/src/ordersApi.js) | Заказы в БД движка (M4): `ordersClient.listOrders`/`getOrder`/`createOrder`/`attachInstance`/`clearOrders` (очистка списка, M8), нормализация серверной карточки (`normalizeOrder`, `mergeOrders`), продолжение нумерации (`nextOrderNum`) и форма заказа (`defaultOrderDraft`, `toOrderPayload`, `formatDueDate`) |
 | [`erp-simulator/src/projectsApi.js`](erp-simulator/src/projectsApi.js) | Схемы проектов на сервере (M6): `projectsClient.listProjects`/`getProject`/`deployProject`/`listVersions`, подписи версии и размера (`versionLabel`, `serverProjectLabel`), запись кэша из ответа (`toProjectRecord`) |
 | [`erp-simulator/src/App.jsx`](erp-simulator/src/App.jsx) | Демо-привязки: роль → кнопка из схемы (`ACTION_ID`) → `sendEvent`; кнопки вне `ACTION_ID` — общим шагом (`schemaStepActions`); сохранение/сброс схемы; подсказки триггера — `getProcessIds` из схемы второй стороны; метрики — `beginRun` на старте, `completeRun` по токену на конечном узле и `refreshMetrics` (`GET /api/v1/metrics`) для панели |
 | [`tests/test_workflow.py`](tests/test_workflow.py) | E2E-проверка привязок через HTTP, БД, NATS и WS |

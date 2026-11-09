@@ -3,7 +3,10 @@
  *
  * Проверяется тот же контракт, который использует кабинет (`erp-simulator/src/ordersApi.js`):
  * коды 200/400/404/409, поля в camelCase, состояние контуров и текущий шаг из
- * legacy read-model (`tokens`, `process_instances`).
+ * legacy read-model (`tokens`, `process_instances`). Последняя проверка — очистка
+ * списка (`DELETE /api/v1/orders`, кнопка «Очистить все заказы»): она удаляет
+ * заказы всего контура, поэтому идёт после остальных и не трогает экземпляры
+ * процессов.
  *
  * Туннель до шлюза скрипт открывает сам (`kubectl port-forward`) и гасит его в
  * конце: запущенный из оболочки `port-forward` живёт до первого таймаута
@@ -299,16 +302,27 @@ async function runChecks() {
     DELETE FROM tokens WHERE instance_id LIKE 'e2e-inst-%';
     DELETE FROM process_instances WHERE id LIKE 'e2e-inst-%';
     DELETE FROM process_definitions WHERE id = 'Process_E2E';
-    DELETE FROM orders WHERE order_num LIKE '№E2E%';
     `,
     'очистка'
   );
 
-  const after = await call('GET', '/api/v1/orders');
+  // Очистка списка (M8) — то, что делает кнопка «Очистить все заказы»:
+  // удаляются карточки, экземпляры процессов остаются в движке. Проверка
+  // последняя: она чистит весь контур, включая заказы ручных прогонов.
+  const cleared = await call('DELETE', '/api/v1/orders');
+  check('DELETE /api/v1/orders → 200', cleared.status === 200, cleared.body);
+  check('ответ ok:true', cleared.body.ok === true, cleared.body);
   check(
-    'заказ удалён из списка',
-    Array.isArray(after.body.orders) && !after.body.orders.some((order) => order.orderNum === orderNum),
-    after.body.orders && after.body.orders.map((order) => order.orderNum)
+    'очистка сообщает число удалённых',
+    typeof cleared.body.deleted === 'number' && cleared.body.deleted >= 1,
+    cleared.body
+  );
+
+  const afterClear = await call('GET', '/api/v1/orders');
+  check(
+    'после очистки список пуст',
+    Array.isArray(afterClear.body.orders) && afterClear.body.orders.length === 0,
+    afterClear.body.orders && afterClear.body.orders.map((order) => order.orderNum)
   );
 
   const failed = results.filter((result) => !result.ok);
